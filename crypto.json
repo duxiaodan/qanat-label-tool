@@ -1,0 +1,7 @@
+{
+  "salt": "cqQNAzoX1+7fA0WfAVvGdQ==",
+  "iterations": 200000,
+  "kdf": "PBKDF2-SHA256",
+  "cipher": "AES-256-GCM",
+  "check": "h6j4Ly5EI8KyGedYtP7rYDKCRst0hG7zY39FcJvr723L/H99G7mgc/mrtcw9qbc="
+}

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Qanat label tool — Jason CORONA swath</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- passcode gate -->
+  <div id="gate" class="gate">
+    <div class="gate-box">
+      <h1>Qanat label tool</h1>
+      <p>Add missing ground-truth shaft points &amp; channel polylines onto the
+         Jason CORONA swath crops.</p>
+      <label for="passcode">Passcode</label>
+      <input type="password" id="passcode" autocomplete="current-password" />
+      <button id="unlock">Unlock</button>
+      <div id="gate-msg" class="gate-msg"></div>
+      <div id="gate-loading" class="gate-loading" hidden>decrypting…</div>
+    </div>
+  </div>
+
+  <!-- main app (hidden until unlocked) -->
+  <div id="app" hidden>
+    <header id="topbar">
+      <span class="brand">Qanat label tool</span>
+      <label class="lab">labeler name
+        <input type="text" id="labeler" placeholder="your name (required)" />
+      </label>
+      <span class="toggles">
+        <label><input type="checkbox" id="tg-heatmap" checked /> Heatmap</label>
+        <label><input type="checkbox" id="tg-gt" checked /> Existing GT</label>
+        <label><input type="checkbox" id="tg-mine" checked /> My new marks</label>
+      </span>
+      <span class="spacer"></span>
+      <button id="btn-download" disabled>Download GeoJSON</button>
+      <span id="status" class="status"></span>
+    </header>
+
+    <div id="main">
+      <aside id="sidelist">
+        <div class="side-head">Cells (by p_pos &darr;)</div>
+        <ul id="cell-list"></ul>
+      </aside>
+
+      <div id="swath-wrap">
+        <div id="swath-stage">
+          <img id="swath-img" alt="swath" draggable="false" />
+          <img id="heat-img" alt="heatmap" draggable="false" />
+          <svg id="swath-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+        </div>
+        <div id="swath-hint">drag to pan · wheel to zoom · click a cell to open its crop</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- crop popup -->
+  <div id="crop-modal" class="modal" hidden>
+    <div class="modal-box">
+      <div class="modal-head">
+        <span id="crop-title"></span>
+        <span class="modal-tools">
+          <label><input type="checkbox" id="crop-autocontrast" /> Autocontrast</label>
+          <label><input type="checkbox" id="crop-gt" checked /> Existing GT</label>
+          <span class="drawmode">
+            <label><input type="radio" name="drawmode" value="point" checked /> Point</label>
+            <label><input type="radio" name="drawmode" value="line" /> Polyline</label>
+          </span>
+          <button id="crop-undo">Undo last</button>
+          <button id="crop-clear">Clear this crop</button>
+          <button id="crop-save">Save crop</button>
+          <button id="crop-close">Close</button>
+        </span>
+      </div>
+      <div id="crop-stage">
+        <canvas id="crop-canvas" width="1024" height="1024"></canvas>
+      </div>
+      <div class="modal-hint">click = add a point / polyline vertex · double-click or Enter ends a polyline ·
+        click your own mark to select it · <b>left-drag = box-select multiple of your marks</b> · Delete removes selected ·
+        right-drag (or middle-drag) to pan · wheel to zoom · Esc cancels</div>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
