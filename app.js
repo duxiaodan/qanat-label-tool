@@ -29,6 +29,9 @@ const S = {
   storageKey: 'qanat-labels:v1',
   // swath view transform
   view: { x: 0, y: 0, scale: 1 },
+  suppressCellClick: false, // set true when a swath pan-drag ends, so the
+                            // trailing click on a cell rect is ignored
+
   // crop modal
   crop: null,           // {cell, raw: ImageData, ctx, view:{x,y,scale}, marks:{points:[[col,row]..], lines:[[[col,row]..]..]}, inProgress:[], selected:null}
 };
@@ -193,7 +196,13 @@ function buildSwathLayers() {
       class: 'cell-rect' + (S.done.has(c.id) ? ' done' : ''),
     });
     rect.dataset.cid = c.id;
-    rect.addEventListener('click', (ev) => { ev.stopPropagation(); openCrop(c.id); });
+    rect.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      // A pan-drag that ends over this rect fires a trailing click; ignore it
+      // so only a genuine (near-stationary) click opens the crop.
+      if (S.suppressCellClick) { S.suppressCellClick = false; return; }
+      openCrop(c.id);
+    });
     rect.addEventListener('mouseenter', () => highlightCell(c.id, true));
     rect.addEventListener('mouseleave', () => highlightCell(c.id, false));
     gCells.appendChild(rect);
@@ -234,6 +243,24 @@ function applyLayerToggles() {
 function applySwathTransform() {
   const { x, y, scale } = S.view;
   $('swath-stage').style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+  updateScaleBar();
+}
+// "nice" round distances (m) for the dynamic scale bar (1/2/5 x 10^n)
+const SCALE_NICE_M = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3,
+                      1e4, 2e4, 5e4, 1e5, 2e5, 5e5, 1e6];
+const SCALE_TARGET_PX = 140; // pick the largest nice distance whose bar <= this
+function updateScaleBar() {
+  const bar = $('swath-scale-bar'); const label = $('swath-scale-label');
+  if (!bar || !label) return;
+  const mPerImgPx = S.manifest && S.manifest.swath ? S.manifest.swath.m_per_px : 0;
+  if (!mPerImgPx || !S.view.scale) return;
+  // image px -> screen px is S.view.scale, so meters per *screen* px is:
+  const mPerScreenPx = mPerImgPx / S.view.scale;
+  const targetM = SCALE_TARGET_PX * mPerScreenPx;
+  let niceM = SCALE_NICE_M[0];
+  for (const m of SCALE_NICE_M) { if (m <= targetM) niceM = m; else break; }
+  bar.style.width = (niceM / mPerScreenPx).toFixed(1) + 'px';
+  label.textContent = niceM >= 1000 ? `${niceM / 1000} km` : `${niceM} m`;
 }
 function fitSwath() {
   const wrap = $('swath-wrap');
@@ -245,12 +272,20 @@ function fitSwath() {
 }
 function setupSwathPanZoom() {
   const wrap = $('swath-wrap');
-  let dragging = false, lastX = 0, lastY = 0, moved = false;
-  wrap.addEventListener('mousedown', (e) => { dragging = true; moved = false; lastX = e.clientX; lastY = e.clientY; });
-  window.addEventListener('mouseup', () => { dragging = false; });
+  const CLICK_MOVE_PX = 5; // total movement under this (screen px) is a click, not a pan
+  let dragging = false, lastX = 0, lastY = 0, downX = 0, downY = 0;
+  wrap.addEventListener('mousedown', (e) => {
+    dragging = true; lastX = downX = e.clientX; lastY = downY = e.clientY;
+    S.suppressCellClick = false; // only a real drag (below) re-arms this
+  });
+  window.addEventListener('mouseup', (e) => {
+    if (dragging && Math.hypot(e.clientX - downX, e.clientY - downY) > CLICK_MOVE_PX) {
+      S.suppressCellClick = true; // gesture was a pan -> swallow the trailing cell click
+    }
+    dragging = false;
+  });
   window.addEventListener('mousemove', (e) => {
     if (!dragging) return;
-    moved = true;
     S.view.x += e.clientX - lastX; S.view.y += e.clientY - lastY;
     lastX = e.clientX; lastY = e.clientY;
     applySwathTransform();

@@ -80,8 +80,21 @@ body {
 #swath-svg .mine-dot { fill: #39ff14; }                     /* new marks = lime */
 #swath-svg .mine-line { fill: none; stroke: #39ff14; stroke-width: 1.2; }
 #swath-hint {
-  position: absolute; left: 8px; bottom: 8px; font-size: 11px; color: #889; background: rgba(0,0,0,.45);
+  position: absolute; right: 8px; bottom: 8px; font-size: 11px; color: #889; background: rgba(0,0,0,.45);
   padding: 3px 7px; border-radius: 4px; pointer-events: none;
+}
+
+/* dynamic scale bar — pinned to the map viewport's bottom-left corner */
+#swath-scale {
+  position: absolute; left: 8px; bottom: 8px; pointer-events: none; user-select: none;
+  color: #fff; font-size: 11px; line-height: 1.2; text-align: center;
+  text-shadow: 0 0 3px #000, 0 0 3px #000, 0 0 3px #000;
+}
+#swath-scale-label { margin-bottom: 2px; font-variant-numeric: tabular-nums; }
+/* bottom + two side borders => a flat bar with up-pointing end ticks */
+#swath-scale-bar {
+  height: 7px; box-sizing: border-box; min-width: 1px;
+  border: 2px solid #fff; border-top: none; background: rgba(0,0,0,.3);
 }
 
 /* ---------- crop modal ---------- */
