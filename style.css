@@ -49,6 +49,20 @@ body {
 }
 #topbar button:disabled { background: #555; cursor: not-allowed; }
 #topbar .status { font-size: 12px; color: #8ad; min-width: 120px; }
+#topbar .lab b { color: #e6e8ec; font-weight: 700; }
+
+/* legend: your marks (lime) vs others' marks (orange) */
+#topbar .legend { display: flex; gap: 12px; font-size: 11px; color: #aab; }
+#topbar .legend-item { display: flex; align-items: center; gap: 5px; }
+#topbar .legend .swatch { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+#topbar .legend .swatch.mine { background: #39ff14; }
+#topbar .legend .swatch.others { background: #ff9500; }
+
+/* sync status: neutral by default, amber while unsynced/working */
+#topbar .sync-status { font-size: 12px; color: #8a93a5; min-width: 90px; }
+#topbar .sync-status.unsynced { color: #f6c453; font-weight: 600; }
+#topbar .sync-status.ok { color: #6bbf59; }
+#topbar .sync-status.err { color: #e07a5f; }
 
 /* ---------- main layout ---------- */
 #main { display: flex; height: calc(100vh - 46px); }
@@ -77,8 +91,10 @@ body {
 #swath-svg .cell-rect.done { stroke: rgba(76,175,80,.6); }
 #swath-svg .gt-dot { fill: #ff3b30; }                       /* existing GT shafts = red  */
 #swath-svg .gt-line { fill: none; stroke: #00e5ff; stroke-width: 1.0; }  /* existing GT channels = cyan */
-#swath-svg .mine-dot { fill: #39ff14; }                     /* new marks = lime */
+#swath-svg .mine-dot { fill: #39ff14; }                     /* my marks = lime */
 #swath-svg .mine-line { fill: none; stroke: #39ff14; stroke-width: 1.2; }
+#swath-svg .others-dot { fill: #ff9500; opacity: .9; }      /* others' marks = orange, read-only */
+#swath-svg .others-line { fill: none; stroke: #ff9500; stroke-width: 1.2; opacity: .9; }
 #swath-hint {
   position: absolute; right: 8px; bottom: 8px; font-size: 11px; color: #889; background: rgba(0,0,0,.45);
   padding: 3px 7px; border-radius: 4px; pointer-events: none;

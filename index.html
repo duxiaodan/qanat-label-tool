@@ -13,6 +13,10 @@
       <h1>Qanat label tool</h1>
       <p>Add missing ground-truth shaft points &amp; channel polylines onto the
          Jason CORONA swath crops.</p>
+      <label for="gate-name">Your name (required — labels are attributed to you)</label>
+      <input type="text" id="gate-name" list="name-suggestions" autocomplete="off"
+             placeholder="e.g. Jane Doe" />
+      <datalist id="name-suggestions"></datalist>
       <label for="passcode">Passcode</label>
       <input type="password" id="passcode" autocomplete="current-password" />
       <button id="unlock">Unlock</button>
@@ -25,16 +29,22 @@
   <div id="app" hidden>
     <header id="topbar">
       <span class="brand">Qanat label tool</span>
-      <label class="lab">labeler name
-        <input type="text" id="labeler" placeholder="your name (required)" />
-      </label>
+      <span class="lab">labeler: <b id="me-name">—</b></span>
+      <!-- kept (hidden) so download() / updateDownloadEnabled() reuse the name -->
+      <input type="hidden" id="labeler" />
       <span class="toggles">
         <label><input type="checkbox" id="tg-heatmap" checked /> Heatmap</label>
         <label><input type="checkbox" id="tg-gt" checked /> Existing GT</label>
-        <label><input type="checkbox" id="tg-mine" checked /> My new marks</label>
+        <label><input type="checkbox" id="tg-mine" checked /> All marks</label>
+      </span>
+      <span class="legend">
+        <span class="legend-item"><span class="swatch mine"></span>your marks</span>
+        <span class="legend-item"><span class="swatch others"></span>others' marks</span>
       </span>
       <span class="spacer"></span>
+      <button id="btn-refresh">Refresh</button>
       <button id="btn-download" disabled>Download GeoJSON</button>
+      <span id="sync-status" class="sync-status"></span>
       <span id="status" class="status"></span>
     </header>
 

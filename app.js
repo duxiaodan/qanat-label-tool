@@ -10,7 +10,9 @@
 
 import { pixelToWorld, worldToPixel } from './geo.js';
 import { buildShaftsFeatureCollection, buildLinesFeatureCollection } from './geojson.js';
-import { deriveKey, decryptBlob, verifyPasscode } from './crypto.js';
+import { deriveKey, decryptBlob, encryptBlob, verifyPasscode } from './crypto.js';
+import { fetchAllMarks, replaceMyCellMarks } from './sync.js';
+import { SUPABASE } from './site_config.js';
 
 // --------------------------------------------------------------------------- //
 // state
@@ -22,10 +24,15 @@ const S = {
   cellById: new Map(),
   swathW: 0, swathH: 0, // swath image pixel size
   swathBounds: null,    // [minx, miny, maxx, maxy]
-  // per-session marks
-  shaftMarks: [],       // {cropId, pPos, world:[x,y], created}
-  lineMarks: [],        // {cropId, pPos, world:[[x,y],...], created}
-  done: new Set(),      // cell ids with >=1 saved mark
+  // identity (set at the gate; `me` is normalized for matching, `meDisplay` shown/exported)
+  me: '',               // normalized owner key (trim+collapse+lowercase)
+  meDisplay: '',        // as-typed display/export name
+  board: null,          // namespace per dataset (mirrors storageKey suffix)
+  // per-session marks (each mark carries `labeler` owner + optional `dbId`)
+  shaftMarks: [],       // {cropId, pPos, world:[x,y], created, labeler, dbId?}
+  lineMarks: [],        // {cropId, pPos, world:[[x,y],...], created, labeler, dbId?}
+  done: new Set(),      // cell ids with >=1 saved mark (from anyone)
+  unsynced: false,      // true when a save couldn't reach the backend
   storageKey: 'qanat-labels:v1',
   // swath view transform
   view: { x: 0, y: 0, scale: 1 },
@@ -57,7 +64,39 @@ async function decryptToBlobUrl(url, mime) {
   return URL.createObjectURL(new Blob([pt], { type: mime }));
 }
 function setStatus(msg) { $('status').textContent = msg || ''; }
+function setSyncStatus(msg, cls) {
+  const el = $('sync-status');
+  if (!el) return;
+  el.textContent = msg || '';
+  el.className = 'sync-status' + (cls ? ' ' + cls : '');
+}
 function fmtP(p) { return (Math.round(p * 1000) / 1000).toFixed(3); }
+
+// normalize a name for *matching* (trim + collapse internal whitespace + lowercase).
+function normalize(name) { return (name || '').trim().replace(/\s+/g, ' ').toLowerCase(); }
+function backendOn() { return !!SUPABASE; }
+
+// remembered display names -> datalist suggestions at the gate.
+const NAMES_KEY = 'qanat-labeler-names';
+function loadNames() {
+  try { const a = JSON.parse(localStorage.getItem(NAMES_KEY) || '[]'); return Array.isArray(a) ? a : []; }
+  catch (e) { return []; }
+}
+function rememberName(display) {
+  const d = (display || '').trim();
+  if (!d) return;
+  const names = loadNames();
+  if (!names.some((n) => normalize(n) === normalize(d))) names.push(d);
+  try { localStorage.setItem(NAMES_KEY, JSON.stringify(names)); } catch (e) { /* non-fatal */ }
+}
+function fillNameDatalist() {
+  const dl = $('name-suggestions');
+  if (!dl) return;
+  dl.innerHTML = '';
+  for (const n of loadNames()) {
+    const o = document.createElement('option'); o.value = n; dl.appendChild(o);
+  }
+}
 function sanitize(s) { return (s || 'anon').replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '') || 'anon'; }
 function ymd(d) {
   const y = d.getFullYear(); const m = String(d.getMonth() + 1).padStart(2, '0'); const day = String(d.getDate()).padStart(2, '0');
@@ -71,6 +110,7 @@ function persist() {
   try {
     localStorage.setItem(S.storageKey, JSON.stringify({
       shaftMarks: S.shaftMarks, lineMarks: S.lineMarks, done: [...S.done],
+      unsynced: S.unsynced,
     }));
   } catch (e) { /* quota / disabled — non-fatal */ }
 }
@@ -81,8 +121,121 @@ function restore() {
     const o = JSON.parse(raw);
     S.shaftMarks = Array.isArray(o.shaftMarks) ? o.shaftMarks : [];
     S.lineMarks = Array.isArray(o.lineMarks) ? o.lineMarks : [];
+    // localStorage is per-device → any cached mark without an owner is mine.
+    for (const m of S.shaftMarks) if (!m.labeler) m.labeler = S.me;
+    for (const m of S.lineMarks) if (!m.labeler) m.labeler = S.me;
     S.done = new Set(Array.isArray(o.done) ? o.done : []);
+    S.unsynced = !!o.unsynced;
   } catch (e) { /* corrupt — ignore */ }
+}
+// recompute `done` from the merged pool: a cell is ✓ if anyone has a mark there.
+function recomputeDone() {
+  S.done = new Set();
+  for (const m of S.shaftMarks) S.done.add(m.cropId);
+  for (const m of S.lineMarks) if (m.world && m.world.length >= 2) S.done.add(m.cropId);
+}
+
+// --------------------------------------------------------------------------- //
+// backend sync (Supabase) — crypto stays here; sync.js only moves ciphertext
+// --------------------------------------------------------------------------- //
+const _utf8 = new TextEncoder();
+const _dutf8 = new TextDecoder();
+
+function _bytesToB64(u8) {
+  let s = '';
+  for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+  return btoa(s);
+}
+function _b64ToBytes(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+
+/** Encrypt a mark's world geometry -> base64 ciphertext for the `geom` column. */
+async function encryptGeom(world) {
+  const json = JSON.stringify({ world });
+  const blob = await encryptBlob(S.key, _utf8.encode(json));
+  return _bytesToB64(blob);
+}
+/** Decrypt a `geom` base64 ciphertext -> the world-coords array (or null on failure). */
+async function decryptGeom(geomB64) {
+  try {
+    const pt = await decryptBlob(S.key, _b64ToBytes(geomB64));
+    const o = JSON.parse(_dutf8.decode(pt));
+    return Array.isArray(o.world) ? o.world : null;
+  } catch (e) { return null; }
+}
+
+/** kind tag in the DB: shafts are points, channels are polylines. */
+const KIND_SHAFT = 'shaft';
+const KIND_CHANNEL = 'channel';
+
+/**
+ * Pull the whole shared pool from the backend, decrypt, and replace S.*Marks —
+ * but preserve my locally-unsynced marks (so a failed save isn't lost on refresh).
+ * Falls back to the local cache when no backend is configured.
+ */
+async function pullAllMarks() {
+  if (!backendOn()) { restore(); recomputeDone(); setSyncStatus('local-only', ''); return; }
+  setSyncStatus('syncing…', '');
+  // load the local cache first so any prior-session unsynced marks of mine survive
+  // the merge below (they have no dbId; synced ones picked up dbIds on save).
+  if (!S.shaftMarks.length && !S.lineMarks.length) restore();
+  let rows;
+  try {
+    rows = await fetchAllMarks(SUPABASE, S.board);
+  } catch (e) {
+    // can't reach backend — fall back to whatever we have locally.
+    restore();
+    recomputeDone();
+    S.unsynced = true;
+    setSyncStatus('offline — using local cache', 'unsynced');
+    return;
+  }
+  const shafts = [];
+  const lines = [];
+  for (const row of rows || []) {
+    const world = await decryptGeom(row.geom);
+    if (!world) continue; // skip rows we can't decrypt (wrong key / corrupt)
+    const owner = row.labeler || '';
+    const cropId = row.cell_id;
+    const created = row.created_at || row.updated_at || '';
+    if (row.kind === KIND_SHAFT) {
+      // a shaft is stored as {world:[x,y]} (a flat pair); tolerate a nested
+      // [[x,y]] too, in case any row was written in the other shape.
+      const c = Array.isArray(world[0]) ? world[0] : world;
+      if (!Array.isArray(c) || c.length < 2 || typeof c[0] !== 'number') continue;
+      shafts.push({ cropId, pPos: cellPPos(cropId), world: [c[0], c[1]], created, labeler: owner, dbId: row.id });
+    } else if (row.kind === KIND_CHANNEL) {
+      if (world.length < 2) continue;
+      lines.push({ cropId, pPos: cellPPos(cropId), world, created, labeler: owner, dbId: row.id });
+    }
+  }
+  // merge my locally-unsynced marks (those without a dbId) so a pending save survives.
+  for (const m of S.shaftMarks) if (m.labeler === S.me && !m.dbId) shafts.push(m);
+  for (const m of S.lineMarks) if (m.labeler === S.me && !m.dbId) lines.push(m);
+  S.shaftMarks = shafts;
+  S.lineMarks = lines;
+  recomputeDone();
+  persist();
+  if (S.unsynced) setSyncStatus('synced (local changes pending)', 'unsynced');
+  else setSyncStatus('synced', 'ok');
+}
+
+function cellPPos(cropId) {
+  const c = S.cellById.get(cropId);
+  return c ? c.p_pos : 0;
+}
+
+/** Re-pull the pool + redraw everything (Refresh button + post-save consistency). */
+async function refreshMarks() {
+  await pullAllMarks();
+  refreshDoneMarks();
+  rebuildMineLayer();
+  applyLayerToggles();
+  if (S.crop) reloadCropMarks();
 }
 
 // --------------------------------------------------------------------------- //
@@ -91,12 +244,21 @@ function restore() {
 async function unlock() {
   const pw = $('passcode').value;
   $('gate-msg').textContent = '';
+  const nameRaw = $('gate-name').value;
+  if (!nameRaw.trim()) { $('gate-msg').textContent = 'enter your name before labeling'; return; }
   if (!pw) { $('gate-msg').textContent = 'enter a passcode'; return; }
   let cj;
   try { cj = await fetchJson('crypto.json'); }
   catch (e) { $('gate-msg').textContent = 'cannot load crypto.json — is the site served correctly?'; return; }
   const ok = await verifyPasscode(cj, pw);
   if (!ok) { $('gate-msg').textContent = 'wrong passcode'; return; }
+  // identity: normalize for matching, remember the display name for suggestions.
+  S.meDisplay = nameRaw.trim().replace(/\s+/g, ' ');
+  S.me = normalize(S.meDisplay);
+  rememberName(S.meDisplay);
+  $('me-name').textContent = S.meDisplay;
+  $('labeler').value = S.meDisplay; // keep the (hidden) download field in sync
+
   $('gate-loading').hidden = false;
   try {
     const salt = Uint8Array.from(atob(cj.salt), (c) => c.charCodeAt(0));
@@ -108,8 +270,9 @@ async function unlock() {
     for (const c of S.cells) S.cellById.set(c.id, c);
     S.swathW = S.manifest.swath.width; S.swathH = S.manifest.swath.height;
     S.swathBounds = S.manifest.swath.world_bounds;
-    S.storageKey = 'qanat-labels:' + (S.swathBounds ? S.swathBounds.map((v) => Math.round(v)).join('_') : 'v1');
-    restore();
+    S.board = (S.swathBounds ? S.swathBounds.map((v) => Math.round(v)).join('_') : 'v1');
+    S.storageKey = 'qanat-labels:' + S.board;
+    await pullAllMarks();
     // images
     const swathUrl = await decryptToBlobUrl('swath.enc', 'image/jpeg');
     const heatUrl = await decryptToBlobUrl(S.manifest.swath.heatmap || 'heatmap.enc', 'image/png');
@@ -225,14 +388,17 @@ function rebuildMineLayer() {
   const g = document.getElementById('g-mine');
   if (!g) return;
   g.innerHTML = '';
+  // draw others' (read-only, greyed) marks first so my lime marks sit on top.
   for (const m of S.shaftMarks) {
+    const mine = m.labeler === S.me;
     const [sx, sy] = worldToSwathPx(m.world[0], m.world[1]);
-    g.appendChild(svgEl('circle', { cx: sx, cy: sy, r: 1.6, class: 'mine-dot' }));
+    g.appendChild(svgEl('circle', { cx: sx, cy: sy, r: mine ? 1.6 : 1.4, class: mine ? 'mine-dot' : 'others-dot' }));
   }
   for (const m of S.lineMarks) {
     if (!m.world || m.world.length < 2) continue;
+    const mine = m.labeler === S.me;
     const pts = m.world.map(([x, y]) => worldToSwathPx(x, y).join(',')).join(' ');
-    g.appendChild(svgEl('polyline', { points: pts, class: 'mine-line' }));
+    g.appendChild(svgEl('polyline', { points: pts, class: mine ? 'mine-line' : 'others-line' }));
   }
 }
 function applyLayerToggles() {
@@ -323,31 +489,47 @@ async function openCrop(cid) {
   ctx.drawImage(img, 0, 0, 1024, 1024);
   const raw = ctx.getImageData(0, 0, 1024, 1024);
 
-  // restore this cell's own marks from session (pixel coords via worldToPixel)
-  const points = [];
-  for (const m of S.shaftMarks) if (m.cropId === cid) {
-    const [c, r] = worldToPixel(m.world[0], m.world[1], cell.world_bbox);
-    points.push([c, r]);
-  }
-  const lines = [];
-  for (const m of S.lineMarks) if (m.cropId === cid) {
-    lines.push(m.world.map(([x, y]) => worldToPixel(x, y, cell.world_bbox)));
-  }
-
   S.crop = {
     cell, raw, ctx, img,
     view: { x: 0, y: 0, scale: 1 },
-    marks: { points, lines },
+    marks: { points: [], lines: [] },      // MY editable marks (pixel coords)
+    others: { points: [], lines: [] },     // OTHERS' read-only marks (pixel coords)
     inProgress: [],
     selected: { points: new Set(), lines: new Set() },  // indices of own marks currently selected
     selectBox: null,       // [c0, r0, c1, r1] in 1024² coords while rubber-band-dragging
   };
+  loadCropMarksFor(cell);
   $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}   (${cell.gt_points.length} GT shafts, ${cell.gt_lines.length} GT lines)`;
   $('crop-autocontrast').checked = false;
   $('crop-gt').checked = true;
   document.querySelector('input[name="drawmode"][value="point"]').checked = true;
   $('crop-modal').hidden = false;
   fitCrop();
+  redrawCrop();
+}
+// (re)derive the crop's mine/others pixel marks from the merged S.*Marks pool.
+function loadCropMarksFor(cell) {
+  const cid = cell.id;
+  const mine = { points: [], lines: [] };
+  const others = { points: [], lines: [] };
+  for (const m of S.shaftMarks) if (m.cropId === cid) {
+    const px = worldToPixel(m.world[0], m.world[1], cell.world_bbox);
+    (m.labeler === S.me ? mine.points : others.points).push(px);
+  }
+  for (const m of S.lineMarks) if (m.cropId === cid) {
+    const ln = m.world.map(([x, y]) => worldToPixel(x, y, cell.world_bbox));
+    (m.labeler === S.me ? mine.lines : others.lines).push(ln);
+  }
+  S.crop.marks = mine;
+  S.crop.others = others;
+}
+// after a refresh while the modal is open: reload others' marks (and any of mine
+// not currently being edited) without clobbering in-progress drawing/selection.
+function reloadCropMarks() {
+  if (!S.crop) return;
+  loadCropMarksFor(S.crop.cell);
+  selClear();
+  S.crop.selectBox = null;
   redrawCrop();
 }
 function closeCrop(save) {
@@ -429,6 +611,20 @@ function redrawCrop() {
       part.forEach(([gx, gy], i) => { const [c, r] = worldToPixel(gx, gy, S.crop.cell.world_bbox); if (i === 0) ctx.moveTo(c, r); else ctx.lineTo(c, r); });
       ctx.stroke();
     }
+    ctx.restore();
+  }
+  // others' marks (read-only, orange) — drawn under mine, never selectable
+  if (S.crop.others && (S.crop.others.points.length || S.crop.others.lines.length)) {
+    ctx.save();
+    ctx.strokeStyle = '#ff9500'; ctx.fillStyle = '#ff9500'; ctx.lineWidth = 2; ctx.globalAlpha = 0.95;
+    for (const ln of S.crop.others.lines) {
+      if (ln.length < 1) continue;
+      ctx.beginPath();
+      ln.forEach(([c, r], i) => { if (i === 0) ctx.moveTo(c, r); else ctx.lineTo(c, r); });
+      ctx.stroke();
+      for (const [c, r] of ln) { ctx.beginPath(); ctx.arc(c, r, 2.5, 0, 2 * Math.PI); ctx.fill(); }
+    }
+    for (const [c, r] of S.crop.others.points) { ctx.beginPath(); ctx.arc(c, r, 4, 0, 2 * Math.PI); ctx.fill(); }
     ctx.restore();
   }
   // my marks (lime); selected ones get a magenta halo
@@ -612,29 +808,55 @@ function setupCropInteractions() {
     }
   });
 }
-function commitCrop() {
+async function commitCrop() {
   if (!S.crop) return;
   const cell = S.crop.cell;
   // flush any in-progress polyline
   if (S.crop.inProgress.length >= 2) S.crop.marks.lines.push(S.crop.inProgress.slice());
   S.crop.inProgress = [];
-  // drop this cell's old marks, re-add the current set as world coords
-  S.shaftMarks = S.shaftMarks.filter((m) => m.cropId !== cell.id);
-  S.lineMarks = S.lineMarks.filter((m) => m.cropId !== cell.id);
+  // drop ONLY MY old marks for this cell; never touch others' marks.
+  S.shaftMarks = S.shaftMarks.filter((m) => !(m.cropId === cell.id && m.labeler === S.me));
+  S.lineMarks = S.lineMarks.filter((m) => !(m.cropId === cell.id && m.labeler === S.me));
   const now = new Date().toISOString();
+  const myShafts = [];
+  const myLines = [];
   for (const [c, r] of S.crop.marks.points) {
     const [x, y] = pixelToWorld(c, r, cell.world_bbox);
-    S.shaftMarks.push({ cropId: cell.id, pPos: cell.p_pos, world: [x, y], created: now });
+    myShafts.push({ cropId: cell.id, pPos: cell.p_pos, world: [x, y], created: now, labeler: S.me });
   }
   for (const ln of S.crop.marks.lines) {
     if (ln.length < 2) continue;
-    S.lineMarks.push({ cropId: cell.id, pPos: cell.p_pos, world: ln.map(([c, r]) => pixelToWorld(c, r, cell.world_bbox)), created: now });
+    myLines.push({ cropId: cell.id, pPos: cell.p_pos, world: ln.map(([c, r]) => pixelToWorld(c, r, cell.world_bbox)), created: now, labeler: S.me });
   }
-  const hasMarks = S.crop.marks.points.length > 0 || S.crop.marks.lines.some((l) => l.length >= 2);
-  if (hasMarks) S.done.add(cell.id); else S.done.delete(cell.id);
+  S.shaftMarks.push(...myShafts);
+  S.lineMarks.push(...myLines);
+  recomputeDone();
   refreshDoneMarks();
   rebuildMineLayer();
   applyLayerToggles();
+
+  // push my marks for this cell to the backend (replace-my-rows), if configured.
+  if (backendOn()) {
+    try {
+      setSyncStatus('saving…', '');
+      const rows = [];
+      for (const m of myShafts) rows.push({ kind: KIND_SHAFT, geom: await encryptGeom(m.world) });
+      for (const m of myLines) rows.push({ kind: KIND_CHANNEL, geom: await encryptGeom(m.world) });
+      const inserted = await replaceMyCellMarks(SUPABASE, S.board, S.me, cell.id, rows);
+      // tag freshly-saved marks with their dbId so a later refresh dedupes them.
+      let si = 0, li = 0;
+      for (const ins of inserted || []) {
+        if (ins.kind === KIND_SHAFT && si < myShafts.length) myShafts[si++].dbId = ins.id;
+        else if (ins.kind === KIND_CHANNEL && li < myLines.length) myLines[li++].dbId = ins.id;
+      }
+      S.unsynced = false;
+      setSyncStatus('saved', 'ok');
+    } catch (e) {
+      // keep local, flag unsynced, retry on next save/refresh.
+      S.unsynced = true;
+      setSyncStatus('unsynced — kept locally', 'unsynced');
+    }
+  }
   persist();
   redrawCrop();
 }
@@ -668,15 +890,20 @@ function download() {
 // boot
 // --------------------------------------------------------------------------- //
 function boot() {
+  fillNameDatalist();
+  // prefill the gate with the most-recently-remembered name (per-device convenience).
+  const names = loadNames();
+  if (names.length) $('gate-name').value = names[names.length - 1];
   $('unlock').addEventListener('click', unlock);
   $('passcode').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
+  $('gate-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('passcode').focus(); });
   $('btn-download').addEventListener('click', download);
-  $('labeler').addEventListener('input', updateDownloadEnabled);
+  $('btn-refresh').addEventListener('click', () => { refreshMarks(); });
   ['tg-heatmap', 'tg-gt', 'tg-mine'].forEach((id) => $(id).addEventListener('change', applyLayerToggles));
   setupSwathPanZoom();
   setupCropInteractions();
   window.addEventListener('resize', () => { if (!$('app').hidden) applySwathTransform(); });
   // never auto-reveal content; the passcode must always be re-entered after a reload.
-  $('passcode').focus();
+  $('gate-name').value ? $('passcode').focus() : $('gate-name').focus();
 }
 boot();
