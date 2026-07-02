@@ -47,6 +47,11 @@ export async function fetchAllMarks(cfg, board) {
   return r.json();
 }
 
+/** Optional per-row plaintext provenance columns, passed through when present. */
+const PROVENANCE_ROW_FIELDS = [
+  'world_bbox', 'crs', 'crop_px', 'tifs', 'crop_sha256', 'build_id', 'p_pos', 'autocontrast',
+];
+
 /**
  * Replace *my* rows for one (board, labeler, cell_id): DELETE then POST the new
  * encrypted rows. Others' rows are never touched. Throws when no backend so the
@@ -54,7 +59,9 @@ export async function fetchAllMarks(cfg, board) {
  *
  * Each row in `rows` should already be `{board, labeler, cell_id, kind, geom}`
  * with `geom` = base64( AES ciphertext ). `board`/`labeler`/`cell_id` are filled
- * in here from the arguments if a row omits them, for convenience.
+ * in here from the arguments if a row omits them, for convenience. Optional
+ * plaintext provenance columns (see PROVENANCE_ROW_FIELDS) are passed through
+ * verbatim when present on a row — dumb pass-through, no crypto here.
  *
  * @param {{url:string, anonKey:string}|null|undefined} cfg
  * @param {string} board
@@ -66,9 +73,11 @@ export async function fetchAllMarks(cfg, board) {
 export async function replaceMyCellMarks(cfg, board, labeler, cellId, rows) {
   if (!cfg) throw new Error('no supabase config');
   await deleteMyCellMarks(cfg, board, labeler, cellId);
-  const payload = (rows || []).map((row) => ({
-    board, labeler, cell_id: cellId, kind: row.kind, geom: row.geom,
-  }));
+  const payload = (rows || []).map((row) => {
+    const out = { board, labeler, cell_id: cellId, kind: row.kind, geom: row.geom };
+    for (const k of PROVENANCE_ROW_FIELDS) if (row[k] !== undefined) out[k] = row[k];
+    return out;
+  });
   if (payload.length === 0) return [];
   const url = `${_base(cfg)}/rest/v1/marks`;
   const r = await fetch(url, {

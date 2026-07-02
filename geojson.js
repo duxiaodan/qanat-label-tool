@@ -23,6 +23,14 @@ function shaftProps(mark, labeler) {
     created: mark.created,
     source: 'web_label_tool',
     crop_p_pos: mark.pPos,
+    // provenance (stamped at save time; null on marks that predate the feature)
+    world_bbox: mark.worldBbox ?? null,
+    crs: mark.crs ?? null,
+    crop_px: mark.cropPx ?? null,
+    tifs: mark.tifs ?? null,
+    crop_sha256: mark.cropSha256 ?? null,
+    build_id: mark.buildId ?? null,
+    autocontrast: mark.autocontrast ?? null,
   };
 }
 

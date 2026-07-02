@@ -18,7 +18,8 @@ import { SUPABASE } from './site_config.js';
 // state
 // --------------------------------------------------------------------------- //
 const S = {
-  key: null,            // CryptoKey
+  key: null,            // CryptoKey (site files: manifest/swath/heatmap/crops)
+  marksKey: null,       // CryptoKey for DB-row geometry (marks_salt; stable across rebuilds)
   manifest: null,       // decrypted manifest object
   cells: [],            // manifest.cells (p_pos desc)
   cellById: new Map(),
@@ -40,7 +41,9 @@ const S = {
                             // trailing click on a cell rect is ignored
 
   // crop modal
-  crop: null,           // {cell, raw: ImageData, ctx, view:{x,y,scale}, marks:{points:[[col,row]..], lines:[[[col,row]..]..]}, inProgress:[], selected:null}
+  crop: null,           // {cell, raw: ImageData, ctx, view:{x,y,scale}, marks:{points:[{px:[col,row],ac}..], lines:[{pts:[[col,row]..],ac}..]}, inProgress:[], selected:null}
+                        // `ac` = autocontrast toggle state when the mark was drawn (null on
+                        // pre-provenance marks reloaded from the pool; preserved across saves)
 };
 
 const $ = (id) => document.getElementById(id);
@@ -156,13 +159,13 @@ function _b64ToBytes(b64) {
 /** Encrypt a mark's world geometry -> base64 ciphertext for the `geom` column. */
 async function encryptGeom(world) {
   const json = JSON.stringify({ world });
-  const blob = await encryptBlob(S.key, _utf8.encode(json));
+  const blob = await encryptBlob(S.marksKey, _utf8.encode(json));
   return _bytesToB64(blob);
 }
 /** Decrypt a `geom` base64 ciphertext -> the world-coords array (or null on failure). */
 async function decryptGeom(geomB64) {
   try {
-    const pt = await decryptBlob(S.key, _b64ToBytes(geomB64));
+    const pt = await decryptBlob(S.marksKey, _b64ToBytes(geomB64));
     const o = JSON.parse(_dutf8.decode(pt));
     return Array.isArray(o.world) ? o.world : null;
   } catch (e) { return null; }
@@ -202,15 +205,27 @@ async function pullAllMarks() {
     const owner = row.labeler || '';
     const cropId = row.cell_id;
     const created = row.created_at || row.updated_at || '';
+    // p_pos recorded at save time wins over the (possibly rebuilt) manifest's.
+    const pPos = row.p_pos != null ? row.p_pos : cellPPos(cropId);
+    // provenance columns (plaintext in the DB; null on rows that predate them)
+    const prov = {
+      worldBbox: row.world_bbox ?? null,
+      crs: row.crs ?? null,
+      cropPx: row.crop_px ?? null,
+      tifs: row.tifs ?? null,
+      cropSha256: row.crop_sha256 ?? null,
+      buildId: row.build_id ?? null,
+      autocontrast: row.autocontrast ?? null,
+    };
     if (row.kind === KIND_SHAFT) {
       // a shaft is stored as {world:[x,y]} (a flat pair); tolerate a nested
       // [[x,y]] too, in case any row was written in the other shape.
       const c = Array.isArray(world[0]) ? world[0] : world;
       if (!Array.isArray(c) || c.length < 2 || typeof c[0] !== 'number') continue;
-      shafts.push({ cropId, pPos: cellPPos(cropId), world: [c[0], c[1]], created, labeler: owner, dbId: row.id });
+      shafts.push({ cropId, pPos, world: [c[0], c[1]], created, labeler: owner, dbId: row.id, ...prov });
     } else if (row.kind === KIND_CHANNEL) {
       if (world.length < 2) continue;
-      lines.push({ cropId, pPos: cellPPos(cropId), world, created, labeler: owner, dbId: row.id });
+      lines.push({ cropId, pPos, world, created, labeler: owner, dbId: row.id, ...prov });
     }
   }
   // merge my locally-unsynced marks (those without a dbId) so a pending save survives.
@@ -263,6 +278,15 @@ async function unlock() {
   try {
     const salt = Uint8Array.from(atob(cj.salt), (c) => c.charCodeAt(0));
     S.key = await deriveKey(pw, salt, cj.iterations);
+    // DB-row geometry key: derived from marks_salt, which survives site rebuilds
+    // (the site salt above does not). Old deployments have no marks_salt ->
+    // fall back to the site key so their existing rows keep decrypting.
+    if (cj.marks_salt) {
+      const msalt = Uint8Array.from(atob(cj.marks_salt), (c) => c.charCodeAt(0));
+      S.marksKey = await deriveKey(pw, msalt, cj.iterations);
+    } else {
+      S.marksKey = S.key;
+    }
     // manifest
     const manBytes = await decryptBlob(S.key, await fetchBytes('manifest.enc'));
     S.manifest = JSON.parse(new TextDecoder().decode(manBytes));
@@ -492,8 +516,8 @@ async function openCrop(cid) {
   S.crop = {
     cell, raw, ctx, img,
     view: { x: 0, y: 0, scale: 1 },
-    marks: { points: [], lines: [] },      // MY editable marks (pixel coords)
-    others: { points: [], lines: [] },     // OTHERS' read-only marks (pixel coords)
+    marks: { points: [], lines: [] },      // MY editable marks ({px|pts, ac} objects)
+    others: { points: [], lines: [] },     // OTHERS' read-only marks (bare pixel coords)
     inProgress: [],
     selected: { points: new Set(), lines: new Set() },  // indices of own marks currently selected
     selectBox: null,       // [c0, r0, c1, r1] in 1024² coords while rubber-band-dragging
@@ -512,13 +536,17 @@ function loadCropMarksFor(cell) {
   const cid = cell.id;
   const mine = { points: [], lines: [] };
   const others = { points: [], lines: [] };
+  // my marks keep their per-mark autocontrast flag (`ac`; null on pre-provenance
+  // rows) so a re-save never restamps them; others' are display-only bare coords.
   for (const m of S.shaftMarks) if (m.cropId === cid) {
     const px = worldToPixel(m.world[0], m.world[1], cell.world_bbox);
-    (m.labeler === S.me ? mine.points : others.points).push(px);
+    if (m.labeler === S.me) mine.points.push({ px, ac: m.autocontrast ?? null });
+    else others.points.push(px);
   }
   for (const m of S.lineMarks) if (m.cropId === cid) {
     const ln = m.world.map(([x, y]) => worldToPixel(x, y, cell.world_bbox));
-    (m.labeler === S.me ? mine.lines : others.lines).push(ln);
+    if (m.labeler === S.me) mine.lines.push({ pts: ln, ac: m.autocontrast ?? null });
+    else others.lines.push(ln);
   }
   S.crop.marks = mine;
   S.crop.others = others;
@@ -548,8 +576,8 @@ function boxNorm(b) { return [Math.min(b[0], b[2]), Math.min(b[1], b[3]), Math.m
 function pointInBox([c, r], b) { const [a0, a1, a2, a3] = boxNorm(b); return c >= a0 && c <= a2 && r >= a1 && r <= a3; }
 function selectFromBox(box, additive) {
   if (!additive) selClear();
-  S.crop.marks.points.forEach(([c, r], i) => { if (pointInBox([c, r], box)) S.crop.selected.points.add(i); });
-  S.crop.marks.lines.forEach((ln, i) => { if (ln.some((v) => pointInBox(v, box))) S.crop.selected.lines.add(i); });
+  S.crop.marks.points.forEach((p, i) => { if (pointInBox(p.px, box)) S.crop.selected.points.add(i); });
+  S.crop.marks.lines.forEach((ln, i) => { if (ln.pts.some((v) => pointInBox(v, box))) S.crop.selected.lines.add(i); });
 }
 function deleteSelected() {
   if (!S.crop || selCount() === 0) return;
@@ -631,17 +659,17 @@ function redrawCrop() {
   const SEL = '#ff00ff';
   ctx.save();
   ctx.strokeStyle = '#39ff14'; ctx.fillStyle = '#39ff14'; ctx.lineWidth = 2;
-  S.crop.marks.lines.forEach((ln, idx) => {
-    if (ln.length < 1) return;
+  S.crop.marks.lines.forEach(({ pts }, idx) => {
+    if (pts.length < 1) return;
     ctx.beginPath();
-    ln.forEach(([c, r], i) => { if (i === 0) ctx.moveTo(c, r); else ctx.lineTo(c, r); });
+    pts.forEach(([c, r], i) => { if (i === 0) ctx.moveTo(c, r); else ctx.lineTo(c, r); });
     ctx.stroke();
     if (S.crop.selected.lines.has(idx)) {
       ctx.save(); ctx.strokeStyle = SEL; ctx.lineWidth = 3.5; ctx.stroke(); ctx.restore();
     }
-    for (const [c, r] of ln) { ctx.beginPath(); ctx.arc(c, r, 3, 0, 2 * Math.PI); ctx.fill(); }
+    for (const [c, r] of pts) { ctx.beginPath(); ctx.arc(c, r, 3, 0, 2 * Math.PI); ctx.fill(); }
   });
-  S.crop.marks.points.forEach(([c, r], idx) => {
+  S.crop.marks.points.forEach(({ px: [c, r] }, idx) => {
     ctx.beginPath(); ctx.arc(c, r, 5, 0, 2 * Math.PI); ctx.fill();
     if (S.crop.selected.points.has(idx)) {
       ctx.save(); ctx.strokeStyle = SEL; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(c, r, 8.5, 0, 2 * Math.PI); ctx.stroke(); ctx.restore();
@@ -679,18 +707,22 @@ function drawMode() { return document.querySelector('input[name="drawmode"]:chec
 function hitTestOwn([col, row]) {
   const tol = 8 / Math.max(0.2, S.crop.view.scale); // a few screen px
   for (let i = 0; i < S.crop.marks.points.length; i++) {
-    const [c, r] = S.crop.marks.points[i];
+    const [c, r] = S.crop.marks.points[i].px;
     if ((c - col) ** 2 + (r - row) ** 2 <= tol * tol) return { kind: 'point', idx: i };
   }
   for (let i = 0; i < S.crop.marks.lines.length; i++) {
-    for (const [c, r] of S.crop.marks.lines[i]) {
+    for (const [c, r] of S.crop.marks.lines[i].pts) {
       if ((c - col) ** 2 + (r - row) ** 2 <= tol * tol) return { kind: 'line', idx: i };
     }
   }
   return null;
 }
 function finishInProgressLine() {
-  if (S.crop.inProgress.length >= 2) S.crop.marks.lines.push(S.crop.inProgress.slice());
+  // provenance: the line is stamped with the toggle state at COMPLETION time
+  // (dblclick/Enter/mode-switch/commit flush), one `ac` flag per line.
+  if (S.crop.inProgress.length >= 2) {
+    S.crop.marks.lines.push({ pts: S.crop.inProgress.slice(), ac: $('crop-autocontrast').checked });
+  }
   S.crop.inProgress = [];
   redrawCrop();
 }
@@ -749,7 +781,8 @@ function setupCropInteractions() {
         const hit = hitTestOwn(pressPx);
         if (hit) { selSet(hit.kind, hit.idx, pressAdditive); redrawCrop(); return; }
         if (!pressAdditive) selClear();
-        if (drawMode() === 'point') S.crop.marks.points.push(pressPx);
+        // new point: stamped with the toggle state at the moment it is added.
+        if (drawMode() === 'point') S.crop.marks.points.push({ px: pressPx, ac: $('crop-autocontrast').checked });
         else S.crop.inProgress.push(pressPx);
         redrawCrop();
       }
@@ -811,22 +844,36 @@ function setupCropInteractions() {
 async function commitCrop() {
   if (!S.crop) return;
   const cell = S.crop.cell;
-  // flush any in-progress polyline
-  if (S.crop.inProgress.length >= 2) S.crop.marks.lines.push(S.crop.inProgress.slice());
+  // flush any in-progress polyline (completing it now → stamp the current toggle)
+  if (S.crop.inProgress.length >= 2) {
+    S.crop.marks.lines.push({ pts: S.crop.inProgress.slice(), ac: $('crop-autocontrast').checked });
+  }
   S.crop.inProgress = [];
   // drop ONLY MY old marks for this cell; never touch others' marks.
   S.shaftMarks = S.shaftMarks.filter((m) => !(m.cropId === cell.id && m.labeler === S.me));
   S.lineMarks = S.lineMarks.filter((m) => !(m.cropId === cell.id && m.labeler === S.me));
   const now = new Date().toISOString();
+  // provenance stamped on every mark at save time (camelCase locally, so the
+  // GeoJSON export is faithful without a refetch; snake_case in the DB rows).
+  // `autocontrast` is per mark — carried from draw time (or the original row on
+  // reloaded marks), NOT the toggle state at save.
+  const prov = {
+    worldBbox: cell.world_bbox,
+    crs: S.manifest.crs || null,
+    cropPx: S.manifest.crop_px || null,
+    tifs: cell.tifs || null,
+    cropSha256: cell.crop_sha256 || null,
+    buildId: (S.manifest.build && S.manifest.build.build_id) || null,
+  };
   const myShafts = [];
   const myLines = [];
-  for (const [c, r] of S.crop.marks.points) {
-    const [x, y] = pixelToWorld(c, r, cell.world_bbox);
-    myShafts.push({ cropId: cell.id, pPos: cell.p_pos, world: [x, y], created: now, labeler: S.me });
+  for (const p of S.crop.marks.points) {
+    const [x, y] = pixelToWorld(p.px[0], p.px[1], cell.world_bbox);
+    myShafts.push({ cropId: cell.id, pPos: cell.p_pos, world: [x, y], created: now, labeler: S.me, ...prov, autocontrast: p.ac ?? null });
   }
   for (const ln of S.crop.marks.lines) {
-    if (ln.length < 2) continue;
-    myLines.push({ cropId: cell.id, pPos: cell.p_pos, world: ln.map(([c, r]) => pixelToWorld(c, r, cell.world_bbox)), created: now, labeler: S.me });
+    if (ln.pts.length < 2) continue;
+    myLines.push({ cropId: cell.id, pPos: cell.p_pos, world: ln.pts.map(([c, r]) => pixelToWorld(c, r, cell.world_bbox)), created: now, labeler: S.me, ...prov, autocontrast: ln.ac ?? null });
   }
   S.shaftMarks.push(...myShafts);
   S.lineMarks.push(...myLines);
@@ -839,9 +886,20 @@ async function commitCrop() {
   if (backendOn()) {
     try {
       setSyncStatus('saving…', '');
+      // same provenance as `prov` above, in the DB's snake_case column names;
+      // `autocontrast` comes from each mark, not a shared save-time value.
+      const rowProv = {
+        world_bbox: cell.world_bbox,
+        crs: S.manifest.crs || null,
+        crop_px: S.manifest.crop_px || null,
+        tifs: cell.tifs || null,
+        crop_sha256: cell.crop_sha256 || null,
+        build_id: (S.manifest.build && S.manifest.build.build_id) || null,
+        p_pos: cell.p_pos,
+      };
       const rows = [];
-      for (const m of myShafts) rows.push({ kind: KIND_SHAFT, geom: await encryptGeom(m.world) });
-      for (const m of myLines) rows.push({ kind: KIND_CHANNEL, geom: await encryptGeom(m.world) });
+      for (const m of myShafts) rows.push({ kind: KIND_SHAFT, geom: await encryptGeom(m.world), ...rowProv, autocontrast: m.autocontrast });
+      for (const m of myLines) rows.push({ kind: KIND_CHANNEL, geom: await encryptGeom(m.world), ...rowProv, autocontrast: m.autocontrast });
       const inserted = await replaceMyCellMarks(SUPABASE, S.board, S.me, cell.id, rows);
       // tag freshly-saved marks with their dbId so a later refresh dedupes them.
       let si = 0, li = 0;
