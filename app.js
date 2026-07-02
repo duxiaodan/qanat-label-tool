@@ -44,6 +44,15 @@ const S = {
   crop: null,           // {cell, raw: ImageData, ctx, view:{x,y,scale}, marks:{points:[{px:[col,row],ac}..], lines:[{pts:[[col,row]..],ac}..]}, inProgress:[], selected:null}
                         // `ac` = autocontrast toggle state when the mark was drawn (null on
                         // pre-provenance marks reloaded from the pool; preserved across saves)
+
+  // hidden GT-review mode (personal, local-only; NEVER synced to the backend).
+  // `on` is decided once at boot from the URL; when false the feature is inert
+  // and the page behaves exactly as before.
+  review: {
+    on: new URLSearchParams(location.search).get('gtreview') === '1',
+    eligible: new Set(),  // cell ids with >=1 GT point AND exactly one owning TIF
+    verdicts: {},         // {cellId: {verdict:'accurate'|'drifted', decided_at}}
+  },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -254,6 +263,120 @@ async function refreshMarks() {
 }
 
 // --------------------------------------------------------------------------- //
+// GT review mode (hidden; active only with ?gtreview=1 in the URL)
+//
+// Personal spot-check of existing GT georeferencing: for cells that have GT
+// shaft points AND a single unambiguous owning TIF, record whether the GT dots
+// sit accurately on the imagery ('accurate') or are offset ('drifted').
+// Verdicts live in localStorage ONLY (key `qanat-gtreview:<board>`), never in
+// Supabase, and export as a standalone JSON — mark saving/sync is untouched.
+// --------------------------------------------------------------------------- //
+function reviewKey() { return 'qanat-gtreview:' + S.board; }
+function reviewLoadVerdicts() {
+  try {
+    const o = JSON.parse(localStorage.getItem(reviewKey()) || '{}');
+    S.review.verdicts = (o && typeof o === 'object' && !Array.isArray(o)) ? o : {};
+  } catch (e) { S.review.verdicts = {}; }
+}
+function reviewPersistVerdicts() {
+  try { localStorage.setItem(reviewKey(), JSON.stringify(S.review.verdicts)); }
+  catch (e) { /* quota / disabled — non-fatal */ }
+}
+/** Called from unlock() (review mode only): eligibility set + stored verdicts. */
+function reviewInit() {
+  S.review.eligible = new Set(
+    S.cells
+      .filter((c) => (c.gt_points || []).length > 0 && (c.tifs || []).length === 1)
+      .map((c) => c.id));
+  reviewLoadVerdicts();
+}
+function reviewVerdictOf(cid) {
+  const v = S.review.verdicts[cid];
+  return v && (v.verdict === 'accurate' || v.verdict === 'drifted') ? v.verdict : null;
+}
+function reviewCountReviewed() {
+  let k = 0;
+  for (const cid of S.review.eligible) if (reviewVerdictOf(cid)) k++;
+  return k;
+}
+/** Set / toggle a verdict (clicking the active one again clears it). */
+function reviewSetVerdict(cid, verdict) {
+  if (!S.review.on || !S.review.eligible.has(cid)) return;
+  if (reviewVerdictOf(cid) === verdict) delete S.review.verdicts[cid];
+  else S.review.verdicts[cid] = { verdict, decided_at: new Date().toISOString() };
+  reviewPersistVerdicts();
+  reviewRefreshUI();
+}
+/** Repaint every review-mode surface: counter, badges, swath tints, buttons. */
+function reviewRefreshUI() {
+  if (!S.review.on) return;
+  const n = S.review.eligible.size;
+  const k = reviewCountReviewed();
+  const cnt = $('gt-review-counter');
+  if (cnt) { cnt.hidden = false; cnt.textContent = `GT review: ${n} eligible · ${k} reviewed`; }
+  const dl = $('btn-gt-review-dl');
+  if (dl) { dl.hidden = false; dl.disabled = k < 1; }
+  document.querySelectorAll('#cell-list .gtr-badge').forEach((b) => {
+    const v = reviewVerdictOf(b.parentElement.dataset.cid);
+    b.textContent = v === 'accurate' ? '✓' : v === 'drifted' ? '✗' : '●';
+    b.className = 'gtr-badge ' + (v === 'accurate' ? 'gtr-acc' : v === 'drifted' ? 'gtr-dr' : 'gtr-un');
+  });
+  document.querySelectorAll('#swath-svg .cell-rect.gt-eligible').forEach((r) => {
+    const v = reviewVerdictOf(r.dataset.cid);
+    r.classList.toggle('gt-accurate', v === 'accurate');
+    r.classList.toggle('gt-drifted', v === 'drifted');
+  });
+  reviewSyncCropButtons();
+}
+/** Reflect the open crop's verdict on the two modal buttons (active state). */
+function reviewSyncCropButtons() {
+  if (!S.review.on || !S.crop) return;
+  const el = $('gt-review-btns');
+  if (!el || el.hidden) return;
+  const v = reviewVerdictOf(S.crop.cell.id);
+  $('gt-accurate').classList.toggle('active', v === 'accurate');
+  $('gt-drifted').classList.toggle('active', v === 'drifted');
+}
+function reviewDownload() {
+  if (!S.review.on) return;
+  const verdicts = [];
+  const perTif = {};
+  for (const c of S.cells) { // manifest order (p_pos desc) for a stable export
+    if (!S.review.eligible.has(c.id)) continue;
+    const v = S.review.verdicts[c.id];
+    const verdict = reviewVerdictOf(c.id);
+    if (!verdict) continue;
+    const tif = (c.tifs && c.tifs[0]) || null;
+    if (tif != null) {
+      const t = perTif[tif] || (perTif[tif] = { accurate: 0, drifted: 0 });
+      t[verdict] += 1;
+    }
+    verdicts.push({
+      cell_id: c.id,
+      verdict,
+      tif,
+      n_gt_points: (c.gt_points || []).length,
+      world_bbox: c.world_bbox,
+      p_pos: c.p_pos,
+      crop_sha256: c.crop_sha256 || null,
+      decided_at: v.decided_at || null,
+    });
+  }
+  const obj = {
+    board: S.board,
+    build_id: (S.manifest.build && S.manifest.build.build_id) || null,
+    crs: S.manifest.crs || null,
+    exported_at: new Date().toISOString(),
+    n_eligible: S.review.eligible.size,
+    n_reviewed: verdicts.length,
+    per_tif: perTif,
+    verdicts,
+  };
+  triggerDownload(obj, `gt_review_${sanitize(S.board).slice(0, 24)}_${ymd(new Date())}.json`);
+  setStatus(`downloaded ${verdicts.length} GT review verdicts`);
+}
+
+// --------------------------------------------------------------------------- //
 // passcode gate
 // --------------------------------------------------------------------------- //
 async function unlock() {
@@ -296,6 +419,7 @@ async function unlock() {
     S.swathBounds = S.manifest.swath.world_bounds;
     S.board = (S.swathBounds ? S.swathBounds.map((v) => Math.round(v)).join('_') : 'v1');
     S.storageKey = 'qanat-labels:' + S.board;
+    if (S.review.on) reviewInit(); // eligibility + stored verdicts (localStorage only)
     await pullAllMarks();
     // images
     const swathUrl = await decryptToBlobUrl('swath.enc', 'image/jpeg');
@@ -315,6 +439,7 @@ async function unlock() {
   buildSwathLayers();
   fitSwath();
   updateDownloadEnabled();
+  if (S.review.on) reviewRefreshUI(); // reveal counter/button + paint badges/tints
 }
 
 // --------------------------------------------------------------------------- //
@@ -327,6 +452,9 @@ function buildSideList() {
     const li = document.createElement('li');
     li.dataset.cid = c.id;
     li.innerHTML = `<span class="done">${S.done.has(c.id) ? '✓' : ''}</span>` +
+      // review-mode badge slot (content painted by reviewRefreshUI); the added
+      // string is '' in normal mode, so the markup is unchanged there.
+      (S.review.on && S.review.eligible.has(c.id) ? '<span class="gtr-badge"></span>' : '') +
       `<span class="cid">${c.id}</span><span class="pp">${fmtP(c.p_pos)}</span>`;
     li.addEventListener('click', () => openCrop(c.id));
     li.addEventListener('mouseenter', () => highlightCell(c.id, true));
@@ -356,6 +484,16 @@ function worldToSwathPx(x, y) {
   const mPerPx = S.manifest.swath.m_per_px;
   return [(x - minx) / mPerPx, (maxy - y) / mPerPx];
 }
+// TIFs whose existing GT was reviewed as ACCURATE (gt_review 2026-07-02, 25/25
+// unanimous verdicts) — drives the toggleable light-green swath mask. Update
+// this list as more GT-review verdicts come in.
+const ACCURATE_TIFS = new Set([
+  '1039-2088DA038_b_R_utm38n.tif',
+  '1039-2088DA037_b_L_utm38n.tif',
+  '1039-2088DA039_b_R_utm38n.tif',
+  '1039-2088DA039_b_L_utm38n.tif',
+]);
+
 function svgEl(name, attrs) {
   const e = document.createElementNS('http://www.w3.org/2000/svg', name);
   for (const k in attrs) e.setAttribute(k, attrs[k]);
@@ -368,21 +506,33 @@ function buildSwathLayers() {
   svg.setAttribute('width', S.swathW); svg.setAttribute('height', S.swathH);
   svg.setAttribute('viewBox', `0 0 ${S.swathW} ${S.swathH}`);
   svg.innerHTML = '';
+  const gAcc = svgEl('g', { id: 'g-acc' });   // accurate-TIF mask, under all other layers
   const gGt = svgEl('g', { id: 'g-gt' });
   const gMine = svgEl('g', { id: 'g-mine' });
   const gCells = svgEl('g', { id: 'g-cells' });
-  svg.appendChild(gGt); svg.appendChild(gMine); svg.appendChild(gCells);
+  svg.appendChild(gAcc); svg.appendChild(gGt); svg.appendChild(gMine); svg.appendChild(gCells);
 
   for (const c of S.cells) {
     const [x0, y0, x1, y1] = c.world_bbox;
     const [px0, py0] = worldToSwathPx(x0, y1); // top-left
     const [px1, py1] = worldToSwathPx(x1, y0); // bottom-right
+    // light-green mask over cells whose dominant owner TIF was reviewed accurate
+    // (cell-level coverage, same footprint logic as the heatmap layer)
+    if (ACCURATE_TIFS.has((c.tifs || [])[0])) {
+      gAcc.appendChild(svgEl('rect', {
+        x: Math.min(px0, px1), y: Math.min(py0, py1),
+        width: Math.abs(px1 - px0), height: Math.abs(py1 - py0),
+        class: 'acc-rect',
+      }));
+    }
     const rect = svgEl('rect', {
       x: Math.min(px0, px1), y: Math.min(py0, py1),
       width: Math.abs(px1 - px0), height: Math.abs(py1 - py0),
       class: 'cell-rect' + (S.done.has(c.id) ? ' done' : ''),
     });
     rect.dataset.cid = c.id;
+    // review mode: amber outline on eligible cells (verdict tints via reviewRefreshUI)
+    if (S.review.on && S.review.eligible.has(c.id)) rect.classList.add('gt-eligible');
     rect.addEventListener('click', (ev) => {
       ev.stopPropagation();
       // A pan-drag that ends over this rect fires a trailing click; ignore it
@@ -394,15 +544,11 @@ function buildSwathLayers() {
     rect.addEventListener('mouseleave', () => highlightCell(c.id, false));
     gCells.appendChild(rect);
 
-    // existing GT (cell.gt_points / gt_lines are in world coords)
+    // existing GT shaft points only (cell.gt_points are in world coords);
+    // GT polylines (cell.gt_lines) are deliberately NOT rendered — dots only.
     for (const [gx, gy] of c.gt_points || []) {
       const [sx, sy] = worldToSwathPx(gx, gy);
       gGt.appendChild(svgEl('circle', { cx: sx, cy: sy, r: 1.2, class: 'gt-dot' }));
-    }
-    for (const part of c.gt_lines || []) {
-      if (!part || part.length < 2) continue;
-      const pts = part.map(([gx, gy]) => worldToSwathPx(gx, gy).join(',')).join(' ');
-      gGt.appendChild(svgEl('polyline', { points: pts, class: 'gt-line' }));
     }
   }
   rebuildMineLayer();
@@ -429,6 +575,7 @@ function applyLayerToggles() {
   $('heat-img').style.display = $('tg-heatmap').checked ? '' : 'none';
   const gGt = document.getElementById('g-gt'); if (gGt) gGt.style.display = $('tg-gt').checked ? '' : 'none';
   const gMine = document.getElementById('g-mine'); if (gMine) gMine.style.display = $('tg-mine').checked ? '' : 'none';
+  const gAcc = document.getElementById('g-acc'); if (gAcc) gAcc.style.display = $('tg-acc').checked ? '' : 'none';
 }
 function applySwathTransform() {
   const { x, y, scale } = S.view;
@@ -523,7 +670,15 @@ async function openCrop(cid) {
     selectBox: null,       // [c0, r0, c1, r1] in 1024² coords while rubber-band-dragging
   };
   loadCropMarksFor(cell);
-  $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}   (${cell.gt_points.length} GT shafts, ${cell.gt_lines.length} GT lines)`;
+  $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}   (${cell.gt_points.length} GT shafts)`;
+  // GT-review verdict buttons: only in review mode AND for eligible cells
+  // (in normal mode `show` is false and the span stays hidden, as shipped).
+  const revBtns = $('gt-review-btns');
+  if (revBtns) {
+    const show = S.review.on && S.review.eligible.has(cell.id);
+    revBtns.hidden = !show;
+    if (show) reviewSyncCropButtons();
+  }
   $('crop-autocontrast').checked = false;
   $('crop-gt').checked = true;
   document.querySelector('input[name="drawmode"][value="point"]').checked = true;
@@ -623,21 +778,14 @@ function redrawCrop() {
   if (!S.crop) return;
   const { ctx, raw } = S.crop;
   ctx.putImageData($('crop-autocontrast').checked ? autocontrast(raw) : raw, 0, 0);
-  // existing GT (locked, read-only): shafts = red, channels = cyan
+  // existing GT (locked, read-only): shaft dots = red. GT polylines
+  // (cell.gt_lines) are deliberately NOT rendered — dots only.
   if ($('crop-gt').checked) {
     ctx.save();
     ctx.fillStyle = '#ff3b30';
-    ctx.strokeStyle = '#00e5ff';
-    ctx.lineWidth = 2;
     for (const [gx, gy] of S.crop.cell.gt_points || []) {
       const [c, r] = worldToPixel(gx, gy, S.crop.cell.world_bbox);
       ctx.beginPath(); ctx.arc(c, r, 4, 0, 2 * Math.PI); ctx.fill();
-    }
-    for (const part of S.crop.cell.gt_lines || []) {
-      if (!part || part.length < 2) continue;
-      ctx.beginPath();
-      part.forEach(([gx, gy], i) => { const [c, r] = worldToPixel(gx, gy, S.crop.cell.world_bbox); if (i === 0) ctx.moveTo(c, r); else ctx.lineTo(c, r); });
-      ctx.stroke();
     }
     ctx.restore();
   }
@@ -838,6 +986,15 @@ function setupCropInteractions() {
       if (S.crop.inProgress.length) { S.crop.inProgress = []; redrawCrop(); }
       else if (selCount() > 0 || S.crop.selectBox) { selClear(); S.crop.selectBox = null; redrawCrop(); }
       else closeCrop(false);
+    } else if (S.review.on && (e.key === 'a' || e.key === 'd') &&
+               !e.ctrlKey && !e.metaKey && !e.altKey) {
+      // GT-review shortcut (review mode only): a = accurate, d = drifted.
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (S.review.eligible.has(S.crop.cell.id)) {
+        reviewSetVerdict(S.crop.cell.id, e.key === 'a' ? 'accurate' : 'drifted');
+        e.preventDefault();
+      }
     }
   });
 }
@@ -957,7 +1114,14 @@ function boot() {
   $('gate-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('passcode').focus(); });
   $('btn-download').addEventListener('click', download);
   $('btn-refresh').addEventListener('click', () => { refreshMarks(); });
-  ['tg-heatmap', 'tg-gt', 'tg-mine'].forEach((id) => $(id).addEventListener('change', applyLayerToggles));
+  // GT-review wiring only exists when the URL opts in (?gtreview=1); in normal
+  // mode no listener is attached and every review element stays [hidden].
+  if (S.review.on) {
+    $('btn-gt-review-dl').addEventListener('click', reviewDownload);
+    $('gt-accurate').addEventListener('click', () => { if (S.crop) reviewSetVerdict(S.crop.cell.id, 'accurate'); });
+    $('gt-drifted').addEventListener('click', () => { if (S.crop) reviewSetVerdict(S.crop.cell.id, 'drifted'); });
+  }
+  ['tg-heatmap', 'tg-gt', 'tg-mine', 'tg-acc'].forEach((id) => $(id).addEventListener('change', applyLayerToggles));
   setupSwathPanZoom();
   setupCropInteractions();
   window.addEventListener('resize', () => { if (!$('app').hidden) applySwathTransform(); });

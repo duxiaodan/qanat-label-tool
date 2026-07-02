@@ -36,6 +36,7 @@
         <label><input type="checkbox" id="tg-heatmap" checked /> Heatmap</label>
         <label><input type="checkbox" id="tg-gt" checked /> Existing GT</label>
         <label><input type="checkbox" id="tg-mine" checked /> All marks</label>
+        <label><input type="checkbox" id="tg-acc" checked /> Accurate TIFs</label>
       </span>
       <span class="legend">
         <span class="legend-item"><span class="swatch mine"></span>your marks</span>
@@ -44,6 +45,9 @@
       <span class="spacer"></span>
       <button id="btn-refresh">Refresh</button>
       <button id="btn-download" disabled>Download GeoJSON</button>
+      <!-- GT review mode (hidden unless the URL has ?gtreview=1) -->
+      <span id="gt-review-counter" class="gt-review-counter" hidden></span>
+      <button id="btn-gt-review-dl" hidden disabled>Download review JSON</button>
       <span id="sync-status" class="sync-status"></span>
       <span id="status" class="status"></span>
     </header>
@@ -80,6 +84,11 @@
           <span class="drawmode">
             <label><input type="radio" name="drawmode" value="point" checked /> Point</label>
             <label><input type="radio" name="drawmode" value="line" /> Polyline</label>
+          </span>
+          <!-- GT review verdicts (hidden unless ?gtreview=1 AND the cell is eligible) -->
+          <span id="gt-review-btns" class="gtr-btns" hidden>
+            <button id="gt-accurate">&#10003; GT accurate</button>
+            <button id="gt-drifted">&#10007; GT drifted</button>
           </span>
           <button id="crop-undo">Undo last</button>
           <button id="crop-clear">Clear this crop</button>

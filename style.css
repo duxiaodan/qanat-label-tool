@@ -89,6 +89,9 @@ body {
 #swath-svg .cell-rect { fill: transparent; stroke: rgba(255,255,255,.12); stroke-width: 0.6; cursor: pointer; }
 #swath-svg .cell-rect:hover, #swath-svg .cell-rect.hover { fill: rgba(120,170,255,.12); stroke: rgba(120,170,255,.7); }
 #swath-svg .cell-rect.done { stroke: rgba(76,175,80,.6); }
+/* accurate-TIF mask: half-transparent light green over cells whose dominant
+   owner TIF was GT-reviewed accurate; never intercepts clicks (cells on top) */
+#swath-svg .acc-rect { fill: rgba(144, 238, 144, .45); stroke: none; pointer-events: none; }
 #swath-svg .gt-dot { fill: #ff3b30; }                       /* existing GT shafts = red  */
 #swath-svg .gt-line { fill: none; stroke: #00e5ff; stroke-width: 1.0; }  /* existing GT channels = cyan */
 #swath-svg .mine-dot { fill: #39ff14; }                     /* my marks = lime */
@@ -112,6 +115,25 @@ body {
   height: 7px; box-sizing: border-box; min-width: 1px;
   border: 2px solid #fff; border-top: none; background: rgba(0,0,0,.3);
 }
+
+/* ---------- GT review mode (elements exist but stay [hidden] unless ?gtreview=1) ---------- */
+#topbar .gt-review-counter { font-size: 12px; color: #f6c453; white-space: nowrap; }
+#cell-list li .gtr-badge { width: 12px; text-align: center; font-weight: 700; flex: 0 0 auto; }
+#cell-list li .gtr-badge.gtr-un  { color: #f6c453; }  /* unreviewed = amber ● */
+#cell-list li .gtr-badge.gtr-acc { color: #4caf50; }  /* accurate   = green ✓ */
+#cell-list li .gtr-badge.gtr-dr  { color: #e05a4f; }  /* drifted    = red   ✗ */
+/* eligible cells: subtle amber outline; verdicts tint it green/red. Hover/done
+   fills and the .done tick behavior are untouched (these rules only set stroke). */
+#swath-svg .cell-rect.gt-eligible { stroke: rgba(246,196,83,.75); stroke-width: 0.9; }
+#swath-svg .cell-rect.gt-eligible.gt-accurate { stroke: rgba(76,175,80,.75); }
+#swath-svg .cell-rect.gt-eligible.gt-drifted { stroke: rgba(224,90,79,.85); }
+/* keep the blue hover highlight readable on top of review outlines */
+#swath-svg .cell-rect.gt-eligible:hover, #swath-svg .cell-rect.gt-eligible.hover {
+  fill: rgba(120,170,255,.12); stroke: rgba(120,170,255,.7);
+}
+.modal-tools .gtr-btns { display: flex; gap: 6px; padding: 0 8px; border-right: 1px solid #444; }
+.modal-tools .gtr-btns button.active#gt-accurate { background: #2e7d32; }
+.modal-tools .gtr-btns button.active#gt-drifted { background: #b3382c; }
 
 /* ---------- crop modal ---------- */
 .modal { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: flex; align-items: center; justify-content: center; z-index: 50; }
