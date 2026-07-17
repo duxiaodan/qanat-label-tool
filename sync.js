@@ -50,55 +50,99 @@ export async function fetchAllMarks(cfg, board) {
 /** Optional per-row plaintext provenance columns, passed through when present. */
 const PROVENANCE_ROW_FIELDS = [
   'world_bbox', 'crs', 'crop_px', 'tifs', 'crop_sha256', 'build_id', 'p_pos', 'autocontrast',
+  // created_at: echoed back on re-saves so a re-inserted mark keeps its
+  // first-save server timestamp; left undefined on new marks → DB default now().
+  'created_at',
 ];
 
+/** The `(board, labeler, cell_id)` scope filter shared by the cell-level calls. */
+function _cellScope(board, labeler, cellId) {
+  return `board=eq.${encodeURIComponent(board)}` +
+    `&labeler=eq.${encodeURIComponent(labeler)}` +
+    `&cell_id=eq.${encodeURIComponent(cellId)}`;
+}
+
 /**
- * Replace *my* rows for one (board, labeler, cell_id): DELETE then POST the new
- * encrypted rows. Others' rows are never touched. Throws when no backend so the
- * caller can keep the local copy + flag "unsynced".
+ * GET my current row ids for one (board, labeler, cell_id). Used by the
+ * reconcile-on-save flow in app.js: untouched marks (their dbId still present
+ * here) are left completely alone — no delete, no re-insert.
+ * @returns {Promise<Array<{id:number, kind:string}>>}
+ */
+export async function fetchMyCellMarks(cfg, board, labeler, cellId) {
+  if (!cfg) throw new Error('no supabase config');
+  const url = `${_base(cfg)}/rest/v1/marks?${_cellScope(board, labeler, cellId)}&select=id,kind`;
+  const r = await fetch(url, { headers: _headers(cfg), cache: 'no-store' });
+  await _check(r, 'fetchMyCellMarks');
+  return r.json();
+}
+
+/**
+ * DELETE specific rows by id, still scoped to (board, labeler, cell_id) as a
+ * belt-and-braces guard so a buggy id list can never touch another labeler's
+ * (or cell's) rows. No-op on an empty id list.
+ * @param {Array<number>} ids
+ */
+export async function deleteMarksByIds(cfg, board, labeler, cellId, ids) {
+  if (!cfg) throw new Error('no supabase config');
+  if (!ids || ids.length === 0) return null;
+  const q = `${_cellScope(board, labeler, cellId)}&id=in.(${ids.map(Number).join(',')})`;
+  const url = `${_base(cfg)}/rest/v1/marks?${q}`;
+  const r = await fetch(url, { method: 'DELETE', headers: _headers(cfg) });
+  await _check(r, 'deleteMarksByIds');
+  return r;
+}
+
+/**
+ * POST new encrypted rows for one (board, labeler, cell_id). Each row should be
+ * `{kind, geom}` (+ optional PROVENANCE_ROW_FIELDS, passed through verbatim —
+ * dumb pass-through, no crypto here); board/labeler/cell_id are filled in.
  *
- * Each row in `rows` should already be `{board, labeler, cell_id, kind, geom}`
- * with `geom` = base64( AES ciphertext ). `board`/`labeler`/`cell_id` are filled
- * in here from the arguments if a row omits them, for convenience. Optional
- * plaintext provenance columns (see PROVENANCE_ROW_FIELDS) are passed through
- * verbatim when present on a row — dumb pass-through, no crypto here.
+ * PostgREST bulk inserts reject arrays whose objects have differing key sets
+ * (PGRST102 "All object keys must match", and this deployment lacks
+ * `missing=default`). Rows legitimately differ: re-inserted marks echo their
+ * created_at while new marks omit it so the DB default now() applies. So
+ * POST one request per distinct key signature.
  *
- * @param {{url:string, anonKey:string}|null|undefined} cfg
- * @param {string} board
- * @param {string} labeler
- * @param {string} cellId
  * @param {Array<{kind:string, geom:string}>} rows
  * @returns {Promise<Array<object>>} the inserted rows (PostgREST `return=representation`)
  */
-export async function replaceMyCellMarks(cfg, board, labeler, cellId, rows) {
+export async function insertMarks(cfg, board, labeler, cellId, rows) {
   if (!cfg) throw new Error('no supabase config');
-  await deleteMyCellMarks(cfg, board, labeler, cellId);
   const payload = (rows || []).map((row) => {
     const out = { board, labeler, cell_id: cellId, kind: row.kind, geom: row.geom };
     for (const k of PROVENANCE_ROW_FIELDS) if (row[k] !== undefined) out[k] = row[k];
     return out;
   });
   if (payload.length === 0) return [];
+  const groups = new Map();
+  for (const row of payload) {
+    const sig = Object.keys(row).sort().join(',');
+    if (!groups.has(sig)) groups.set(sig, []);
+    groups.get(sig).push(row);
+  }
   const url = `${_base(cfg)}/rest/v1/marks`;
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { ..._headers(cfg), Prefer: 'return=representation' },
-    body: JSON.stringify(payload),
-  });
-  await _check(r, 'replaceMyCellMarks:insert');
-  return r.json();
+  const inserted = [];
+  for (const rows_ of groups.values()) {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { ..._headers(cfg), Prefer: 'return=representation' },
+      body: JSON.stringify(rows_),
+    });
+    await _check(r, 'insertMarks');
+    inserted.push(...await r.json());
+  }
+  return inserted;
 }
 
 /**
- * DELETE my rows for (board, labeler, cell_id). Throws when no backend.
+ * DELETE ALL my rows for (board, labeler, cell_id). Not used by the normal
+ * save path (which reconciles per row — see app.js commitCrop); kept as a
+ * utility for admin/cleanup use.
  * @param {{url:string, anonKey:string}|null|undefined} cfg
  */
 export async function deleteMyCellMarks(cfg, board, labeler, cellId) {
   if (!cfg) throw new Error('no supabase config');
-  const q = `board=eq.${encodeURIComponent(board)}` +
-    `&labeler=eq.${encodeURIComponent(labeler)}` +
-    `&cell_id=eq.${encodeURIComponent(cellId)}`;
-  const url = `${_base(cfg)}/rest/v1/marks?${q}`;
+  const url = `${_base(cfg)}/rest/v1/marks?${_cellScope(board, labeler, cellId)}`;
   const r = await fetch(url, { method: 'DELETE', headers: _headers(cfg) });
   await _check(r, 'deleteMyCellMarks');
   return r;

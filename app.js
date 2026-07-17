@@ -11,7 +11,7 @@
 import { pixelToWorld, worldToPixel } from './geo.js';
 import { buildShaftsFeatureCollection, buildLinesFeatureCollection } from './geojson.js';
 import { deriveKey, decryptBlob, encryptBlob, verifyPasscode } from './crypto.js';
-import { fetchAllMarks, replaceMyCellMarks } from './sync.js';
+import { fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks } from './sync.js';
 import { SUPABASE } from './site_config.js';
 
 // --------------------------------------------------------------------------- //
@@ -692,15 +692,17 @@ function loadCropMarksFor(cell) {
   const mine = { points: [], lines: [] };
   const others = { points: [], lines: [] };
   // my marks keep their per-mark autocontrast flag (`ac`; null on pre-provenance
-  // rows) so a re-save never restamps them; others' are display-only bare coords.
+  // rows), their `created` timestamp AND their `dbId` — an untouched mark keeps
+  // its row byte-identical across saves (the reconcile in commitCrop skips it);
+  // others' are display-only bare coords.
   for (const m of S.shaftMarks) if (m.cropId === cid) {
     const px = worldToPixel(m.world[0], m.world[1], cell.world_bbox);
-    if (m.labeler === S.me) mine.points.push({ px, ac: m.autocontrast ?? null });
+    if (m.labeler === S.me) mine.points.push({ px, ac: m.autocontrast ?? null, created: m.created || null, dbId: m.dbId ?? null });
     else others.points.push(px);
   }
   for (const m of S.lineMarks) if (m.cropId === cid) {
     const ln = m.world.map(([x, y]) => worldToPixel(x, y, cell.world_bbox));
-    if (m.labeler === S.me) mine.lines.push({ pts: ln, ac: m.autocontrast ?? null });
+    if (m.labeler === S.me) mine.lines.push({ pts: ln, ac: m.autocontrast ?? null, created: m.created || null, dbId: m.dbId ?? null });
     else others.lines.push(ln);
   }
   S.crop.marks = mine;
@@ -1009,11 +1011,12 @@ async function commitCrop() {
   // drop ONLY MY old marks for this cell; never touch others' marks.
   S.shaftMarks = S.shaftMarks.filter((m) => !(m.cropId === cell.id && m.labeler === S.me));
   S.lineMarks = S.lineMarks.filter((m) => !(m.cropId === cell.id && m.labeler === S.me));
-  const now = new Date().toISOString();
   // provenance stamped on every mark at save time (camelCase locally, so the
   // GeoJSON export is faithful without a refetch; snake_case in the DB rows).
   // `autocontrast` is per mark — carried from draw time (or the original row on
-  // reloaded marks), NOT the toggle state at save.
+  // reloaded marks), NOT the toggle state at save. `created` is per mark too:
+  // reloaded marks keep their first-save server timestamp (echoed back to the
+  // DB below); new marks stay null and pick up the DB's now() after insert.
   const prov = {
     worldBbox: cell.world_bbox,
     crs: S.manifest.crs || null,
@@ -1026,11 +1029,11 @@ async function commitCrop() {
   const myLines = [];
   for (const p of S.crop.marks.points) {
     const [x, y] = pixelToWorld(p.px[0], p.px[1], cell.world_bbox);
-    myShafts.push({ cropId: cell.id, pPos: cell.p_pos, world: [x, y], created: now, labeler: S.me, ...prov, autocontrast: p.ac ?? null });
+    myShafts.push({ cropId: cell.id, pPos: cell.p_pos, world: [x, y], created: p.created || null, dbId: p.dbId ?? null, kind: KIND_SHAFT, labeler: S.me, ...prov, autocontrast: p.ac ?? null });
   }
   for (const ln of S.crop.marks.lines) {
     if (ln.pts.length < 2) continue;
-    myLines.push({ cropId: cell.id, pPos: cell.p_pos, world: ln.pts.map(([c, r]) => pixelToWorld(c, r, cell.world_bbox)), created: now, labeler: S.me, ...prov, autocontrast: ln.ac ?? null });
+    myLines.push({ cropId: cell.id, pPos: cell.p_pos, world: ln.pts.map(([c, r]) => pixelToWorld(c, r, cell.world_bbox)), created: ln.created || null, dbId: ln.dbId ?? null, kind: KIND_CHANNEL, labeler: S.me, ...prov, autocontrast: ln.ac ?? null });
   }
   S.shaftMarks.push(...myShafts);
   S.lineMarks.push(...myLines);
@@ -1039,10 +1042,22 @@ async function commitCrop() {
   rebuildMineLayer();
   applyLayerToggles();
 
-  // push my marks for this cell to the backend (replace-my-rows), if configured.
+  // push my marks for this cell to the backend, if configured. RECONCILE, not
+  // replace: an untouched mark (its dbId still present server-side) is left
+  // completely alone, so its row — id, created_at, updated_at, geom ciphertext,
+  // provenance — stays byte-identical across saves. Only rows whose mark was
+  // removed get deleted, and only new/stale marks get inserted (stale = a dbId
+  // whose row vanished, e.g. after an earlier failed save; those echo their
+  // created_at so the original timestamp survives the re-insert).
   if (backendOn()) {
     try {
       setSyncStatus('saving…', '');
+      const existing = await fetchMyCellMarks(SUPABASE, S.board, S.me, cell.id);
+      const existingIds = new Set(existing.map((r) => r.id));
+      const mine = [...myShafts, ...myLines];
+      const keptIds = new Set();
+      for (const m of mine) if (m.dbId != null && existingIds.has(m.dbId)) keptIds.add(m.dbId);
+      const toDelete = [...existingIds].filter((id) => !keptIds.has(id));
       // same provenance as `prov` above, in the DB's snake_case column names;
       // `autocontrast` comes from each mark, not a shared save-time value.
       const rowProv = {
@@ -1054,15 +1069,23 @@ async function commitCrop() {
         build_id: (S.manifest.build && S.manifest.build.build_id) || null,
         p_pos: cell.p_pos,
       };
-      const rows = [];
-      for (const m of myShafts) rows.push({ kind: KIND_SHAFT, geom: await encryptGeom(m.world), ...rowProv, autocontrast: m.autocontrast });
-      for (const m of myLines) rows.push({ kind: KIND_CHANNEL, geom: await encryptGeom(m.world), ...rowProv, autocontrast: m.autocontrast });
-      const inserted = await replaceMyCellMarks(SUPABASE, S.board, S.me, cell.id, rows);
-      // tag freshly-saved marks with their dbId so a later refresh dedupes them.
-      let si = 0, li = 0;
+      // `created_at: undefined` on new marks → column omitted → DB default now().
+      const inserts = [];
+      for (const m of mine) {
+        if (m.dbId != null && existingIds.has(m.dbId)) continue; // untouched — leave its row alone
+        inserts.push({ mark: m, row: { kind: m.kind, geom: await encryptGeom(m.world), ...rowProv, autocontrast: m.autocontrast, created_at: m.created || undefined } });
+      }
+      await deleteMarksByIds(SUPABASE, S.board, S.me, cell.id, toDelete);
+      const inserted = await insertMarks(SUPABASE, S.board, S.me, cell.id, inserts.map((x) => x.row));
+      // tag freshly-inserted marks with their dbId (so the next save skips them)
+      // and their server-stamped created_at (so any future re-insert echoes it).
+      // Match by geom ciphertext — unique per row (AES-GCM random IV) and stable
+      // across the round-trip, unlike array order (inserts may split into
+      // several POSTs by key signature).
+      const byGeom = new Map(inserts.map((x) => [x.row.geom, x.mark]));
       for (const ins of inserted || []) {
-        if (ins.kind === KIND_SHAFT && si < myShafts.length) myShafts[si++].dbId = ins.id;
-        else if (ins.kind === KIND_CHANNEL && li < myLines.length) myLines[li++].dbId = ins.id;
+        const m = byGeom.get(ins.geom);
+        if (m) { m.dbId = ins.id; m.created = ins.created_at || m.created; }
       }
       S.unsynced = false;
       setSyncStatus('saved', 'ok');
