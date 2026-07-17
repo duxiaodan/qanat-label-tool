@@ -1,10 +1,10 @@
-# Keep the Supabase free-tier project awake.
+# Keep the Supabase free-tier projects awake.
 #
 # Supabase pauses free projects after 7 consecutive days without API
 # activity. This sends one lightweight read-only request per day to the
-# prod REST API so the labeling backend never goes quiet long enough to
-# be paused. The apikey below is the *public* anon key — the same value
-# shipped to every visitor in site_config.js — so it is not a secret.
+# prod AND test/staging REST APIs so neither labeling backend goes quiet
+# long enough to be paused. The apikeys below are the *public* anon keys
+# (prod's is shipped to every visitor in site_config.js) — not secrets.
 #
 # Note: GitHub disables scheduled workflows after ~60 days without any
 # repo activity; if that happens, re-enable it under the Actions tab.
@@ -29,3 +29,13 @@ jobs:
           test "$code" = "200"
         env:
           SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV1b3Z3c3dvbHJveXRwdG5scWllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODE4MjkwMzEsImV4cCI6MjA5NzQwNTAzMX0.1caB9P85ddM20632oxt4rcKuVsiNjaYTX2JSwG_AXO8
+      - name: Ping test/staging REST API (read-only)
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            'https://atoblsvyemtvxwkhquwz.supabase.co/rest/v1/marks?select=id&limit=1' \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY")
+          echo "HTTP $code"
+          test "$code" = "200"
+        env:
+          SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF0b2Jsc3Z5ZW10dnh3a2hxdXd6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODE4MjgzNjksImV4cCI6MjA5NzQwNDM2OX0.r4VYo9yzQIMoOGcnz2bBxaRqlw7Ld4nJSc-8NG5xnJU
