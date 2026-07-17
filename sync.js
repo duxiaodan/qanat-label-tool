@@ -32,19 +32,34 @@ async function _check(r, what) {
   return r;
 }
 
+/** Page size for fetchAllMarks. Supabase caps every REST response at its
+ * "Max rows" setting (default 1000) SILENTLY, so a single un-ranged GET would
+ * quietly truncate once the pool grows past it. Must not exceed that cap. */
+const FETCH_PAGE = 1000;
+
 /**
- * GET all marks for a board. Returns the raw rows (each row's `geom` is still
- * base64 ciphertext — do NOT decrypt here). Returns [] when no backend.
+ * GET all marks for a board, paginated (Range headers, FETCH_PAGE rows per
+ * request, stable id order) so the pool is complete at any size. Returns the
+ * raw rows (each row's `geom` is still base64 ciphertext — do NOT decrypt
+ * here). Returns [] when no backend.
  * @param {{url:string, anonKey:string}|null|undefined} cfg
  * @param {string} board
  * @returns {Promise<Array<object>>}
  */
 export async function fetchAllMarks(cfg, board) {
   if (!cfg) return [];
-  const url = `${_base(cfg)}/rest/v1/marks?board=eq.${encodeURIComponent(board)}&select=*`;
-  const r = await fetch(url, { headers: _headers(cfg), cache: 'no-store' });
-  await _check(r, 'fetchAllMarks');
-  return r.json();
+  const url = `${_base(cfg)}/rest/v1/marks?board=eq.${encodeURIComponent(board)}&select=*&order=id.asc`;
+  const rows = [];
+  for (let from = 0; ; from += FETCH_PAGE) {
+    const r = await fetch(url, {
+      headers: { ..._headers(cfg), Range: `${from}-${from + FETCH_PAGE - 1}` },
+      cache: 'no-store',
+    });
+    await _check(r, 'fetchAllMarks');
+    const page = await r.json();
+    rows.push(...page);
+    if (page.length < FETCH_PAGE) return rows;
+  }
 }
 
 /** Optional per-row plaintext provenance columns, passed through when present. */
