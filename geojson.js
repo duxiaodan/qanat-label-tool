@@ -19,6 +19,7 @@ function shaftProps(mark, labeler) {
   return {
     // per-mark owner wins (shared pool); fall back to the caller-supplied default.
     labeler: (mark && mark.labeler) || labeler,
+    project: mark.project ?? null,
     crop_id: mark.cropId,
     created: mark.created,
     source: 'web_label_tool',

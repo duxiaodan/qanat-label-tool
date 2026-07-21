@@ -34,6 +34,10 @@ const S = {
   lineMarks: [],        // {cropId, pPos, world:[[x,y],...], created, labeler, dbId?}
   done: new Set(),      // cell ids with >=1 saved mark (from anyone)
   unsynced: false,      // true when a save couldn't reach the backend
+  // "labeled by…" cell filter — one state drives the sidebar AND the map tint.
+  // '' = off | 'me' | '__anyone__' | '__unlabeled__' | a normalized labeler name.
+  filter: '',
+  labelerCells: { byLabeler: new Map(), any: new Set() }, // derived from the pool
   storageKey: 'qanat-labels:v1',
   // swath view transform
   view: { x: 0, y: 0, scale: 1 },
@@ -197,7 +201,7 @@ async function pullAllMarks() {
   if (!S.shaftMarks.length && !S.lineMarks.length) restore();
   let rows;
   try {
-    rows = await fetchAllMarks(SUPABASE, S.board);
+    rows = await fetchAllMarks(SUPABASE, S.board, S.project);
   } catch (e) {
     // can't reach backend — fall back to whatever we have locally.
     restore();
@@ -225,6 +229,7 @@ async function pullAllMarks() {
       cropSha256: row.crop_sha256 ?? null,
       buildId: row.build_id ?? null,
       autocontrast: row.autocontrast ?? null,
+      project: row.project ?? null,
     };
     if (row.kind === KIND_SHAFT) {
       // a shaft is stored as {world:[x,y]} (a flat pair); tolerate a nested
@@ -256,6 +261,7 @@ function cellPPos(cropId) {
 /** Re-pull the pool + redraw everything (Refresh button + post-save consistency). */
 async function refreshMarks() {
   await pullAllMarks();
+  refreshFilterUI(); // labeler sets + dropdown options + filtered sidebar + tint
   refreshDoneMarks();
   rebuildMineLayer();
   applyLayerToggles();
@@ -384,6 +390,8 @@ async function unlock() {
   $('gate-msg').textContent = '';
   const nameRaw = $('gate-name').value;
   if (!nameRaw.trim()) { $('gate-msg').textContent = 'enter your name before labeling'; return; }
+  const project = $('gate-project').value;
+  if (!project || !PROJECTS.includes(project)) { $('gate-msg').textContent = 'select a project before labeling'; return; }
   if (!pw) { $('gate-msg').textContent = 'enter a passcode'; return; }
   let cj;
   try { cj = await fetchJson('crypto.json'); }
@@ -393,8 +401,10 @@ async function unlock() {
   // identity: normalize for matching, remember the display name for suggestions.
   S.meDisplay = nameRaw.trim().replace(/\s+/g, ' ');
   S.me = normalize(S.meDisplay);
+  S.project = project;
   rememberName(S.meDisplay);
   $('me-name').textContent = S.meDisplay;
+  $('me-project').textContent = S.project; // topbar reminder of the active project
   $('labeler').value = S.meDisplay; // keep the (hidden) download field in sync
 
   $('gate-loading').hidden = false;
@@ -418,7 +428,9 @@ async function unlock() {
     S.swathW = S.manifest.swath.width; S.swathH = S.manifest.swath.height;
     S.swathBounds = S.manifest.swath.world_bounds;
     S.board = (S.swathBounds ? S.swathBounds.map((v) => Math.round(v)).join('_') : 'v1');
-    S.storageKey = 'qanat-labels:' + S.board;
+    // cache is per (board, project) — without the project the offline cache
+    // would bleed one project's marks into another even with the DB filtered.
+    S.storageKey = 'qanat-labels:' + S.board + ':' + S.project;
     if (S.review.on) reviewInit(); // eligibility + stored verdicts (localStorage only)
     await pullAllMarks();
     // images
@@ -435,11 +447,97 @@ async function unlock() {
   $('gate').hidden = true;
   $('app').hidden = false;
   sessionStorage.setItem('qanat-unlocked', '1');
+  computeLabelerCells();   // before buildSideList: the filter dropdown + sets
+  rebuildFilterOptions();  // need the freshly pulled pool and S.meDisplay
   buildSideList();
   buildSwathLayers();
   fitSwath();
   updateDownloadEnabled();
   if (S.review.on) reviewRefreshUI(); // reveal counter/button + paint badges/tints
+}
+
+// --------------------------------------------------------------------------- //
+// "labeled by…" filter — sidebar dropdown + map spotlight dim (g-filter).
+// Derived entirely from the project-scoped pulled pool; recomputed on every
+// pull/save so the option list and the matching sets never go stale.
+// --------------------------------------------------------------------------- //
+const FILTER_ANYONE = '__anyone__';
+const FILTER_UNLABELED = '__unlabeled__';
+
+/** One pass over the pool -> per-labeler cell sets + the "any mark" set. */
+function computeLabelerCells() {
+  const byLabeler = new Map();
+  const any = new Set();
+  const add = (m) => {
+    if (!m.cropId) return;
+    any.add(m.cropId);
+    const who = m.labeler || '';
+    let s = byLabeler.get(who);
+    if (!s) byLabeler.set(who, (s = new Set()));
+    s.add(m.cropId);
+  };
+  S.shaftMarks.forEach(add);
+  S.lineMarks.forEach(add);
+  S.labelerCells = { byLabeler, any };
+}
+function cellMatchesFilter(cid) {
+  const f = S.filter;
+  if (!f) return true;
+  if (f === FILTER_ANYONE) return S.labelerCells.any.has(cid);
+  if (f === FILTER_UNLABELED) return !S.labelerCells.any.has(cid);
+  const s = S.labelerCells.byLabeler.get(f === 'me' ? S.me : f);
+  return !!s && s.has(cid);
+}
+/** Rebuild the dropdown's options, preserving the selection when still valid. */
+function rebuildFilterOptions() {
+  const sel = $('cell-filter');
+  if (!sel) return;
+  const others = [...S.labelerCells.byLabeler.keys()]
+    .filter((n) => n && n !== S.me)
+    .sort();
+  // the selected labeler vanished from the pool -> reset to "all cells"
+  if (S.filter && S.filter !== 'me' && S.filter !== FILTER_ANYONE &&
+      S.filter !== FILTER_UNLABELED && !others.includes(S.filter)) S.filter = '';
+  sel.innerHTML = '';
+  const opt = (value, label) => {
+    const o = document.createElement('option');
+    o.value = value; o.textContent = label;
+    sel.appendChild(o);
+  };
+  opt('', '— all cells —');
+  opt('me', `me (${S.meDisplay})`);
+  for (const n of others) opt(n, n);
+  opt(FILTER_ANYONE, 'anyone');
+  opt(FILTER_UNLABELED, 'unlabeled');
+  sel.value = S.filter;
+}
+/** Repaint the g-filter SPOTLIGHT (empty when no filter is selected): one
+ *  even-odd path that veils the whole canvas dark EXCEPT the matching cells,
+ *  which stay at full brightness. Communicating by contrast instead of by a
+ *  color fill keeps the filter legible over the plasma heatmap / green mask. */
+function rebuildFilterLayer() {
+  const g = document.getElementById('g-filter');
+  if (!g) return;
+  g.innerHTML = '';
+  if (!S.filter) return;
+  let d = `M0 0H${S.swathW}V${S.swathH}H0Z`; // outer: the whole swath canvas
+  for (const c of S.cells) {
+    if (!cellMatchesFilter(c.id)) continue;
+    const [x0, y0, x1, y1] = c.world_bbox;
+    const [px0, py0] = worldToSwathPx(x0, y1);
+    const [px1, py1] = worldToSwathPx(x1, y0);
+    const x = Math.min(px0, px1), y = Math.min(py0, py1);
+    d += `M${x} ${y}h${Math.abs(px1 - px0)}v${Math.abs(py1 - py0)}h${-Math.abs(px1 - px0)}Z`; // hole
+  }
+  g.appendChild(svgEl('path', { d, 'fill-rule': 'evenodd', class: 'filter-dim' }));
+}
+/** Full refresh of everything the filter drives (call after pool changes). */
+function refreshFilterUI() {
+  computeLabelerCells();
+  rebuildFilterOptions();
+  buildSideList();
+  rebuildFilterLayer();
+  if (S.review.on) reviewRefreshUI(); // repaint badges on the rebuilt rows
 }
 
 // --------------------------------------------------------------------------- //
@@ -449,6 +547,7 @@ function buildSideList() {
   const ul = $('cell-list');
   ul.innerHTML = '';
   for (const c of S.cells) {
+    if (!cellMatchesFilter(c.id)) continue; // active filter -> matching cells only
     const li = document.createElement('li');
     li.dataset.cid = c.id;
     li.innerHTML = `<span class="done">${S.done.has(c.id) ? '✓' : ''}</span>` +
@@ -457,8 +556,8 @@ function buildSideList() {
       (S.review.on && S.review.eligible.has(c.id) ? '<span class="gtr-badge"></span>' : '') +
       `<span class="cid">${c.id}</span><span class="pp">${fmtP(c.p_pos)}</span>`;
     li.addEventListener('click', () => openCrop(c.id));
-    li.addEventListener('mouseenter', () => highlightCell(c.id, true));
-    li.addEventListener('mouseleave', () => highlightCell(c.id, false));
+    li.addEventListener('mouseenter', () => highlightCell(c.id, true, true));
+    li.addEventListener('mouseleave', () => highlightCell(c.id, false, true));
     ul.appendChild(li);
   }
 }
@@ -471,9 +570,47 @@ function refreshDoneMarks() {
     r.classList.toggle('done', S.done.has(r.dataset.cid));
   });
 }
-function highlightCell(cid, on) {
+function highlightCell(cid, on, strong = false) {
   document.querySelectorAll(`#cell-list li[data-cid="${CSS.escape(cid)}"]`).forEach((li) => li.classList.toggle('hl', on));
   document.querySelectorAll(`#swath-svg .cell-rect[data-cid="${CSS.escape(cid)}"]`).forEach((r) => r.classList.toggle('hover', on));
+  // sidebar-driven hover gets the strong casing highlight (the subtle blue is
+  // invisible under the heatmap/mask, and the cursor isn't on the map to guide
+  // the eye); direct map hover keeps the subtle style only.
+  if (strong) setStrongHighlight(on ? cid : null);
+}
+/** Show the black/white casing rects over one cell (null = hide). */
+function setStrongHighlight(cid) {
+  const outer = document.getElementById('hl-outer');
+  const inner = document.getElementById('hl-inner');
+  if (!outer || !inner) return;
+  const cell = cid ? S.cellById.get(cid) : null;
+  if (!cell) {
+    outer.setAttribute('visibility', 'hidden');
+    inner.setAttribute('visibility', 'hidden');
+    return;
+  }
+  const [x0, y0, x1, y1] = cell.world_bbox;
+  const [px0, py0] = worldToSwathPx(x0, y1);
+  const [px1, py1] = worldToSwathPx(x1, y0);
+  for (const r of [outer, inner]) {
+    r.setAttribute('x', Math.min(px0, px1));
+    r.setAttribute('y', Math.min(py0, py1));
+    r.setAttribute('width', Math.abs(px1 - px0));
+    r.setAttribute('height', Math.abs(py1 - py0));
+    r.setAttribute('visibility', 'visible');
+  }
+  updateHlStrokeWidths();
+}
+/** Keep the casing strokes a constant SCREEN width (5px black / 3px white).
+ *  The zoom is a CSS scale() on #swath-stage, which scales the rendered SVG
+ *  wholesale — SVG's vector-effect can't counteract an HTML-ancestor
+ *  transform — so we divide the stroke width by the current zoom instead. */
+function updateHlStrokeWidths() {
+  const outer = document.getElementById('hl-outer');
+  const inner = document.getElementById('hl-inner');
+  const s = S.view.scale || 1;
+  if (outer) outer.setAttribute('stroke-width', 5 / s);
+  if (inner) inner.setAttribute('stroke-width', 3 / s);
 }
 
 // --------------------------------------------------------------------------- //
@@ -487,6 +624,13 @@ function worldToSwathPx(x, y) {
 // TIFs whose existing GT was reviewed as ACCURATE (gt_review 2026-07-02, 25/25
 // unanimous verdicts) — drives the toggleable light-green swath mask. Update
 // this list as more GT-review verdicts come in.
+// Labeling projects. Marks are fully separated per project: the gate requires
+// picking one (never remembered across logins — a stale preselection is how
+// labels end up in the wrong project), every DB row is stamped with it, and
+// pull/save/reconcile are all scoped to it. Select-only: users cannot add
+// projects; to add one, extend this list (alphabetical) and redeploy.
+const PROJECTS = ['EPAS_2026_Q2', 'Test'];
+
 const ACCURATE_TIFS = new Set([
   '1039-2088DA038_b_R_utm38n.tif',
   '1039-2088DA037_b_L_utm38n.tif',
@@ -507,10 +651,19 @@ function buildSwathLayers() {
   svg.setAttribute('viewBox', `0 0 ${S.swathW} ${S.swathH}`);
   svg.innerHTML = '';
   const gAcc = svgEl('g', { id: 'g-acc' });   // accurate-TIF mask, under all other layers
+  // "labeled by…" tint: above the green mask, below GT dots / marks / cells
+  const gFilter = svgEl('g', { id: 'g-filter' });
   const gGt = svgEl('g', { id: 'g-gt' });
   const gMine = svgEl('g', { id: 'g-mine' });
   const gCells = svgEl('g', { id: 'g-cells' });
-  svg.appendChild(gAcc); svg.appendChild(gGt); svg.appendChild(gMine); svg.appendChild(gCells);
+  svg.appendChild(gAcc); svg.appendChild(gFilter); svg.appendChild(gGt); svg.appendChild(gMine); svg.appendChild(gCells);
+  // strong sidebar-hover highlight: white outline inside a black casing, in a
+  // group appended LAST so it paints above every other layer (the heatmap is a
+  // sibling <img> below the whole SVG). Hidden until a sidebar row is hovered.
+  const gHl = svgEl('g', { id: 'g-hl' });
+  gHl.appendChild(svgEl('rect', { id: 'hl-outer', class: 'hl-casing hl-outer', visibility: 'hidden' }));
+  gHl.appendChild(svgEl('rect', { id: 'hl-inner', class: 'hl-casing hl-inner', visibility: 'hidden' }));
+  svg.appendChild(gHl);
 
   for (const c of S.cells) {
     const [x0, y0, x1, y1] = c.world_bbox;
@@ -552,6 +705,7 @@ function buildSwathLayers() {
     }
   }
   rebuildMineLayer();
+  rebuildFilterLayer();
   applyLayerToggles();
 }
 function rebuildMineLayer() {
@@ -576,10 +730,12 @@ function applyLayerToggles() {
   const gGt = document.getElementById('g-gt'); if (gGt) gGt.style.display = $('tg-gt').checked ? '' : 'none';
   const gMine = document.getElementById('g-mine'); if (gMine) gMine.style.display = $('tg-mine').checked ? '' : 'none';
   const gAcc = document.getElementById('g-acc'); if (gAcc) gAcc.style.display = $('tg-acc').checked ? '' : 'none';
+  const gFilter = document.getElementById('g-filter'); if (gFilter) gFilter.style.display = $('tg-filter').checked ? '' : 'none';
 }
 function applySwathTransform() {
   const { x, y, scale } = S.view;
   $('swath-stage').style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+  updateHlStrokeWidths(); // keep the hover-casing outline constant in screen px
   updateScaleBar();
 }
 // "nice" round distances (m) for the dynamic scale bar (1/2/5 x 10^n)
@@ -1024,6 +1180,7 @@ async function commitCrop() {
     tifs: cell.tifs || null,
     cropSha256: cell.crop_sha256 || null,
     buildId: (S.manifest.build && S.manifest.build.build_id) || null,
+    project: S.project || null,
   };
   const myShafts = [];
   const myLines = [];
@@ -1038,6 +1195,7 @@ async function commitCrop() {
   S.shaftMarks.push(...myShafts);
   S.lineMarks.push(...myLines);
   recomputeDone();
+  refreshFilterUI(); // pool changed -> labeler sets, dropdown, sidebar, tint
   refreshDoneMarks();
   rebuildMineLayer();
   applyLayerToggles();
@@ -1052,7 +1210,7 @@ async function commitCrop() {
   if (backendOn()) {
     try {
       setSyncStatus('saving…', '');
-      const existing = await fetchMyCellMarks(SUPABASE, S.board, S.me, cell.id);
+      const existing = await fetchMyCellMarks(SUPABASE, S.board, S.me, cell.id, S.project);
       const existingIds = new Set(existing.map((r) => r.id));
       const mine = [...myShafts, ...myLines];
       const keptIds = new Set();
@@ -1075,8 +1233,8 @@ async function commitCrop() {
         if (m.dbId != null && existingIds.has(m.dbId)) continue; // untouched — leave its row alone
         inserts.push({ mark: m, row: { kind: m.kind, geom: await encryptGeom(m.world), ...rowProv, autocontrast: m.autocontrast, created_at: m.created || undefined } });
       }
-      await deleteMarksByIds(SUPABASE, S.board, S.me, cell.id, toDelete);
-      const inserted = await insertMarks(SUPABASE, S.board, S.me, cell.id, inserts.map((x) => x.row));
+      await deleteMarksByIds(SUPABASE, S.board, S.me, cell.id, toDelete, S.project);
+      const inserted = await insertMarks(SUPABASE, S.board, S.me, cell.id, inserts.map((x) => x.row), S.project);
       // tag freshly-inserted marks with their dbId (so the next save skips them)
       // and their server-stamped created_at (so any future re-insert echoes it).
       // Match by geom ciphertext — unique per row (AES-GCM random IV) and stable
@@ -1132,9 +1290,18 @@ function boot() {
   // prefill the gate with the most-recently-remembered name (per-device convenience).
   const names = loadNames();
   if (names.length) $('gate-name').value = names[names.length - 1];
+  // project dropdown: alphabetical, select-only, NEVER preselected (a fresh,
+  // deliberate choice every login is the anti-mixing guarantee).
+  const projSel = $('gate-project');
+  for (const p of PROJECTS.slice().sort()) {
+    const o = document.createElement('option');
+    o.value = p; o.textContent = p;
+    projSel.appendChild(o);
+  }
   $('unlock').addEventListener('click', unlock);
   $('passcode').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
-  $('gate-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('passcode').focus(); });
+  $('gate-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('gate-project').focus(); });
+  $('gate-project').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('passcode').focus(); });
   $('btn-download').addEventListener('click', download);
   $('btn-refresh').addEventListener('click', () => { refreshMarks(); });
   // GT-review wiring only exists when the URL opts in (?gtreview=1); in normal
@@ -1144,7 +1311,14 @@ function boot() {
     $('gt-accurate').addEventListener('click', () => { if (S.crop) reviewSetVerdict(S.crop.cell.id, 'accurate'); });
     $('gt-drifted').addEventListener('click', () => { if (S.crop) reviewSetVerdict(S.crop.cell.id, 'drifted'); });
   }
-  ['tg-heatmap', 'tg-gt', 'tg-mine', 'tg-acc'].forEach((id) => $(id).addEventListener('change', applyLayerToggles));
+  ['tg-heatmap', 'tg-gt', 'tg-mine', 'tg-acc', 'tg-filter'].forEach((id) => $(id).addEventListener('change', applyLayerToggles));
+  $('cell-filter').addEventListener('change', () => {
+    S.filter = $('cell-filter').value;
+    buildSideList();
+    rebuildFilterLayer();
+    applyLayerToggles();
+    if (S.review.on) reviewRefreshUI(); // repaint badges on the rebuilt rows
+  });
   setupSwathPanZoom();
   setupCropInteractions();
   window.addEventListener('resize', () => { if (!$('app').hidden) applySwathTransform(); });

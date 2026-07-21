@@ -46,9 +46,10 @@ const FETCH_PAGE = 1000;
  * @param {string} board
  * @returns {Promise<Array<object>>}
  */
-export async function fetchAllMarks(cfg, board) {
+export async function fetchAllMarks(cfg, board, project) {
   if (!cfg) return [];
-  const url = `${_base(cfg)}/rest/v1/marks?board=eq.${encodeURIComponent(board)}&select=*&order=id.asc`;
+  const url = `${_base(cfg)}/rest/v1/marks?board=eq.${encodeURIComponent(board)}` +
+    `&project=eq.${encodeURIComponent(project)}&select=*&order=id.asc`;
   const rows = [];
   for (let from = 0; ; from += FETCH_PAGE) {
     const r = await fetch(url, {
@@ -70,9 +71,13 @@ const PROVENANCE_ROW_FIELDS = [
   'created_at',
 ];
 
-/** The `(board, labeler, cell_id)` scope filter shared by the cell-level calls. */
-function _cellScope(board, labeler, cellId) {
+/** The `(board, project, labeler, cell_id)` scope filter shared by the
+ * cell-level calls. `project` is part of the scope so that saving a crop in
+ * one project can never delete or reconcile away the same user's rows for the
+ * same crop in ANOTHER project. */
+function _cellScope(board, labeler, cellId, project) {
   return `board=eq.${encodeURIComponent(board)}` +
+    `&project=eq.${encodeURIComponent(project)}` +
     `&labeler=eq.${encodeURIComponent(labeler)}` +
     `&cell_id=eq.${encodeURIComponent(cellId)}`;
 }
@@ -83,9 +88,9 @@ function _cellScope(board, labeler, cellId) {
  * here) are left completely alone — no delete, no re-insert.
  * @returns {Promise<Array<{id:number, kind:string}>>}
  */
-export async function fetchMyCellMarks(cfg, board, labeler, cellId) {
+export async function fetchMyCellMarks(cfg, board, labeler, cellId, project) {
   if (!cfg) throw new Error('no supabase config');
-  const url = `${_base(cfg)}/rest/v1/marks?${_cellScope(board, labeler, cellId)}&select=id,kind`;
+  const url = `${_base(cfg)}/rest/v1/marks?${_cellScope(board, labeler, cellId, project)}&select=id,kind`;
   const r = await fetch(url, { headers: _headers(cfg), cache: 'no-store' });
   await _check(r, 'fetchMyCellMarks');
   return r.json();
@@ -97,10 +102,10 @@ export async function fetchMyCellMarks(cfg, board, labeler, cellId) {
  * (or cell's) rows. No-op on an empty id list.
  * @param {Array<number>} ids
  */
-export async function deleteMarksByIds(cfg, board, labeler, cellId, ids) {
+export async function deleteMarksByIds(cfg, board, labeler, cellId, ids, project) {
   if (!cfg) throw new Error('no supabase config');
   if (!ids || ids.length === 0) return null;
-  const q = `${_cellScope(board, labeler, cellId)}&id=in.(${ids.map(Number).join(',')})`;
+  const q = `${_cellScope(board, labeler, cellId, project)}&id=in.(${ids.map(Number).join(',')})`;
   const url = `${_base(cfg)}/rest/v1/marks?${q}`;
   const r = await fetch(url, { method: 'DELETE', headers: _headers(cfg) });
   await _check(r, 'deleteMarksByIds');
@@ -121,10 +126,10 @@ export async function deleteMarksByIds(cfg, board, labeler, cellId, ids) {
  * @param {Array<{kind:string, geom:string}>} rows
  * @returns {Promise<Array<object>>} the inserted rows (PostgREST `return=representation`)
  */
-export async function insertMarks(cfg, board, labeler, cellId, rows) {
+export async function insertMarks(cfg, board, labeler, cellId, rows, project) {
   if (!cfg) throw new Error('no supabase config');
   const payload = (rows || []).map((row) => {
-    const out = { board, labeler, cell_id: cellId, kind: row.kind, geom: row.geom };
+    const out = { board, project, labeler, cell_id: cellId, kind: row.kind, geom: row.geom };
     for (const k of PROVENANCE_ROW_FIELDS) if (row[k] !== undefined) out[k] = row[k];
     return out;
   });

@@ -21,9 +21,13 @@ body {
 .gate-box h1 { margin: 0 0 6px; font-size: 20px; }
 .gate-box p { margin: 0 0 16px; color: #555; line-height: 1.4; }
 .gate-box label { display: block; font-weight: 600; margin-bottom: 4px; font-size: 12px; color: #444; }
-.gate-box input {
+.gate-box input, .gate-box select {
   width: 100%; padding: 9px 10px; font-size: 15px; border: 1px solid #ccc; border-radius: 6px;
+  background: #fff; color: #1c1c1c;
 }
+.gate-box select:invalid, .gate-box select option[value=""] { color: #888; }
+.gate-box label { margin-top: 12px; }
+.gate-box label:first-of-type { margin-top: 0; }
 .gate-box button {
   margin-top: 14px; width: 100%; padding: 10px; font-size: 15px; font-weight: 600;
   background: #2a6df0; color: #fff; border: none; border-radius: 6px; cursor: pointer;
@@ -70,7 +74,14 @@ body {
   width: 260px; flex: 0 0 260px; background: #1b1e25; color: #cdd; overflow-y: auto; border-right: 1px solid #000;
 }
 .side-head { padding: 8px 12px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: #889;
-  position: sticky; top: 0; background: #1b1e25; border-bottom: 1px solid #000; }
+  position: sticky; top: 0; background: #1b1e25; border-bottom: 1px solid #000;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+/* "labeled by…" filter dropdown; names show as-is (undo the header uppercase) */
+#cell-filter {
+  font-size: 11px; max-width: 130px; padding: 2px 4px;
+  background: #14171d; color: #cdd; border: 1px solid #333; border-radius: 4px;
+  text-transform: none; letter-spacing: normal; cursor: pointer;
+}
 #cell-list { list-style: none; margin: 0; padding: 0; }
 #cell-list li {
   padding: 6px 12px; border-bottom: 1px solid #14171d; cursor: pointer; display: flex; gap: 8px; align-items: baseline;
@@ -92,6 +103,16 @@ body {
 /* accurate-TIF mask: half-transparent light green over cells whose dominant
    owner TIF was GT-reviewed accurate; never intercepts clicks (cells on top) */
 #swath-svg .acc-rect { fill: rgba(144, 238, 144, .45); stroke: none; pointer-events: none; }
+/* "labeled by…" filter SPOTLIGHT: dark veil over everything EXCEPT matching
+   cells (even-odd path with holes) — matches "light up" by contrast, which
+   stays legible over the heatmap/green mask; never intercepts clicks */
+#swath-svg .filter-dim { fill: rgba(0, 0, 0, .55); stroke: none; pointer-events: none; }
+/* strong sidebar-hover highlight: white outline inside a black casing — legible
+   on any background (plasma heatmap, green mask, greyscale). stroke-width is
+   set from JS (divided by the current zoom) so it stays constant on screen. */
+#swath-svg .hl-casing { fill: none; pointer-events: none; }
+#swath-svg .hl-outer { stroke: #000; }
+#swath-svg .hl-inner { stroke: #fff; }
 #swath-svg .gt-dot { fill: #ff3b30; }                       /* existing GT shafts = red  */
 #swath-svg .gt-line { fill: none; stroke: #00e5ff; stroke-width: 1.0; }  /* existing GT channels = cyan */
 #swath-svg .mine-dot { fill: #39ff14; }                     /* my marks = lime */

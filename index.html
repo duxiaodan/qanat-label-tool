@@ -17,6 +17,13 @@
       <input type="text" id="gate-name" list="name-suggestions" autocomplete="off"
              placeholder="e.g. Jane Doe" />
       <datalist id="name-suggestions"></datalist>
+      <label for="gate-project">Project (required — labels are kept separate per project)</label>
+      <!-- options are populated from the PROJECTS const in app.js; selection is
+           deliberately NOT remembered across logins so nobody labels into a
+           stale project by accident -->
+      <select id="gate-project">
+        <option value="" disabled selected>— select a project —</option>
+      </select>
       <label for="passcode">Passcode</label>
       <input type="password" id="passcode" autocomplete="current-password" />
       <button id="unlock">Unlock</button>
@@ -30,6 +37,7 @@
     <header id="topbar">
       <span class="brand">Qanat label tool</span>
       <span class="lab">labeler: <b id="me-name">—</b></span>
+      <span class="lab">project: <b id="me-project">—</b></span>
       <!-- kept (hidden) so download() / updateDownloadEnabled() reuse the name -->
       <input type="hidden" id="labeler" />
       <span class="toggles">
@@ -37,6 +45,7 @@
         <label><input type="checkbox" id="tg-gt" checked /> Existing GT</label>
         <label><input type="checkbox" id="tg-mine" checked /> All marks</label>
         <label><input type="checkbox" id="tg-acc" checked /> Accurate TIFs</label>
+        <label><input type="checkbox" id="tg-filter" checked /> Filter mask</label>
       </span>
       <span class="legend">
         <span class="legend-item"><span class="swatch mine"></span>your marks</span>
@@ -54,7 +63,11 @@
 
     <div id="main">
       <aside id="sidelist">
-        <div class="side-head">Cells (by p_pos &darr;)</div>
+        <div class="side-head">
+          <span>Cells (by p_pos &darr;)</span>
+          <!-- "labeled by…" filter; options are rebuilt from the pulled pool -->
+          <select id="cell-filter" title="show only cells labeled by…"></select>
+        </div>
         <ul id="cell-list"></ul>
       </aside>
 
