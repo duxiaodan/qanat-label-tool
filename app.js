@@ -839,6 +839,7 @@ async function openCrop(cid) {
   $('crop-gt').checked = true;
   document.querySelector('input[name="drawmode"][value="point"]').checked = true;
   $('crop-modal').hidden = false;
+  resizeCropOverlay();   // stage has a layout size only now that the modal is shown
   fitCrop();
   redrawCrop();
 }
@@ -876,6 +877,7 @@ function reloadCropMarks() {
 function closeCrop(save) {
   if (S.crop && save) commitCrop();
   S.crop = null;
+  drawCropOverlay();   // wipe the vector overlay so nothing is stale on reopen
   $('crop-modal').hidden = true;
 }
 // ---- selection helpers (S.crop.selected = {points:Set<idx>, lines:Set<idx>}) ----
@@ -910,6 +912,9 @@ function fitCrop() {
 function applyCropTransform() {
   const { x, y, scale } = S.crop.view;
   $('crop-canvas').style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+  // the overlay is NOT transformed — it must be repainted on every view change
+  // (pan / wheel-zoom / fit), otherwise the marks would lag behind the imagery.
+  drawCropOverlay();
 }
 function autocontrast(src) {
   // 1%-cutoff per-channel histogram stretch on the (greyscale) crop.
@@ -932,10 +937,51 @@ function autocontrast(src) {
   }
   return out;
 }
-function redrawCrop() {
+// ---- crop rendering -------------------------------------------------------
+// The imagery lives on #crop-canvas (1024², CSS-`scale()`d, `image-rendering:
+// pixelated`). ALL vectors live on #crop-overlay, which is stage-sized and
+// never transformed, so a mark's radius / line width is constant in SCREEN px
+// at any zoom: zooming in shrinks a mark's ground footprint instead of growing
+// it, which is what lets a shaft be seen under the dot that marks it.
+// The numeric constants below are the historical image-px ones, now read as
+// screen px — identical look at fit-zoom.
+const CROP_MARK_TOL_SCREEN_PX = 8;   // click tolerance; must match what's drawn
+
+// backing store = stage client size × devicePixelRatio, ctx scaled so all
+// drawing below is in CSS px. Safe to call any time (no-ops without the modal).
+function resizeCropOverlay() {
+  const stage = $('crop-stage'), ov = $('crop-overlay');
+  if (!stage || !ov) return null;
+  const dpr = window.devicePixelRatio || 1;
+  const w = stage.clientWidth, h = stage.clientHeight;
+  const bw = Math.max(1, Math.round(w * dpr)), bh = Math.max(1, Math.round(h * dpr));
+  ov.style.width = w + 'px'; ov.style.height = h + 'px';
+  if (ov.width !== bw || ov.height !== bh) { ov.width = bw; ov.height = bh; }
+  const octx = ov.getContext('2d');
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0);   // reset every time: setting .width clears it
+  return octx;
+}
+// repaint ONLY the imagery (raw or autocontrast-stretched)
+function redrawCropImage() {
   if (!S.crop) return;
   const { ctx, raw } = S.crop;
   ctx.putImageData($('crop-autocontrast').checked ? autocontrast(raw) : raw, 0, 0);
+}
+// repaint ONLY the vectors, in screen space. Called on every view change too.
+function drawCropOverlay() {
+  const ov = $('crop-overlay');
+  if (!ov) return;
+  const ctx = resizeCropOverlay();
+  if (!ctx) return;
+  const dpr = window.devicePixelRatio || 1;
+  ctx.clearRect(0, 0, ov.width / dpr, ov.height / dpr);
+  if (!S.crop) return;
+  const { x: vx, y: vy, scale } = S.crop.view;
+  // image px -> screen (CSS) px within the stage
+  const SX = (c) => vx + c * scale, SY = (r) => vy + r * scale;
+  ctx.save();
+  // clip to the imagery's on-screen rect, as when the marks lived on the image canvas
+  ctx.beginPath(); ctx.rect(vx, vy, 1024 * scale, 1024 * scale); ctx.clip();
   // existing GT (locked, read-only): shaft dots = red. GT polylines
   // (cell.gt_lines) are deliberately NOT rendered — dots only.
   if ($('crop-gt').checked) {
@@ -943,7 +989,7 @@ function redrawCrop() {
     ctx.fillStyle = '#ff3b30';
     for (const [gx, gy] of S.crop.cell.gt_points || []) {
       const [c, r] = worldToPixel(gx, gy, S.crop.cell.world_bbox);
-      ctx.beginPath(); ctx.arc(c, r, 4, 0, 2 * Math.PI); ctx.fill();
+      ctx.beginPath(); ctx.arc(SX(c), SY(r), 4, 0, 2 * Math.PI); ctx.fill();
     }
     ctx.restore();
   }
@@ -954,11 +1000,11 @@ function redrawCrop() {
     for (const ln of S.crop.others.lines) {
       if (ln.length < 1) continue;
       ctx.beginPath();
-      ln.forEach(([c, r], i) => { if (i === 0) ctx.moveTo(c, r); else ctx.lineTo(c, r); });
+      ln.forEach(([c, r], i) => { if (i === 0) ctx.moveTo(SX(c), SY(r)); else ctx.lineTo(SX(c), SY(r)); });
       ctx.stroke();
-      for (const [c, r] of ln) { ctx.beginPath(); ctx.arc(c, r, 2.5, 0, 2 * Math.PI); ctx.fill(); }
+      for (const [c, r] of ln) { ctx.beginPath(); ctx.arc(SX(c), SY(r), 2.5, 0, 2 * Math.PI); ctx.fill(); }
     }
-    for (const [c, r] of S.crop.others.points) { ctx.beginPath(); ctx.arc(c, r, 4, 0, 2 * Math.PI); ctx.fill(); }
+    for (const [c, r] of S.crop.others.points) { ctx.beginPath(); ctx.arc(SX(c), SY(r), 4, 0, 2 * Math.PI); ctx.fill(); }
     ctx.restore();
   }
   // my marks (lime); selected ones get a magenta halo
@@ -968,38 +1014,45 @@ function redrawCrop() {
   S.crop.marks.lines.forEach(({ pts }, idx) => {
     if (pts.length < 1) return;
     ctx.beginPath();
-    pts.forEach(([c, r], i) => { if (i === 0) ctx.moveTo(c, r); else ctx.lineTo(c, r); });
+    pts.forEach(([c, r], i) => { if (i === 0) ctx.moveTo(SX(c), SY(r)); else ctx.lineTo(SX(c), SY(r)); });
     ctx.stroke();
     if (S.crop.selected.lines.has(idx)) {
       ctx.save(); ctx.strokeStyle = SEL; ctx.lineWidth = 3.5; ctx.stroke(); ctx.restore();
     }
-    for (const [c, r] of pts) { ctx.beginPath(); ctx.arc(c, r, 3, 0, 2 * Math.PI); ctx.fill(); }
+    for (const [c, r] of pts) { ctx.beginPath(); ctx.arc(SX(c), SY(r), 3, 0, 2 * Math.PI); ctx.fill(); }
   });
   S.crop.marks.points.forEach(({ px: [c, r] }, idx) => {
-    ctx.beginPath(); ctx.arc(c, r, 5, 0, 2 * Math.PI); ctx.fill();
+    ctx.beginPath(); ctx.arc(SX(c), SY(r), 5, 0, 2 * Math.PI); ctx.fill();
     if (S.crop.selected.points.has(idx)) {
-      ctx.save(); ctx.strokeStyle = SEL; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(c, r, 8.5, 0, 2 * Math.PI); ctx.stroke(); ctx.restore();
+      ctx.save(); ctx.strokeStyle = SEL; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(SX(c), SY(r), 8.5, 0, 2 * Math.PI); ctx.stroke(); ctx.restore();
     }
   });
   // in-progress polyline (white)
   if (S.crop.inProgress.length) {
     ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.beginPath();
-    S.crop.inProgress.forEach(([c, r], i) => { if (i === 0) ctx.moveTo(c, r); else ctx.lineTo(c, r); });
+    S.crop.inProgress.forEach(([c, r], i) => { if (i === 0) ctx.moveTo(SX(c), SY(r)); else ctx.lineTo(SX(c), SY(r)); });
     ctx.stroke();
     ctx.fillStyle = '#ffffff';
-    for (const [c, r] of S.crop.inProgress) { ctx.beginPath(); ctx.arc(c, r, 3, 0, 2 * Math.PI); ctx.fill(); }
+    for (const [c, r] of S.crop.inProgress) { ctx.beginPath(); ctx.arc(SX(c), SY(r), 3, 0, 2 * Math.PI); ctx.fill(); }
   }
   ctx.restore();
-  // rubber-band selection rectangle
+  // rubber-band selection rectangle (stored in image px, drawn in screen px)
   if (S.crop.selectBox) {
     const [a0, a1, a2, a3] = boxNorm(S.crop.selectBox);
     ctx.save();
     ctx.setLineDash([6, 4]); ctx.lineWidth = 1.5; ctx.strokeStyle = '#ffffff';
     ctx.fillStyle = 'rgba(255,255,255,0.08)';
-    ctx.fillRect(a0, a1, a2 - a0, a3 - a1);
-    ctx.strokeRect(a0, a1, a2 - a0, a3 - a1);
+    ctx.fillRect(SX(a0), SY(a1), (a2 - a0) * scale, (a3 - a1) * scale);
+    ctx.strokeRect(SX(a0), SY(a1), (a2 - a0) * scale, (a3 - a1) * scale);
     ctx.restore();
   }
+  ctx.restore();
+}
+// "repaint everything" entry point (kept so all existing call sites stay valid)
+function redrawCrop() {
+  if (!S.crop) return;
+  redrawCropImage();
+  drawCropOverlay();
 }
 function canvasEventToPx(e) {
   const canvas = $('crop-canvas');
@@ -1011,7 +1064,9 @@ function canvasEventToPx(e) {
 }
 function drawMode() { return document.querySelector('input[name="drawmode"]:checked').value; }
 function hitTestOwn([col, row]) {
-  const tol = 8 / Math.max(0.2, S.crop.view.scale); // a few screen px
+  // marks are drawn at a constant SCREEN size, so the tolerance must be too:
+  // convert the screen-px tolerance into the image-px space of the coords.
+  const tol = CROP_MARK_TOL_SCREEN_PX / Math.max(0.01, S.crop.view.scale);
   for (let i = 0; i < S.crop.marks.points.length; i++) {
     const [c, r] = S.crop.marks.points[i].px;
     if ((c - col) ** 2 + (r - row) ** 2 <= tol * tol) return { kind: 'point', idx: i };
@@ -1069,7 +1124,7 @@ function setupCropInteractions() {
       if (pressMoved) {
         const cur = canvasEventToPx(e);
         S.crop.selectBox = [pressPx[0], pressPx[1], cur[0], cur[1]];
-        redrawCrop();
+        drawCropOverlay();   // imagery unchanged while rubber-banding
       }
     }
   });
@@ -1111,6 +1166,8 @@ function setupCropInteractions() {
     e.preventDefault();
     if (drawMode() === 'line') finishInProgressLine();
   });
+  // the overlay's backing store is tied to the stage size / devicePixelRatio
+  window.addEventListener('resize', () => { if (S.crop) drawCropOverlay(); });
   $('crop-autocontrast').addEventListener('change', redrawCrop);
   $('crop-gt').addEventListener('change', redrawCrop);
   $('crop-undo').addEventListener('click', () => {

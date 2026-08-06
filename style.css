@@ -169,4 +169,7 @@ body {
 .modal-tools button:hover { filter: brightness(1.2); }
 #crop-stage { flex: 1; overflow: hidden; background: #000; border-radius: 4px; position: relative; min-height: 60vh; }
 #crop-canvas { position: absolute; left: 0; top: 0; transform-origin: 0 0; image-rendering: pixelated; cursor: crosshair; }
+/* vector overlay: stage-sized, never CSS-transformed, click-through so all the
+   mouse handlers stay on #crop-canvas / #crop-stage underneath. */
+#crop-overlay { position: absolute; left: 0; top: 0; pointer-events: none; }
 .modal-hint { font-size: 11px; color: #889; margin-top: 6px; }

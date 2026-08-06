@@ -111,6 +111,9 @@
       </div>
       <div id="crop-stage">
         <canvas id="crop-canvas" width="1024" height="1024"></canvas>
+        <!-- screen-space vector overlay: NOT CSS-transformed, so marks keep a
+             constant screen size at any zoom (see drawCropOverlay in app.js) -->
+        <canvas id="crop-overlay"></canvas>
       </div>
       <div class="modal-hint">click = add a point / polyline vertex · double-click or Enter ends a polyline ·
         click your own mark to select it · <b>left-drag = box-select multiple of your marks</b> · Delete removes selected ·
