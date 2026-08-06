@@ -173,10 +173,16 @@ body {
 /* accurate-TIF mask: half-transparent light green over cells whose dominant
    owner TIF was GT-reviewed accurate; never intercepts clicks (cells on top) */
 #swath-svg .acc-rect { fill: rgba(144, 238, 144, .45); stroke: none; pointer-events: none; }
-/* "labeled by…" filter SPOTLIGHT: dark veil over everything EXCEPT matching
-   cells (even-odd path with holes) — matches "light up" by contrast, which
-   stays legible over the heatmap/green mask; never intercepts clicks */
-#swath-svg .filter-dim { fill: rgba(0, 0, 0, .55); stroke: none; pointer-events: none; }
+/* Filter SPOTLIGHT, part 1 of 2: a dark veil over everything EXCEPT matching
+   cells (even-odd path with holes). Part 2 is a <clipPath> that confines the
+   colour layers (#heat-img, #g-acc) to the same matching cells — see
+   rebuildFilterLayer() in app.js. Contrast alone was NOT enough: a veil takes
+   luminance away but leaves chroma, so a filtered-out hot plasma cell still
+   read as "lit up". Clipping removes the colour outright.
+   #g-filter is stacked above g-cells/g-mine/g-gt (only the sidebar-hover
+   casing in #g-hl outranks it), so `pointer-events: none` here is load-bearing:
+   without it the veil would swallow every click meant for a .cell-rect. */
+#swath-svg .filter-dim { fill: rgba(0, 0, 0, .70); stroke: none; pointer-events: none; }
 /* strong sidebar-hover highlight: white outline inside a black casing — legible
    on any background (plasma heatmap, green mask, greyscale). stroke-width is
    set from JS (divided by the current zoom) so it stays constant on screen. */

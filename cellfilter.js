@@ -118,5 +118,35 @@ export function filterSummary(opts, ctx) {
   return 'Filters: ' + (parts.length ? parts.join(' · ') : 'off') + ' · ' + count;
 }
 
+// --------------------------------------------------------------------------- //
+// spotlight geometry (pure string building — the DOM half lives in app.js)
+// --------------------------------------------------------------------------- //
+
+/** One closed axis-aligned rectangle as an SVG path subpath. */
+export function rectSubpath(x, y, w, h) {
+  return `M${x} ${y}h${w}v${h}h${-w}Z`;
+}
+
+/**
+ * The two halves of the map spotlight, built from ONE concatenation of matching
+ * -cell subpaths (`holesD`, e.g. accumulated with `rectSubpath`):
+ *
+ *   veil — outer swath rect FOLLOWED BY every matching-cell subpath. Painted
+ *          with fill-rule:evenodd, so the matching cells become holes: the veil
+ *          covers everything EXCEPT the matches.
+ *   clip — the matching-cell subpaths ALONE, i.e. the exact geometric INVERSE
+ *          of the veil. Used as a <clipPath> so the colour layers (heatmap img,
+ *          green accurate-TIF mask) paint only inside the matches.
+ *
+ * The two are returned together on purpose: they are derived from the same
+ * `holesD` and MUST be rebuilt in the same pass, or the veil's holes and the
+ * clip's windows will drift apart and the map will show colour outside the
+ * spotlight (or grey inside it).
+ */
+export function spotlightPaths(swathW, swathH, holesD) {
+  const holes = holesD || '';
+  return { veil: `M0 0H${swathW}V${swathH}H0Z${holes}`, clip: holes };
+}
+
 const EMPTY_SET = new Set();
 const EMPTY_MAP = new Map();

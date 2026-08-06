@@ -14,7 +14,7 @@ import { deriveKey, decryptBlob, encryptBlob, verifyPasscode } from './crypto.js
 import { fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks } from './sync.js';
 import {
   cellPasses, filterIsActive, pruneSelection, labelerOrder,
-  rankPercent, fmtPercent, filterSummary,
+  rankPercent, fmtPercent, filterSummary, rectSubpath, spotlightPaths,
 } from './cellfilter.js';
 import {
   selectMarks, scopeSlug, scopeProblem, countOrphans, buildExportScope,
@@ -756,25 +756,68 @@ function applyFilterRender() {
   if (S.review.on) reviewRefreshUI(); // repaint badges on the rebuilt rows
 }
 
-/** Repaint the g-filter SPOTLIGHT (empty when no condition is active): one
- *  even-odd path that veils the whole canvas dark EXCEPT the matching cells,
- *  which stay at full brightness. Communicating by contrast instead of by a
- *  color fill keeps the filter legible over the plasma heatmap / green mask. */
+/** Repaint the map SPOTLIGHT (a no-op when no filter condition is active).
+ *
+ *  The rule the spotlight enforces is "bright and colourful = in the filter
+ *  result", and it takes TWO mechanisms to hold, because a black veil removes
+ *  luminance but not chroma — under a 55% veil a filtered-OUT hot plasma cell
+ *  was still more vividly coloured than a matching cold one:
+ *
+ *    1. VEIL — one even-odd path in #g-filter: the whole swath rect with a hole
+ *       punched over each matching cell. #g-filter sits above every content
+ *       layer (see buildSwathLayers), so marks, GT dots and cell outlines dim
+ *       along with the imagery instead of floating over the veil.
+ *    2. CLIP — the colour layers (#heat-img, #g-acc) are clipped to the
+ *       matching cells, so outside them you get the plain greyscale swath under
+ *       the veil: no chroma at all, not merely darker chroma.
+ *
+ *  The clip path is the exact geometric INVERSE of the veil path (veil =
+ *  outer-rect MINUS matches, clip = matches only), so both are built from the
+ *  same single pass over S.cells here — see spotlightPaths() in cellfilter.js.
+ *  Splitting them into two passes/functions will let them drift out of sync. */
 function rebuildFilterLayer() {
   const g = document.getElementById('g-filter');
   if (!g) return;
   g.innerHTML = '';
-  if (!filterActive()) return;
-  let d = `M0 0H${S.swathW}V${S.swathH}H0Z`; // outer: the whole swath canvas
+  if (!filterActive()) { applyFilterClip(''); return; }
+  let holes = '';
   for (const c of S.cells) {
     if (!cellMatchesFilter(c.id)) continue;
     const [x0, y0, x1, y1] = c.world_bbox;
     const [px0, py0] = worldToSwathPx(x0, y1);
     const [px1, py1] = worldToSwathPx(x1, y0);
-    const x = Math.min(px0, px1), y = Math.min(py0, py1);
-    d += `M${x} ${y}h${Math.abs(px1 - px0)}v${Math.abs(py1 - py0)}h${-Math.abs(px1 - px0)}Z`; // hole
+    holes += rectSubpath(Math.min(px0, px1), Math.min(py0, py1),
+                         Math.abs(px1 - px0), Math.abs(py1 - py0));
   }
-  g.appendChild(svgEl('path', { d, 'fill-rule': 'evenodd', class: 'filter-dim' }));
+  const { veil, clip } = spotlightPaths(S.swathW, S.swathH, holes);
+  g.appendChild(svgEl('path', { d: veil, 'fill-rule': 'evenodd', class: 'filter-dim' }));
+  applyFilterClip(clip);
+}
+/** Point #heat-img and #g-acc at the spotlight clipPath, or release them.
+ *
+ *  Coordinate systems line up 1:1 with no conversion: #swath-svg is sized
+ *  width/height = S.swathW/S.swathH with viewBox "0 0 swathW swathH", and
+ *  #heat-img carries the same width/height attributes at left:0/top:0 inside
+ *  #swath-stage — so SVG user units == swath pixels == the img's border-box
+ *  pixels, which is what clipPathUnits="userSpaceOnUse" resolves against for an
+ *  HTML referrer. The zoom is a CSS transform on the shared #swath-stage
+ *  ancestor and therefore scales clip and content together.
+ *
+ *  Passing '' releases both clips. That is what makes the "Filter mask" toggle
+ *  a complete escape hatch (see applyLayerToggles): hiding the veil without
+ *  releasing the clips would leave a half-on state with the heatmap still
+ *  punched out and nothing on screen explaining why. */
+let _filterClipD = ''; // last built clip geometry; '' means "no spotlight"
+function applyFilterClip(clipD) {
+  if (clipD !== undefined) _filterClipD = clipD || '';
+  const path = document.getElementById('filter-clip-path');
+  if (path) path.setAttribute('d', _filterClipD);
+  const tg = $('tg-filter');
+  const ref = (_filterClipD && (!tg || tg.checked)) ? 'url(#filter-clip)' : '';
+  const heat = document.getElementById('heat-img');
+  if (heat) heat.style.clipPath = ref;
+  const gAcc = document.getElementById('g-acc');
+  if (gAcc) gAcc.style.clipPath = ref;
 }
 /** Full refresh of everything the filter drives (call after pool changes). */
 function refreshFilterUI() {
@@ -896,16 +939,31 @@ function buildSwathLayers() {
   svg.setAttribute('width', S.swathW); svg.setAttribute('height', S.swathH);
   svg.setAttribute('viewBox', `0 0 ${S.swathW} ${S.swathH}`);
   svg.innerHTML = '';
+  // <defs> holds the filter spotlight's clipPath (never rendered directly; it is
+  // referenced by #heat-img and #g-acc — see rebuildFilterLayer).
+  const defs = svgEl('defs', {});
+  const clip = svgEl('clipPath', { id: 'filter-clip', clipPathUnits: 'userSpaceOnUse' });
+  clip.appendChild(svgEl('path', { id: 'filter-clip-path', d: '' }));
+  defs.appendChild(clip);
+  svg.appendChild(defs);
   const gAcc = svgEl('g', { id: 'g-acc' });   // accurate-TIF mask, under all other layers
-  // "labeled by…" tint: above the green mask, below GT dots / marks / cells
-  const gFilter = svgEl('g', { id: 'g-filter' });
   const gGt = svgEl('g', { id: 'g-gt' });
   const gMine = svgEl('g', { id: 'g-mine' });
   const gCells = svgEl('g', { id: 'g-cells' });
-  svg.appendChild(gAcc); svg.appendChild(gFilter); svg.appendChild(gGt); svg.appendChild(gMine); svg.appendChild(gCells);
+  // Filter SPOTLIGHT veil, deliberately appended ABOVE g-cells (it used to sit
+  // just above g-acc, where it darkened only the base/heatmap imagery while GT
+  // dots, other users' marks, my marks and every cell outline still painted at
+  // full brightness on top of it — the exact inverse of "bright = matching").
+  // Everything below it now dims together. Do NOT move it back down.
+  const gFilter = svgEl('g', { id: 'g-filter' });
+  svg.appendChild(gAcc); svg.appendChild(gGt); svg.appendChild(gMine);
+  svg.appendChild(gCells); svg.appendChild(gFilter);
   // strong sidebar-hover highlight: white outline inside a black casing, in a
   // group appended LAST so it paints above every other layer (the heatmap is a
   // sibling <img> below the whole SVG). Hidden until a sidebar row is hovered.
+  // This is the ONE layer that stays above the filter veil: hovering a sidebar
+  // row is a deliberate "show me this cell" action and must win even when the
+  // cell is filtered out (that is how you locate a non-matching cell at all).
   const gHl = svgEl('g', { id: 'g-hl' });
   gHl.appendChild(svgEl('rect', { id: 'hl-outer', class: 'hl-casing hl-outer', visibility: 'hidden' }));
   gHl.appendChild(svgEl('rect', { id: 'hl-inner', class: 'hl-casing hl-inner', visibility: 'hidden' }));
@@ -976,7 +1034,11 @@ function applyLayerToggles() {
   const gGt = document.getElementById('g-gt'); if (gGt) gGt.style.display = $('tg-gt').checked ? '' : 'none';
   const gMine = document.getElementById('g-mine'); if (gMine) gMine.style.display = $('tg-mine').checked ? '' : 'none';
   const gAcc = document.getElementById('g-acc'); if (gAcc) gAcc.style.display = $('tg-acc').checked ? '' : 'none';
+  // "Filter mask" is a COMPLETE escape hatch: it hides the veil AND releases the
+  // clip on the colour layers, so unchecking it restores the full-colour heatmap
+  // and green mask everywhere. Never leave one half of the spotlight on.
   const gFilter = document.getElementById('g-filter'); if (gFilter) gFilter.style.display = $('tg-filter').checked ? '' : 'none';
+  applyFilterClip(); // re-resolve the clip refs against the toggle's new state
 }
 function applySwathTransform() {
   const { x, y, scale } = S.view;
@@ -1583,7 +1645,10 @@ function setupCropInteractions() {
     }
     if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
       // same action as the matching edge button; a no-op when that neighbour
-      // is missing. preventDefault stops arrows from walking the drawmode radios.
+      // is missing. inside the crop modal the arrows belong to crop navigation
+      // unconditionally — we deliberately do NOT bail out when the event target is
+      // a form control, so this overrides the native arrow behaviour of the
+      // name="drawmode" radio group. considered and kept; not a bug to "fix".
       e.preventDefault();
       navigateCrop(e.key.slice(5).toLowerCase());   // ArrowUp -> 'up', …
     }
