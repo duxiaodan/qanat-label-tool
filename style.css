@@ -74,14 +74,84 @@ body {
   width: 260px; flex: 0 0 260px; background: #1b1e25; color: #cdd; overflow-y: auto; border-right: 1px solid #000;
 }
 .side-head { padding: 8px 12px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: #889;
-  position: sticky; top: 0; background: #1b1e25; border-bottom: 1px solid #000;
-  display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-/* "labeled by…" filter dropdown; names show as-is (undo the header uppercase) */
-#cell-filter {
-  font-size: 11px; max-width: 130px; padding: 2px 4px;
-  background: #14171d; color: #cdd; border: 1px solid #333; border-radius: 4px;
-  text-transform: none; letter-spacing: normal; cursor: pointer;
+  position: sticky; top: 0; z-index: 2; background: #1b1e25; border-bottom: 1px solid #000;
+  display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
+.side-title { white-space: nowrap; }
+
+/* ---------- collapsible cell filter ----------
+   Collapsed: just #filter-toggle (one summary line). Expanded: #filter-body
+   below it. The whole block lives inside the sticky .side-head, so it stays
+   pinned while #cell-list scrolls under it. */
+.filter-toggle {
+  display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
+  padding: 3px 6px; border: 1px solid #333; border-radius: 4px;
+  background: #14171d; color: #99a3b3; cursor: pointer;
+  font: inherit; font-size: 11px; text-transform: none; letter-spacing: normal;
 }
+.filter-toggle:hover { border-color: #4a5468; color: #cdd; }
+.filter-toggle.is-active { color: #f6c453; border-color: #4a4636; }
+.filter-caret { flex: 0 0 auto; font-size: 9px; opacity: .8; }
+.filter-summary { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.filter-body {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 8px 8px 6px; border: 1px solid #2a2f3a; border-radius: 4px;
+  background: #171a21; text-transform: none; letter-spacing: normal;
+}
+.filter-sec-title { font-size: 10px; color: #7a8494; margin-bottom: 6px; text-transform: uppercase; letter-spacing: .05em; }
+
+/* dual-handle rank slider: two <input type=range> stacked on one track. Both
+   inputs are pointer-events:none — #rank-slider takes the pointer itself and
+   routes the drag to the nearer handle (app.js), which stays predictable even
+   when both thumbs sit on the same pixel. The inputs remain keyboard-usable. */
+.rank-slider { position: relative; height: 18px; margin: 0 1px; touch-action: none; }
+.rank-track, .rank-fill {
+  position: absolute; top: 50%; height: 4px; margin-top: -2px; border-radius: 2px; pointer-events: none;
+}
+.rank-track { left: 0; right: 0; background: #2b3140; }
+.rank-fill { background: #2a6df0; }
+.rank-slider input[type=range] {
+  position: absolute; left: 0; top: 0; width: 100%; height: 18px; margin: 0;
+  background: none; pointer-events: none; -webkit-appearance: none; appearance: none;
+}
+.rank-slider input[type=range]:focus { outline: none; }
+.rank-slider input[type=range]:focus::-webkit-slider-thumb { border-color: #fff; }
+.rank-slider input[type=range]:focus::-moz-range-thumb { border-color: #fff; }
+.rank-slider input[type=range]::-webkit-slider-runnable-track { background: none; border: none; height: 18px; }
+.rank-slider input[type=range]::-moz-range-track { background: none; border: none; height: 18px; }
+.rank-slider input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 14px; height: 14px; margin-top: 2px;
+  border-radius: 50%; background: #cdd; border: 2px solid #1b1e25; cursor: ew-resize;
+}
+.rank-slider input[type=range]::-moz-range-thumb {
+  width: 14px; height: 14px; border-radius: 50%; background: #cdd;
+  border: 2px solid #1b1e25; cursor: ew-resize;
+}
+.rank-readout {
+  display: flex; justify-content: space-between; gap: 8px; margin-top: 4px;
+  font-size: 10px; color: #99a3b3; font-variant-numeric: tabular-nums;
+}
+
+/* "labeled by…" checkbox list (union; "(unlabeled)" is mutually exclusive) */
+.filter-labelers { display: flex; flex-direction: column; gap: 2px; max-height: 148px; overflow-y: auto; }
+.filter-chk {
+  display: flex; align-items: center; gap: 6px; font-size: 11px; color: #cdd;
+  cursor: pointer; padding: 1px 2px; border-radius: 3px;
+}
+.filter-chk:hover { background: #22262f; }
+.filter-chk input { margin: 0; flex: 0 0 auto; }
+.filter-chk span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.filter-chk-all, .filter-chk-unlabeled { color: #99a3b3; font-style: italic; }
+.filter-chk-all { border-bottom: 1px solid #2a2f3a; padding-bottom: 3px; margin-bottom: 2px; }
+.filter-chk-unlabeled { border-top: 1px solid #2a2f3a; padding-top: 3px; margin-top: 2px; }
+.filter-empty { font-size: 10px; color: #6b7484; padding: 2px; font-style: italic; }
+.filter-actions { display: flex; justify-content: flex-end; }
+.filter-reset {
+  font: inherit; font-size: 11px; padding: 2px 10px; cursor: pointer;
+  background: #333a48; color: #cdd; border: none; border-radius: 4px;
+  text-transform: none; letter-spacing: normal;
+}
+.filter-reset:hover:not(:disabled) { filter: brightness(1.25); }
+.filter-reset:disabled { opacity: .45; cursor: default; }
 #cell-list { list-style: none; margin: 0; padding: 0; }
 #cell-list li {
   padding: 6px 12px; border-bottom: 1px solid #14171d; cursor: pointer; display: flex; gap: 8px; align-items: baseline;

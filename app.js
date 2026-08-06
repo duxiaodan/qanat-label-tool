@@ -12,6 +12,10 @@ import { pixelToWorld, worldToPixel } from './geo.js';
 import { buildShaftsFeatureCollection, buildLinesFeatureCollection } from './geojson.js';
 import { deriveKey, decryptBlob, encryptBlob, verifyPasscode } from './crypto.js';
 import { fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks } from './sync.js';
+import {
+  cellPasses, filterIsActive, pruneSelection, labelerOrder,
+  rankPercent, fmtPercent, filterSummary,
+} from './cellfilter.js';
 import { SUPABASE } from './site_config.js';
 
 // --------------------------------------------------------------------------- //
@@ -23,6 +27,7 @@ const S = {
   manifest: null,       // decrypted manifest object
   cells: [],            // manifest.cells (p_pos desc)
   cellById: new Map(),
+  cellRank: new Map(),  // cell id -> index into S.cells (p_pos desc) — O(1) range test
   cellByCentre: new Map(), // `${round(cx)}_${round(cy)}` -> cell (adjacent-crop nav)
   swathW: 0, swathH: 0, // swath image pixel size
   swathBounds: null,    // [minx, miny, maxx, maxy]
@@ -35,9 +40,17 @@ const S = {
   lineMarks: [],        // {cropId, pPos, world:[[x,y],...], created, labeler, dbId?}
   done: new Set(),      // cell ids with >=1 saved mark (from anyone)
   unsynced: false,      // true when a save couldn't reach the backend
-  // "labeled by…" cell filter — one state drives the sidebar AND the map tint.
-  // '' = off | 'me' | '__anyone__' | '__unlabeled__' | a normalized labeler name.
-  filter: '',
+  // cell filter — ONE state object drives the sidebar list AND the map spotlight.
+  // Two conditions ANDed: a p_pos RANGE over rank (indices into S.cells, which
+  // is p_pos-descending, so the selection is a contiguous slice) and a
+  // "labeled by…" union over checked labelers. See cellfilter.js.
+  filter: {
+    lo: 0,                 // first (highest-p_pos) rank kept, inclusive
+    hi: 0,                 // last (lowest-p_pos) rank kept, inclusive; = cells-1 on unlock
+    checked: new Set(),    // normalized labeler names; EMPTY = condition inactive
+    unlabeled: false,      // "(unlabeled)" — mutually exclusive with `checked`
+    open: false,           // Filters section expanded? (collapsed by default)
+  },
   labelerCells: { byLabeler: new Map(), any: new Set() }, // derived from the pool
   storageKey: 'qanat-labels:v1',
   // swath view transform
@@ -430,7 +443,8 @@ async function unlock() {
     const manBytes = await decryptBlob(S.key, await fetchBytes('manifest.enc'));
     S.manifest = JSON.parse(new TextDecoder().decode(manBytes));
     S.cells = (S.manifest.cells || []).slice().sort((a, b) => b.p_pos - a.p_pos);
-    for (const c of S.cells) S.cellById.set(c.id, c);
+    S.cellRank = new Map();
+    S.cells.forEach((c, i) => { S.cellById.set(c.id, c); S.cellRank.set(c.id, i); });
     buildCellCentreIndex(); // centre-keyed lookup for adjacent-crop navigation
     S.swathW = S.manifest.swath.width; S.swathH = S.manifest.swath.height;
     S.swathBounds = S.manifest.swath.world_bounds;
@@ -454,8 +468,10 @@ async function unlock() {
   $('gate').hidden = true;
   $('app').hidden = false;
   sessionStorage.setItem('qanat-unlocked', '1');
-  computeLabelerCells();   // before buildSideList: the filter dropdown + sets
-  rebuildFilterOptions();  // need the freshly pulled pool and S.meDisplay
+  computeLabelerCells();   // before buildSideList: the per-labeler cell sets
+  initRankSlider();        // rank bounds now that S.cells is known (full range)
+  rebuildLabelerChecks();  // needs the freshly pulled pool and S.meDisplay
+  updateFilterSummary();
   buildSideList();
   buildSwathLayers();
   fitSwath();
@@ -464,12 +480,16 @@ async function unlock() {
 }
 
 // --------------------------------------------------------------------------- //
-// "labeled by…" filter — sidebar dropdown + map spotlight dim (g-filter).
-// Derived entirely from the project-scoped pulled pool; recomputed on every
-// pull/save so the option list and the matching sets never go stale.
+// cell filter — collapsible sidebar "Filters" block + map spotlight (g-filter).
+//
+// Two conditions, ANDed (predicate lives in cellfilter.js so it is unit-testable
+// without a DOM):
+//   * p_pos range, dragged over RANK with a dual-handle slider;
+//   * "labeled by…" union over checkbox-selected labelers (+ an exclusive
+//     "(unlabeled)" entry). Nothing checked = that condition is inactive.
+// The labeler pool is derived entirely from the project-scoped pulled pool and
+// recomputed on every pull/save, so the checkbox list never goes stale.
 // --------------------------------------------------------------------------- //
-const FILTER_ANYONE = '__anyone__';
-const FILTER_UNLABELED = '__unlabeled__';
 
 /** One pass over the pool -> per-labeler cell sets + the "any mark" set. */
 function computeLabelerCells() {
@@ -487,38 +507,238 @@ function computeLabelerCells() {
   S.lineMarks.forEach(add);
   S.labelerCells = { byLabeler, any };
 }
-function cellMatchesFilter(cid) {
-  const f = S.filter;
-  if (!f) return true;
-  if (f === FILTER_ANYONE) return S.labelerCells.any.has(cid);
-  if (f === FILTER_UNLABELED) return !S.labelerCells.any.has(cid);
-  const s = S.labelerCells.byLabeler.get(f === 'me' ? S.me : f);
-  return !!s && s.has(cid);
-}
-/** Rebuild the dropdown's options, preserving the selection when still valid. */
-function rebuildFilterOptions() {
-  const sel = $('cell-filter');
-  if (!sel) return;
-  const others = [...S.labelerCells.byLabeler.keys()]
-    .filter((n) => n && n !== S.me)
-    .sort();
-  // the selected labeler vanished from the pool -> reset to "all cells"
-  if (S.filter && S.filter !== 'me' && S.filter !== FILTER_ANYONE &&
-      S.filter !== FILTER_UNLABELED && !others.includes(S.filter)) S.filter = '';
-  sel.innerHTML = '';
-  const opt = (value, label) => {
-    const o = document.createElement('option');
-    o.value = value; o.textContent = label;
-    sel.appendChild(o);
+/** The live predicate arguments (one object, so list + map can never diverge). */
+function filterOpts() {
+  return {
+    lo: S.filter.lo, hi: S.filter.hi,
+    checked: S.filter.checked, unlabeledOnly: S.filter.unlabeled,
+    labelerCells: S.labelerCells,
   };
-  opt('', '— all cells —');
-  opt('me', `me (${S.meDisplay})`);
-  for (const n of others) opt(n, n);
-  opt(FILTER_ANYONE, 'anyone');
-  opt(FILTER_UNLABELED, 'unlabeled');
-  sel.value = S.filter;
 }
-/** Repaint the g-filter SPOTLIGHT (empty when no filter is selected): one
+function maxRank() { return S.cells.length ? S.cells.length - 1 : 0; }
+/** True when at least one condition narrows the set (drives the veil + summary). */
+function filterActive() { return filterIsActive(filterOpts(), maxRank()); }
+function cellMatchesFilter(cid) {
+  const r = S.cellRank.has(cid) ? S.cellRank.get(cid) : -1;
+  return cellPasses(cid, r, filterOpts());
+}
+function countMatches() {
+  let n = 0;
+  for (const c of S.cells) if (cellMatchesFilter(c.id)) n++;
+  return n;
+}
+
+// ---- rank slider (two overlaid <input type=range> over indices into S.cells) --
+// Native range inputs cannot express two handles, so both are stacked on one
+// track. Pointer events are taken on the CONTAINER (the inputs themselves are
+// pointer-events:none) and routed to whichever handle is nearer the click —
+// deterministic even when the two handles sit on the same pixel, which the
+// usual z-index juggling gets wrong. Keyboard still works: the chosen handle is
+// focused on pointerdown, and each input's own `input` event is handled below.
+const RANK_THUMB_PX = 14; // keep in sync with the thumb width in style.css
+
+function initRankSlider() {
+  const lo = $('rank-lo'), hi = $('rank-hi');
+  if (!lo || !hi) return;
+  const max = maxRank();
+  S.filter.lo = 0; S.filter.hi = max;
+  for (const el of [lo, hi]) { el.min = '0'; el.max = String(max); el.step = '1'; }
+  lo.value = '0'; hi.value = String(max);
+  syncRankUI();
+}
+/** Clamp so lo <= hi (a handle pushed past the other stops, never swaps). */
+function setRankRange(lo, hi) {
+  const max = maxRank();
+  S.filter.lo = Math.max(0, Math.min(max, Math.round(lo)));
+  S.filter.hi = Math.max(0, Math.min(max, Math.round(hi)));
+  if (S.filter.lo > S.filter.hi) S.filter.lo = S.filter.hi;
+  const loEl = $('rank-lo'), hiEl = $('rank-hi');
+  if (loEl) loEl.value = String(S.filter.lo);
+  if (hiEl) hiEl.value = String(S.filter.hi);
+  syncRankUI();
+}
+/** Repaint the selected-range bar + the two value/percentile readouts. */
+function syncRankUI() {
+  const max = maxRank() || 1;
+  const fill = $('rank-fill');
+  if (fill) {
+    fill.style.left = (S.filter.lo / max) * 100 + '%';
+    fill.style.right = (1 - S.filter.hi / max) * 100 + '%';
+  }
+  const total = S.cells.length;
+  const put = (id, rank) => {
+    const el = $(id);
+    if (!el) return;
+    const c = S.cells[rank];
+    el.textContent = c
+      ? `${fmtP(c.p_pos)}  ·  top ${fmtPercent(rankPercent(rank, total))}%`
+      : '—';
+  };
+  put('rank-lo-out', S.filter.lo);
+  put('rank-hi-out', S.filter.hi);
+}
+/** Track x (client px) -> rank, matching the native thumb's half-width insets. */
+function rankFromClientX(clientX) {
+  const box = $('rank-slider').getBoundingClientRect();
+  const usable = Math.max(1, box.width - RANK_THUMB_PX);
+  const f = (clientX - box.left - RANK_THUMB_PX / 2) / usable;
+  return Math.round(Math.max(0, Math.min(1, f)) * maxRank());
+}
+function setupRankSlider() {
+  const wrap = $('rank-slider');
+  if (!wrap) return;
+  let dragging = null; // 'lo' | 'hi' while a pointer drag is in flight
+  const applyAt = (clientX) => {
+    const r = rankFromClientX(clientX);
+    if (dragging === 'lo') setRankRange(Math.min(r, S.filter.hi), S.filter.hi);
+    else setRankRange(S.filter.lo, Math.max(r, S.filter.lo));
+    scheduleFilterRender();
+  };
+  wrap.addEventListener('pointerdown', (e) => {
+    const r = rankFromClientX(e.clientX);
+    // nearest handle wins; ties go to the one that can still move that way
+    const dLo = Math.abs(r - S.filter.lo), dHi = Math.abs(r - S.filter.hi);
+    dragging = (dLo < dHi || (dLo === dHi && r < S.filter.lo)) ? 'lo' : 'hi';
+    const el = $(dragging === 'lo' ? 'rank-lo' : 'rank-hi');
+    if (el) el.focus();
+    wrap.setPointerCapture(e.pointerId);
+    applyAt(e.clientX);
+    e.preventDefault();
+  });
+  wrap.addEventListener('pointermove', (e) => { if (dragging) applyAt(e.clientX); });
+  const end = () => { dragging = null; };
+  wrap.addEventListener('pointerup', end);
+  wrap.addEventListener('pointercancel', end);
+  // keyboard (arrows / Home / End on the focused input)
+  for (const id of ['rank-lo', 'rank-hi']) {
+    $(id).addEventListener('input', () => {
+      setRankRange(Number($('rank-lo').value), Number($('rank-hi').value));
+      scheduleFilterRender();
+    });
+  }
+}
+
+// ---- "labeled by…" checkbox list -------------------------------------------
+/** Display label for a normalized labeler name (mine gets the "(me)" suffix). */
+function labelerLabel(who) {
+  return who === S.me ? `${S.meDisplay || who} (me)` : who;
+}
+/**
+ * Rebuild the checkbox list from the current pool, preserving the selection for
+ * labelers that still exist and silently dropping those that vanished.
+ */
+function rebuildLabelerChecks() {
+  const box = $('filter-labelers');
+  if (!box) return;
+  const pool = new Set([...S.labelerCells.byLabeler.keys()].filter((n) => n));
+  S.filter.checked = pruneSelection(S.filter.checked, pool);
+  const names = labelerOrder(pool, S.me);
+  // the list is rebuilt wholesale on every pool change AND on every toggle, so
+  // keep the user's place: scroll offset + which row had keyboard focus.
+  const scroll = box.scrollTop;
+  const act = document.activeElement;
+  const keepKey = act && box.contains(act)
+    ? (act.dataset.role ? 'role:' + act.dataset.role : 'who:' + act.dataset.who) : null;
+  box.innerHTML = '';
+  const row = (value, text, checked, role) => {
+    const lab = document.createElement('label');
+    lab.className = 'filter-chk' + (role ? ' filter-chk-' + role : '');
+    const inp = document.createElement('input');
+    inp.type = 'checkbox';
+    inp.checked = checked;
+    if (role) inp.dataset.role = role; else inp.dataset.who = value;
+    const span = document.createElement('span');
+    span.textContent = text;
+    lab.appendChild(inp); lab.appendChild(span);
+    box.appendChild(lab);
+    return inp;
+  };
+  const allBox = row('', '(all users)', names.length > 0 && S.filter.checked.size === names.length, 'all');
+  allBox.indeterminate = S.filter.checked.size > 0 && S.filter.checked.size < names.length;
+  if (!names.length) {
+    const em = document.createElement('div');
+    em.className = 'filter-empty';
+    em.textContent = 'nobody has labeled in this project yet';
+    box.appendChild(em);
+  }
+  for (const n of names) row(n, labelerLabel(n), S.filter.checked.has(n));
+  row('', '(unlabeled)', S.filter.unlabeled, 'unlabeled');
+  box.querySelectorAll('input[type=checkbox]').forEach((inp) => {
+    inp.addEventListener('change', () => onLabelerCheck(inp, names));
+    const key = inp.dataset.role ? 'role:' + inp.dataset.role : 'who:' + inp.dataset.who;
+    if (key === keepKey) inp.focus();
+  });
+  box.scrollTop = scroll;
+}
+/** Apply one checkbox change to S.filter, enforcing the exclusivity rules. */
+function onLabelerCheck(inp, names) {
+  const role = inp.dataset.role;
+  if (role === 'unlabeled') {
+    S.filter.unlabeled = inp.checked;
+    if (inp.checked) S.filter.checked = new Set(); // exclusive with the labelers
+  } else if (role === 'all') {
+    S.filter.checked = inp.checked ? new Set(names) : new Set();
+    if (inp.checked) S.filter.unlabeled = false;
+  } else {
+    const who = inp.dataset.who;
+    if (inp.checked) { S.filter.checked.add(who); S.filter.unlabeled = false; }
+    else S.filter.checked.delete(who);
+  }
+  rebuildLabelerChecks(); // repaint (all)/(unlabeled) states from the new truth
+  scheduleFilterRender();
+}
+
+// ---- collapse / expand + summary -------------------------------------------
+function setFilterOpen(open) {
+  S.filter.open = !!open;
+  const body = $('filter-body'), btn = $('filter-toggle'), caret = $('filter-caret');
+  if (body) body.hidden = !S.filter.open;
+  if (btn) btn.setAttribute('aria-expanded', S.filter.open ? 'true' : 'false');
+  if (caret) caret.textContent = S.filter.open ? '▾' : '▸';
+}
+function updateFilterSummary() {
+  const el = $('filter-summary');
+  if (!el) return;
+  el.textContent = filterSummary(filterOpts(), {
+    total: S.cells.length,
+    matched: countMatches(),
+    me: S.me,
+    meLabel: 'me',
+  });
+  const btn = $('filter-toggle');
+  if (btn) btn.classList.toggle('is-active', filterActive());
+  const reset = $('filter-reset');
+  if (reset) reset.disabled = !filterActive();
+}
+function resetFilter() {
+  S.filter.checked = new Set();
+  S.filter.unlabeled = false;
+  setRankRange(0, maxRank());
+  rebuildLabelerChecks();
+  scheduleFilterRender();
+}
+
+// ---- render coalescing ------------------------------------------------------
+// Dragging a handle would otherwise rebuild ~5000 <li> plus a long SVG path per
+// pointermove event. One pending rAF frame max keeps the drag smooth without
+// the lag a timeout-debounce would add.
+let _filterFrame = 0;
+function scheduleFilterRender() {
+  if (_filterFrame) return;
+  _filterFrame = requestAnimationFrame(() => {
+    _filterFrame = 0;
+    applyFilterRender();
+  });
+}
+function applyFilterRender() {
+  updateFilterSummary();
+  buildSideList();
+  rebuildFilterLayer();
+  applyLayerToggles();
+  if (S.review.on) reviewRefreshUI(); // repaint badges on the rebuilt rows
+}
+
+/** Repaint the g-filter SPOTLIGHT (empty when no condition is active): one
  *  even-odd path that veils the whole canvas dark EXCEPT the matching cells,
  *  which stay at full brightness. Communicating by contrast instead of by a
  *  color fill keeps the filter legible over the plasma heatmap / green mask. */
@@ -526,7 +746,7 @@ function rebuildFilterLayer() {
   const g = document.getElementById('g-filter');
   if (!g) return;
   g.innerHTML = '';
-  if (!S.filter) return;
+  if (!filterActive()) return;
   let d = `M0 0H${S.swathW}V${S.swathH}H0Z`; // outer: the whole swath canvas
   for (const c of S.cells) {
     if (!cellMatchesFilter(c.id)) continue;
@@ -541,7 +761,8 @@ function rebuildFilterLayer() {
 /** Full refresh of everything the filter drives (call after pool changes). */
 function refreshFilterUI() {
   computeLabelerCells();
-  rebuildFilterOptions();
+  rebuildLabelerChecks(); // keeps the selection for labelers that still exist
+  updateFilterSummary();
   buildSideList();
   rebuildFilterLayer();
   if (S.review.on) reviewRefreshUI(); // repaint badges on the rebuilt rows
@@ -1523,13 +1744,11 @@ function boot() {
     $('gt-drifted').addEventListener('click', () => { if (S.crop) reviewSetVerdict(S.crop.cell.id, 'drifted'); });
   }
   ['tg-heatmap', 'tg-gt', 'tg-mine', 'tg-acc', 'tg-filter'].forEach((id) => $(id).addEventListener('change', applyLayerToggles));
-  $('cell-filter').addEventListener('change', () => {
-    S.filter = $('cell-filter').value;
-    buildSideList();
-    rebuildFilterLayer();
-    applyLayerToggles();
-    if (S.review.on) reviewRefreshUI(); // repaint badges on the rebuilt rows
-  });
+  // collapsible Filters block (collapsed by default) + its controls
+  setFilterOpen(false);
+  $('filter-toggle').addEventListener('click', () => setFilterOpen(!S.filter.open));
+  $('filter-reset').addEventListener('click', resetFilter);
+  setupRankSlider();
   setupSwathPanZoom();
   setupCropInteractions();
   window.addEventListener('resize', () => { if (!$('app').hidden) applySwathTransform(); });

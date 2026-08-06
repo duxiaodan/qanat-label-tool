@@ -64,9 +64,42 @@
     <div id="main">
       <aside id="sidelist">
         <div class="side-head">
-          <span>Cells (by p_pos &darr;)</span>
-          <!-- "labeled by…" filter; options are rebuilt from the pulled pool -->
-          <select id="cell-filter" title="show only cells labeled by…"></select>
+          <div class="side-title">Cells (by p_pos &darr;)</div>
+          <!-- Collapsible filter block. Collapsed (the default) it is one line:
+               a live summary of what is filtered + the match count. Expanded it
+               reveals the rank slider, the "labeled by…" checkboxes and reset. -->
+          <button id="filter-toggle" class="filter-toggle" type="button"
+                  aria-expanded="false" aria-controls="filter-body">
+            <span id="filter-caret" class="filter-caret">&#9656;</span>
+            <span id="filter-summary" class="filter-summary">Filters: off</span>
+          </button>
+          <div id="filter-body" class="filter-body" hidden>
+            <div class="filter-sec">
+              <div class="filter-sec-title">p_pos range</div>
+              <!-- dual-handle slider over RANK (index into the p_pos-descending
+                   cell array), not over the raw value — see cellfilter.js -->
+              <div id="rank-slider" class="rank-slider">
+                <div class="rank-track"></div>
+                <div id="rank-fill" class="rank-fill"></div>
+                <input type="range" id="rank-lo" min="0" max="0" step="1" value="0"
+                       aria-label="highest p_pos kept" />
+                <input type="range" id="rank-hi" min="0" max="0" step="1" value="0"
+                       aria-label="lowest p_pos kept" />
+              </div>
+              <div class="rank-readout">
+                <span id="rank-lo-out">&mdash;</span>
+                <span id="rank-hi-out">&mdash;</span>
+              </div>
+            </div>
+            <div class="filter-sec">
+              <div class="filter-sec-title">labeled by</div>
+              <!-- checkboxes are rebuilt from the pulled pool on every refresh -->
+              <div id="filter-labelers" class="filter-labelers"></div>
+            </div>
+            <div class="filter-actions">
+              <button id="filter-reset" class="filter-reset" type="button" disabled>reset</button>
+            </div>
+          </div>
         </div>
         <ul id="cell-list"></ul>
       </aside>
