@@ -16,6 +16,9 @@ import {
   cellPasses, filterIsActive, pruneSelection, labelerOrder,
   rankPercent, fmtPercent, filterSummary,
 } from './cellfilter.js';
+import {
+  selectMarks, scopeSlug, scopeProblem, countOrphans, buildExportScope,
+} from './exportscope.js';
 import { SUPABASE } from './site_config.js';
 
 // --------------------------------------------------------------------------- //
@@ -52,6 +55,20 @@ const S = {
     open: false,           // Filters section expanded? (collapsed by default)
   },
   labelerCells: { byLabeler: new Map(), any: new Set() }, // derived from the pool
+  // download dialog — three INDEPENDENT axes ANDed by exportscope.js. Defaults
+  // reproduce the old one-shot button (the whole pool). Choices persist across
+  // opens within a session (a re-download of the same scope is one click).
+  dl: {
+    crops: 'all',          // 'all' | 'filter'
+    marksBy: 'everyone',   // 'everyone' | 'me' | 'choose'
+    chosen: new Set(),     // normalized labeler names (marksBy === 'choose')
+    created: 'any',        // 'any' | 'session' | 'since'
+    since: '',             // 'YYYY-MM-DD' from <input type=date>
+  },
+  // max(created) over the pool AT UNLOCK — the boundary for "this session".
+  // Server timestamps only: the browser clock is never consulted, so clock skew
+  // cannot misclassify a mark saved near the boundary. Set ONCE, never refreshed.
+  sessionSince: '',
   storageKey: 'qanat-labels:v1',
   // swath view transform
   view: { x: 0, y: 0, scale: 1 },
@@ -454,6 +471,7 @@ async function unlock() {
     S.storageKey = 'qanat-labels:' + S.board + ':' + S.project;
     if (S.review.on) reviewInit(); // eligibility + stored verdicts (localStorage only)
     await pullAllMarks();
+    computeSessionSince(); // "this session" boundary — ONLY here, never on refresh
     // images
     const swathUrl = await decryptToBlobUrl('swath.enc', 'image/jpeg');
     const heatUrl = await decryptToBlobUrl(S.manifest.swath.heatmap || 'heatmap.enc', 'image/png');
@@ -1554,6 +1572,9 @@ function setupCropInteractions() {
   }));
   document.addEventListener('keydown', (e) => {
     if (!S.crop || $('crop-modal').hidden) return;
+    // the download dialog stacks above everything: while it is open it owns the
+    // keyboard (Esc closes IT), so the crop's Esc/arrow duties stand down.
+    if (!$('dl-modal').hidden) return;
     // the unsaved-changes prompt is modal: Esc cancels it, everything else
     // (including the arrow keys and Esc's normal duties) is swallowed.
     if (S.navDialog) {
@@ -1690,9 +1711,17 @@ async function commitCrop() {
 }
 
 // --------------------------------------------------------------------------- //
-// download
+// download dialog
+//
+// The button used to emit both files immediately — the ENTIRE pulled pool
+// (everyone's marks) under a filename bearing YOUR name. It now opens a dialog
+// with three independent axes (crops / marks by / created); the predicate lives
+// in exportscope.js so it is unit-testable without a DOM, and the filename +
+// an `export_scope` foreign member record what the file actually contains.
+// Defaults reproduce the old behaviour exactly.
 // --------------------------------------------------------------------------- //
 function updateDownloadEnabled() {
+  // unchanged rule: no labeler name -> nothing to attribute an export to.
   $('btn-download').disabled = !($('labeler').value.trim());
 }
 function triggerDownload(obj, fname) {
@@ -1702,16 +1731,207 @@ function triggerDownload(obj, fname) {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
-function download() {
+
+/** "this session" boundary: the newest server timestamp present AT UNLOCK. */
+function computeSessionSince() {
+  let best = '';
+  const consider = (m) => {
+    const c = (m && m.created) || '';
+    if (!c) return;
+    if (!best) { best = c; return; }
+    const a = Date.parse(c), b = Date.parse(best);
+    if (Number.isFinite(a) && Number.isFinite(b)) { if (a > b) best = c; }
+    else if (c > best) best = c;     // defensive: unparseable -> string compare
+  };
+  S.shaftMarks.forEach(consider);
+  S.lineMarks.forEach(consider);
+  S.sessionSince = best;             // '' (empty pool) => everything is "this session"
+}
+
+/** The dialog state as ONE plain object for exportscope.js (which has no DOM). */
+function dlScope() {
+  return {
+    crops: S.dl.crops,
+    cellPasses: cellMatchesFilter,   // injected: the very predicate the sidebar uses
+    marksBy: S.dl.marksBy,
+    me: S.me,
+    chosen: S.dl.chosen,
+    created: S.dl.created,
+    since: S.dl.since,
+    sessionSince: S.sessionSince,
+  };
+}
+/**
+ * Build exactly what the two files would contain, so the live preview counts
+ * FEATURES (lines with < 2 vertices are dropped by the builder) and can never
+ * disagree with what lands on disk.
+ */
+function dlBuild() {
+  const scope = dlScope();
   const labeler = $('labeler').value.trim();
-  if (!labeler) { setStatus('enter a labeler name first'); return; }
-  const lab = sanitize(labeler);
+  const shafts = buildShaftsFeatureCollection(selectMarks(S.shaftMarks, scope), { labeler });
+  const lines = buildLinesFeatureCollection(selectMarks(S.lineMarks, scope), { labeler });
+  const slug = scopeSlug(scope);
   const d = ymd(new Date());
-  const shafts = buildShaftsFeatureCollection(S.shaftMarks, { labeler });
-  const lines = buildLinesFeatureCollection(S.lineMarks, { labeler });
-  triggerDownload(shafts, `qanat_shafts_manual_${lab}_${d}.geojson`);
-  triggerDownload(lines, `qanat_channels_manual_${lab}_${d}.geojson`);
-  setStatus(`downloaded ${shafts.features.length} shafts + ${lines.features.length} channels`);
+  const proj = sanitize(S.project || 'project');
+  const tag = sanitize(slug);
+  return {
+    shafts, lines, scope,
+    names: {
+      shafts: `qanat_shafts_${proj}_${tag}_${d}.geojson`,
+      lines: `qanat_channels_${proj}_${tag}_${d}.geojson`,
+    },
+  };
+}
+/** Marks pointing at a cell the manifest no longer has (a rebuild can drop cells). */
+function dlOrphanCount() {
+  return countOrphans([S.shaftMarks, S.lineMarks], (cid) => S.cellRank.has(cid));
+}
+
+// ---- dialog ----------------------------------------------------------------
+function dlOpen() {
+  if (!($('labeler').value.trim())) { setStatus('enter a labeler name first'); return; }
+  // prune labelers who vanished from the pool (project switch / deleted marks)
+  const pool = new Set([...S.labelerCells.byLabeler.keys()].filter((n) => n));
+  S.dl.chosen = pruneSelection(S.dl.chosen, pool);
+  $('dl-me-name').textContent = S.meDisplay || S.me || '—';
+  $('dl-since').value = S.dl.since || '';
+  for (const [name, val] of [['dl-crops', S.dl.crops], ['dl-marks', S.dl.marksBy], ['dl-created', S.dl.created]]) {
+    const el = document.querySelector(`input[name="${name}"][value="${val}"]`);
+    if (el) el.checked = true;
+  }
+  dlRebuildLabelerChecks();
+  $('dl-modal').hidden = false;
+  dlRefresh();
+  $('dl-go').focus();
+}
+function dlClose() { $('dl-modal').hidden = true; }
+
+/** Checkbox list for "choose…" — same ordering/master-checkbox idiom as Filters. */
+function dlRebuildLabelerChecks() {
+  const box = $('dl-labelers');
+  if (!box) return;
+  const pool = new Set([...S.labelerCells.byLabeler.keys()].filter((n) => n));
+  const names = labelerOrder(pool, S.me);
+  box.innerHTML = '';
+  const row = (value, text, checked, role) => {
+    const lab = document.createElement('label');
+    lab.className = 'dl-chk' + (role ? ' dl-chk-' + role : '');
+    const inp = document.createElement('input');
+    inp.type = 'checkbox';
+    inp.checked = checked;
+    if (role) inp.dataset.role = role; else inp.dataset.who = value;
+    const span = document.createElement('span');
+    span.textContent = text;
+    lab.appendChild(inp); lab.appendChild(span);
+    box.appendChild(lab);
+    return inp;
+  };
+  const allBox = row('', '(all users)', names.length > 0 && S.dl.chosen.size === names.length, 'all');
+  allBox.indeterminate = S.dl.chosen.size > 0 && S.dl.chosen.size < names.length;
+  if (!names.length) {
+    const em = document.createElement('div');
+    em.className = 'dl-empty';
+    em.textContent = 'nobody has labeled in this project yet';
+    box.appendChild(em);
+  }
+  for (const n of names) row(n, labelerLabel(n), S.dl.chosen.has(n));
+  box.querySelectorAll('input[type=checkbox]').forEach((inp) => {
+    inp.addEventListener('change', () => {
+      if (inp.dataset.role === 'all') S.dl.chosen = inp.checked ? new Set(names) : new Set();
+      else if (inp.checked) S.dl.chosen.add(inp.dataset.who);
+      else S.dl.chosen.delete(inp.dataset.who);
+      dlRebuildLabelerChecks();  // repaint the (all users) tri-state
+      dlRefresh();
+    });
+  });
+  box.hidden = S.dl.marksBy !== 'choose';
+}
+
+/** Live counts, filenames, guardrails — recomputed on every axis change. */
+function dlRefresh() {
+  if ($('dl-modal').hidden) return;
+  const cnt = $('dl-crops-count');
+  if (cnt) {
+    const n = filterActive() ? countMatches() : S.cells.length;
+    cnt.textContent = `${n} crop${n === 1 ? '' : 's'}`;
+  }
+  const built = dlBuild();
+  const ns = built.shafts.features.length, nl = built.lines.features.length;
+  const total = ns + nl;
+  const prev = $('dl-preview');
+  prev.textContent = `→ ${total} mark${total === 1 ? '' : 's'}  `;
+  const split = document.createElement('span');
+  split.className = 'dl-split';
+  split.textContent = `(${ns} shaft${ns === 1 ? '' : 's'} + ${nl} channel${nl === 1 ? '' : 's'})`;
+  prev.appendChild(split);
+  $('dl-files').textContent = `${built.names.shafts} · ${built.names.lines}`;
+  // orphans: exported under "all", necessarily excluded under "current filter"
+  const orph = dlOrphanCount();
+  const note = $('dl-note');
+  note.hidden = orph === 0;
+  if (orph) {
+    note.textContent = `${orph} mark${orph === 1 ? '' : 's'} reference a crop that is no longer ` +
+      `in the manifest — included under "all", excluded by "current filter".`;
+  }
+  const problem = scopeProblem(built.scope);
+  const why = problem || (total === 0 ? 'nothing matches this selection' : '');
+  $('dl-why').hidden = !why;
+  $('dl-why').textContent = why;
+  $('dl-go').disabled = !!why;
+}
+
+function dlDownload() {
+  const built = dlBuild();
+  const ns = built.shafts.features.length, nl = built.lines.features.length;
+  if (scopeProblem(built.scope) || ns + nl === 0) return; // guarded; never emit empty files
+  const exportedAt = new Date().toISOString();
+  const meta = (featureCount) => buildExportScope(built.scope, {
+    project: S.project || null,
+    cropCount: filterActive() ? countMatches() : S.cells.length,
+    featureCount, exportedAt,
+  });
+  // foreign member (RFC 7946 §6.1): records the scope without touching any
+  // per-feature `properties`, so conformant parsers are unaffected.
+  built.shafts.export_scope = meta(ns);
+  built.lines.export_scope = meta(nl);
+  triggerDownload(built.shafts, built.names.shafts);
+  triggerDownload(built.lines, built.names.lines);
+  setStatus(`downloaded ${ns + nl} marks (${ns} shafts + ${nl} channels)`);
+  dlClose();
+}
+
+function setupDownloadDialog() {
+  const modal = $('dl-modal');
+  modal.addEventListener('click', (e) => { if (e.target === modal) dlClose(); });
+  $('dl-cancel').addEventListener('click', dlClose);
+  $('dl-go').addEventListener('click', dlDownload);
+  document.querySelectorAll('input[name="dl-crops"]').forEach((r) =>
+    r.addEventListener('change', () => { if (r.checked) { S.dl.crops = r.value; dlRefresh(); } }));
+  document.querySelectorAll('input[name="dl-marks"]').forEach((r) =>
+    r.addEventListener('change', () => {
+      if (!r.checked) return;
+      S.dl.marksBy = r.value;
+      $('dl-labelers').hidden = r.value !== 'choose';
+      dlRefresh();
+    }));
+  document.querySelectorAll('input[name="dl-created"]').forEach((r) =>
+    r.addEventListener('change', () => { if (r.checked) { S.dl.created = r.value; dlRefresh(); } }));
+  $('dl-since').addEventListener('input', () => {
+    S.dl.since = $('dl-since').value;
+    // typing/picking a date is an unambiguous request for that option
+    if (S.dl.since && S.dl.created !== 'since') {
+      S.dl.created = 'since';
+      $('dl-created-since').checked = true;
+    }
+    dlRefresh();
+  });
+  // Esc closes. The crop modal's keydown handler bails out while this dialog is
+  // open (see setupCropInteractions), so exactly one modal ever reacts.
+  document.addEventListener('keydown', (e) => {
+    if ($('dl-modal').hidden) return;
+    if (e.key === 'Escape') { e.preventDefault(); dlClose(); }
+  });
 }
 
 // --------------------------------------------------------------------------- //
@@ -1734,7 +1954,8 @@ function boot() {
   $('passcode').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
   $('gate-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('gate-project').focus(); });
   $('gate-project').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('passcode').focus(); });
-  $('btn-download').addEventListener('click', download);
+  $('btn-download').addEventListener('click', dlOpen);
+  setupDownloadDialog();
   $('btn-refresh').addEventListener('click', () => { refreshMarks(); });
   // GT-review wiring only exists when the URL opts in (?gtreview=1); in normal
   // mode no listener is attached and every review element stays [hidden].

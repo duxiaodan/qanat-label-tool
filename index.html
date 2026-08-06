@@ -177,6 +177,60 @@
     </div>
   </div>
 
+  <!-- download dialog: three INDEPENDENT axes (crops / marks by / created) that
+       AND into one mark-level predicate (exportscope.js). The defaults —
+       all × everyone × any time — reproduce the pre-dialog one-shot download. -->
+  <div id="dl-modal" class="modal dl-modal" hidden role="dialog" aria-modal="true"
+       aria-labelledby="dl-title">
+    <div class="dl-box">
+      <div class="dl-title" id="dl-title">Download GeoJSON</div>
+
+      <div class="dl-sec">
+        <div class="dl-sec-title">Crops</div>
+        <label class="dl-opt"><input type="radio" name="dl-crops" value="all" id="dl-crops-all" checked />
+          <span>all</span></label>
+        <label class="dl-opt"><input type="radio" name="dl-crops" value="filter" id="dl-crops-filter" />
+          <span>current filter — <span id="dl-crops-count">—</span></span></label>
+      </div>
+
+      <div class="dl-sec">
+        <div class="dl-sec-title">Marks by</div>
+        <label class="dl-opt"><input type="radio" name="dl-marks" value="everyone" id="dl-marks-everyone" checked />
+          <span>everyone</span></label>
+        <label class="dl-opt"><input type="radio" name="dl-marks" value="me" id="dl-marks-me" />
+          <span>just me (<span id="dl-me-name">—</span>)</span></label>
+        <label class="dl-opt"><input type="radio" name="dl-marks" value="choose" id="dl-marks-choose" />
+          <span>choose…</span></label>
+        <!-- rebuilt from the pulled pool every time the dialog opens -->
+        <div id="dl-labelers" class="dl-labelers" hidden></div>
+      </div>
+
+      <div class="dl-sec">
+        <div class="dl-sec-title">Created</div>
+        <label class="dl-opt"><input type="radio" name="dl-created" value="any" id="dl-created-any" checked />
+          <span>any time</span></label>
+        <!-- "this session" is server-timestamp based (max(created) at unlock),
+             never the browser clock — see exportscope.js -->
+        <label class="dl-opt"><input type="radio" name="dl-created" value="session" id="dl-created-session" />
+          <span>this session</span></label>
+        <label class="dl-opt"><input type="radio" name="dl-created" value="since" id="dl-created-since" />
+          <span>since</span>
+          <input type="date" id="dl-since" class="dl-date" aria-label="created on or after" />
+        </label>
+      </div>
+
+      <div id="dl-note" class="dl-note" hidden></div>
+      <div id="dl-preview" class="dl-preview">—</div>
+      <div id="dl-files" class="dl-files"></div>
+      <div id="dl-why" class="dl-why" hidden></div>
+
+      <div class="dl-actions">
+        <button id="dl-cancel" type="button">Cancel</button>
+        <button id="dl-go" type="button">Download</button>
+      </div>
+    </div>
+  </div>
+
   <script type="module" src="app.js"></script>
 </body>
 </html>
