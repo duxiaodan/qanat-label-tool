@@ -173,3 +173,45 @@ body {
    mouse handlers stay on #crop-canvas / #crop-stage underneath. */
 #crop-overlay { position: absolute; left: 0; top: 0; pointer-events: none; }
 .modal-hint { font-size: 11px; color: #889; margin-top: 6px; }
+
+/* ---------- adjacent-crop navigation ----------
+   Small semi-transparent arrows overlaying the imagery at the four edges of
+   #crop-stage. They are the only clickable children of the stage (the canvas
+   handlers ignore them because the buttons stopPropagation), and each one is
+   [hidden] whenever that neighbour cell doesn't exist. */
+.crop-nav {
+  position: absolute; z-index: 5; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(20, 24, 32, .5); color: #e6e8ec;
+  border: 1px solid rgba(255, 255, 255, .22); border-radius: 6px;
+  font-size: 13px; line-height: 1; cursor: pointer; opacity: .55;
+  user-select: none; transition: opacity .12s ease, background .12s ease, border-color .12s ease;
+}
+.crop-nav:hover { opacity: 1; background: rgba(42, 109, 240, .85); border-color: rgba(255, 255, 255, .65); }
+.crop-nav:active { background: rgba(31, 91, 208, .95); }
+.crop-nav-left, .crop-nav-right { top: 50%; transform: translateY(-50%); width: 26px; height: 56px; }
+.crop-nav-left { left: 6px; }
+.crop-nav-right { right: 6px; }
+.crop-nav-up, .crop-nav-down { left: 50%; transform: translateX(-50%); width: 56px; height: 26px; }
+.crop-nav-up { top: 6px; }
+.crop-nav-down { bottom: 6px; }
+
+/* unsaved-marks prompt (three choices, so window.confirm can't be used) */
+.nav-confirm {
+  position: absolute; inset: 0; z-index: 60;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, .55);
+}
+.nav-confirm-box {
+  background: #232833; color: #e6e8ec; border: 1px solid #3a4152; border-radius: 8px;
+  padding: 18px 20px; width: min(430px, 90vw); box-shadow: 0 12px 40px rgba(0, 0, 0, .55);
+}
+.nav-confirm-title { font-weight: 700; margin-bottom: 8px; }
+.nav-confirm-msg { margin: 0 0 16px; font-size: 13px; color: #b9c0cd; line-height: 1.45; }
+.nav-confirm-btns { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+.nav-confirm-btns button {
+  padding: 6px 12px; border-radius: 5px; border: none; background: #333a48; color: #eee;
+  cursor: pointer; font-size: 12px;
+}
+.nav-confirm-btns button#crop-nav-save { background: #2a6df0; font-weight: 600; }
+.nav-confirm-btns button:hover { filter: brightness(1.2); }

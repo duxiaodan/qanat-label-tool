@@ -114,10 +114,33 @@
         <!-- screen-space vector overlay: NOT CSS-transformed, so marks keep a
              constant screen size at any zoom (see drawCropOverlay in app.js) -->
         <canvas id="crop-overlay"></canvas>
+        <!-- adjacent-crop navigation: one edge-overlay button per direction.
+             Each is shown ONLY when that neighbour cell exists in the manifest
+             (updateCropNavButtons in app.js recomputes on every openCrop), so a
+             swath edge OR a mid-swath gap simply renders no button. -->
+        <button id="crop-nav-up" class="crop-nav crop-nav-up" hidden>&#9650;</button>
+        <button id="crop-nav-down" class="crop-nav crop-nav-down" hidden>&#9660;</button>
+        <button id="crop-nav-left" class="crop-nav crop-nav-left" hidden>&#9664;</button>
+        <button id="crop-nav-right" class="crop-nav crop-nav-right" hidden>&#9654;</button>
       </div>
       <div class="modal-hint">click = add a point / polyline vertex · double-click or Enter ends a polyline ·
         click your own mark to select it · <b>left-drag = box-select multiple of your marks</b> · Delete removes selected ·
-        right-drag (or middle-drag) to pan · wheel to zoom · Esc cancels</div>
+        right-drag (or middle-drag) to pan · wheel to zoom · <b>arrow keys (or the edge arrows) jump to the adjacent crop</b> · Esc cancels</div>
+    </div>
+
+    <!-- unsaved-marks prompt shown when navigating away from a dirty crop.
+         Three choices (window.confirm can only offer two). Esc = cancel. -->
+    <div id="crop-nav-confirm" class="nav-confirm" hidden>
+      <div class="nav-confirm-box">
+        <div class="nav-confirm-title">Unsaved marks on this crop</div>
+        <p class="nav-confirm-msg">You changed marks on this crop without saving.
+           What should happen before moving to the adjacent crop?</p>
+        <div class="nav-confirm-btns">
+          <button id="crop-nav-save">Save &amp; go</button>
+          <button id="crop-nav-discard">Discard &amp; go</button>
+          <button id="crop-nav-cancel">Cancel</button>
+        </div>
+      </div>
     </div>
   </div>
 

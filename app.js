@@ -23,6 +23,7 @@ const S = {
   manifest: null,       // decrypted manifest object
   cells: [],            // manifest.cells (p_pos desc)
   cellById: new Map(),
+  cellByCentre: new Map(), // `${round(cx)}_${round(cy)}` -> cell (adjacent-crop nav)
   swathW: 0, swathH: 0, // swath image pixel size
   swathBounds: null,    // [minx, miny, maxx, maxy]
   // identity (set at the gate; `me` is normalized for matching, `meDisplay` shown/exported)
@@ -48,6 +49,11 @@ const S = {
   crop: null,           // {cell, raw: ImageData, ctx, view:{x,y,scale}, marks:{points:[{px:[col,row],ac}..], lines:[{pts:[[col,row]..],ac}..]}, inProgress:[], selected:null}
                         // `ac` = autocontrast toggle state when the mark was drawn (null on
                         // pre-provenance marks reloaded from the pool; preserved across saves)
+                        // `dirty` = the user changed marks since the last save/open.
+
+  // adjacent-crop navigation
+  navBusy: false,       // a jump is in flight (or its prompt is up) -> ignore further nav
+  navDialog: null,      // resolver fn while the unsaved-changes prompt is open, else null
 
   // hidden GT-review mode (personal, local-only; NEVER synced to the backend).
   // `on` is decided once at boot from the URL; when false the feature is inert
@@ -425,6 +431,7 @@ async function unlock() {
     S.manifest = JSON.parse(new TextDecoder().decode(manBytes));
     S.cells = (S.manifest.cells || []).slice().sort((a, b) => b.p_pos - a.p_pos);
     for (const c of S.cells) S.cellById.set(c.id, c);
+    buildCellCentreIndex(); // centre-keyed lookup for adjacent-crop navigation
     S.swathW = S.manifest.swath.width; S.swathH = S.manifest.swath.height;
     S.swathBounds = S.manifest.swath.world_bounds;
     S.board = (S.swathBounds ? S.swathBounds.map((v) => Math.round(v)).join('_') : 'v1');
@@ -806,6 +813,105 @@ function setupSwathPanZoom() {
 }
 
 // --------------------------------------------------------------------------- //
+// adjacent-crop navigation (neighbour lookup)
+//
+// Cells sit on a regular grid, so a neighbour is just "this cell's centre ±
+// one cell size" — but the baked manifest has HOLES (cells were dropped when
+// their valid-imagery fraction was too low), so the lookup must go through the
+// actual cell set, never through arithmetic on the id alone. The step comes
+// from the cell's own bbox rather than a hard-coded 2048 m.
+// --------------------------------------------------------------------------- //
+function centreKey(cx, cy) { return `${Math.round(cx)}_${Math.round(cy)}`; }
+function cellCentre(cell) {
+  const [x0, y0, x1, y1] = cell.world_bbox;
+  return [(x0 + x1) / 2, (y0 + y1) / 2];
+}
+/** Built once per unlock, alongside S.cellById. */
+function buildCellCentreIndex() {
+  S.cellByCentre = new Map();
+  for (const c of S.cells) {
+    if (!c.world_bbox) continue;
+    const [cx, cy] = cellCentre(c);
+    S.cellByCentre.set(centreKey(cx, cy), c);
+  }
+}
+// screen direction -> world-coord step sign. Northing grows upward, so 'up' is +y.
+const NAV_DIRS = { up: [0, 1], down: [0, -1], left: [-1, 0], right: [1, 0] };
+const NAV_LABEL = { up: 'north', down: 'south', left: 'west', right: 'east' };
+/** The adjacent cell in `dir`, or null when the grid has no cell there. */
+function neighbourCell(cell, dir) {
+  const d = NAV_DIRS[dir];
+  if (!d || !cell || !cell.world_bbox) return null;
+  const [x0, y0, x1, y1] = cell.world_bbox;
+  const stepX = Math.abs(x1 - x0), stepY = Math.abs(y1 - y0);
+  const [cx, cy] = cellCentre(cell);
+  return S.cellByCentre.get(centreKey(cx + d[0] * stepX, cy + d[1] * stepY)) || null;
+}
+/** Show an edge arrow only where a neighbour actually exists. Runs per openCrop. */
+function updateCropNavButtons() {
+  const cell = S.crop ? S.crop.cell : null;
+  for (const dir of Object.keys(NAV_DIRS)) {
+    const b = $('crop-nav-' + dir);
+    if (!b) continue;
+    const n = cell ? neighbourCell(cell, dir) : null;
+    b.hidden = !n;
+    b.title = n ? `${NAV_LABEL[dir]} → ${n.id}` : '';
+  }
+}
+/** Unsaved-marks test: an explicit edit, or a polyline still being drawn. */
+function cropIsDirty() {
+  if (!S.crop) return false;
+  return S.crop.dirty === true || (S.crop.inProgress && S.crop.inProgress.length > 0);
+}
+/** In-app 3-way prompt (window.confirm can only offer two). Resolves to
+ *  'save' | 'discard' | 'cancel'. Esc cancels (see the keydown handler). */
+function askNavChoice() {
+  return new Promise((resolve) => {
+    const dlg = $('crop-nav-confirm');
+    if (!dlg) { resolve('cancel'); return; }
+    S.navDialog = (choice) => {
+      S.navDialog = null;
+      dlg.hidden = true;
+      resolve(choice);
+    };
+    dlg.hidden = false;
+    const c = $('crop-nav-cancel');
+    if (c) c.focus();
+  });
+}
+function closeNavDialog(choice) { if (S.navDialog) S.navDialog(choice); }
+/**
+ * Jump to the neighbouring crop without leaving the modal.
+ * ORDERING IS LOAD-BEARING: openCrop() replaces S.crop wholesale and commitCrop()
+ * reads/mutates it, so the save must be fully awaited BEFORE the jump.
+ * Zoom is deliberately not preserved — openCrop's fitCrop() resets it.
+ */
+async function navigateCrop(dir) {
+  if (S.navBusy) return;                       // a jump/prompt is already running
+  if (!S.crop || $('crop-modal').hidden) return;
+  const target = neighbourCell(S.crop.cell, dir);
+  if (!target) return;                          // no such neighbour -> nothing to do
+  S.navBusy = true;
+  try {
+    if (cropIsDirty()) {
+      const choice = await askNavChoice();
+      if (choice === 'cancel') return;
+      if (!S.crop) return;                      // modal closed while the prompt was up
+      if (choice === 'save') {
+        const savedId = S.crop.cell.id;
+        await commitCrop();                     // MUST finish before openCrop replaces S.crop
+        setStatus('saved ' + savedId);
+      }
+      // 'discard': openCrop below rebuilds the marks from the pool, so the
+      // uncommitted edits simply never leave S.crop.
+    }
+    await openCrop(target.id);
+  } finally {
+    S.navBusy = false;
+  }
+}
+
+// --------------------------------------------------------------------------- //
 // crop popup
 // --------------------------------------------------------------------------- //
 async function openCrop(cid) {
@@ -832,6 +938,7 @@ async function openCrop(cid) {
     inProgress: [],
     selected: { points: new Set(), lines: new Set() },  // indices of own marks currently selected
     selectBox: null,       // [c0, r0, c1, r1] in 1024² coords while rubber-band-dragging
+    dirty: false,          // unsaved mark edits (drives the navigation prompt)
   };
   loadCropMarksFor(cell);
   $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}   (${cell.gt_points.length} GT shafts)`;
@@ -847,6 +954,7 @@ async function openCrop(cid) {
   $('crop-gt').checked = true;
   document.querySelector('input[name="drawmode"][value="point"]').checked = true;
   $('crop-modal').hidden = false;
+  updateCropNavButtons(); // edge arrows for whichever neighbours this cell has
   resizeCropOverlay();   // stage has a layout size only now that the modal is shown
   fitCrop();
   redrawCrop();
@@ -884,6 +992,7 @@ function reloadCropMarks() {
 }
 function closeCrop(save) {
   if (S.crop && save) commitCrop();
+  closeNavDialog('cancel');  // never leave the nav prompt up over a closed modal
   S.crop = null;
   drawCropOverlay();   // wipe the vector overlay so nothing is stale on reopen
   $('crop-modal').hidden = true;
@@ -909,6 +1018,7 @@ function deleteSelected() {
   const li = [...S.crop.selected.lines].sort((a, b) => b - a);
   for (const i of li) S.crop.marks.lines.splice(i, 1);
   selClear();
+  S.crop.dirty = true;
   redrawCrop();
 }
 function fitCrop() {
@@ -1091,6 +1201,7 @@ function finishInProgressLine() {
   // (dblclick/Enter/mode-switch/commit flush), one `ac` flag per line.
   if (S.crop.inProgress.length >= 2) {
     S.crop.marks.lines.push({ pts: S.crop.inProgress.slice(), ac: $('crop-autocontrast').checked });
+    S.crop.dirty = true;
   }
   S.crop.inProgress = [];
   redrawCrop();
@@ -1153,6 +1264,7 @@ function setupCropInteractions() {
         // new point: stamped with the toggle state at the moment it is added.
         if (drawMode() === 'point') S.crop.marks.points.push({ px: pressPx, ac: $('crop-autocontrast').checked });
         else S.crop.inProgress.push(pressPx);
+        S.crop.dirty = true;
         redrawCrop();
       }
     }
@@ -1180,11 +1292,12 @@ function setupCropInteractions() {
   $('crop-gt').addEventListener('change', redrawCrop);
   $('crop-undo').addEventListener('click', () => {
     if (!S.crop) return;
-    if (S.crop.inProgress.length) { S.crop.inProgress.pop(); }
+    if (S.crop.inProgress.length) { S.crop.inProgress.pop(); S.crop.dirty = true; }
     else if (S.crop.marks.points.length || S.crop.marks.lines.length) {
       // undo whichever was added last is ambiguous after reload; pop a point first, else a line
       if (S.crop.marks.points.length) S.crop.marks.points.pop();
       else S.crop.marks.lines.pop();
+      S.crop.dirty = true;
     }
     selClear();
     redrawCrop();
@@ -1193,16 +1306,46 @@ function setupCropInteractions() {
     if (!S.crop) return;
     if (!confirm('Remove all your marks for this crop?')) return;
     S.crop.marks.points = []; S.crop.marks.lines = []; S.crop.inProgress = []; S.crop.selectBox = null; selClear();
+    S.crop.dirty = true;
     redrawCrop();
   });
   $('crop-save').addEventListener('click', () => { commitCrop(); setStatus('saved ' + S.crop.cell.id); });
   $('crop-close').addEventListener('click', () => closeCrop(false));
+  // ---- adjacent-crop navigation: edge arrows + the unsaved-changes prompt ----
+  // stopPropagation on both mousedown and click so the stage/canvas never reads
+  // an arrow press as a pan gesture or a point-placement click.
+  for (const dir of Object.keys(NAV_DIRS)) {
+    const b = $('crop-nav-' + dir);
+    if (!b) continue;
+    b.addEventListener('mousedown', (e) => e.stopPropagation());
+    b.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); navigateCrop(dir); });
+  }
+  const navChoice = { 'crop-nav-save': 'save', 'crop-nav-discard': 'discard', 'crop-nav-cancel': 'cancel' };
+  for (const id in navChoice) {
+    const b = $(id);
+    if (b) b.addEventListener('click', (e) => { e.stopPropagation(); closeNavDialog(navChoice[id]); });
+  }
+  // clicking the prompt's backdrop (never its box) is a cancel
+  const navDlg = $('crop-nav-confirm');
+  if (navDlg) navDlg.addEventListener('click', (e) => { if (e.target === navDlg) closeNavDialog('cancel'); });
   document.querySelectorAll('input[name="drawmode"]').forEach((r) => r.addEventListener('change', () => {
     if (S.crop && drawMode() === 'point') finishInProgressLine();
   }));
   document.addEventListener('keydown', (e) => {
     if (!S.crop || $('crop-modal').hidden) return;
-    if (e.key === 'Enter') { if (drawMode() === 'line') finishInProgressLine(); }
+    // the unsaved-changes prompt is modal: Esc cancels it, everything else
+    // (including the arrow keys and Esc's normal duties) is swallowed.
+    if (S.navDialog) {
+      if (e.key === 'Escape') { e.preventDefault(); closeNavDialog('cancel'); }
+      return;
+    }
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      // same action as the matching edge button; a no-op when that neighbour
+      // is missing. preventDefault stops arrows from walking the drawmode radios.
+      e.preventDefault();
+      navigateCrop(e.key.slice(5).toLowerCase());   // ArrowUp -> 'up', …
+    }
+    else if (e.key === 'Enter') { if (drawMode() === 'line') finishInProgressLine(); }
     else if (e.key === 'Delete' || e.key === 'Backspace') {
       if (selCount() > 0) { deleteSelected(); e.preventDefault(); }
     } else if (e.key === 'Escape') {
@@ -1319,6 +1462,9 @@ async function commitCrop() {
     }
   }
   persist();
+  // everything the user drew is now in the pool (and, when configured, the DB) —
+  // guard on the cell because closeCrop(true) can null/replace S.crop meanwhile.
+  if (S.crop && S.crop.cell === cell) S.crop.dirty = false;
   redrawCrop();
 }
 
