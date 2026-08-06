@@ -81,8 +81,8 @@ const S = {
                         // pre-provenance marks reloaded from the pool; preserved across saves)
                         // `dirty` = the user changed marks since the last save/open.
 
-  // adjacent-crop navigation
-  navBusy: false,       // a jump is in flight (or its prompt is up) -> ignore further nav
+  // adjacent-crop navigation + guarded close (both share the unsaved-marks prompt)
+  navBusy: false,       // a jump/close is in flight (or its prompt is up) -> ignore further nav/close
   navDialog: null,      // resolver fn while the unsaved-changes prompt is open, else null
 
   // hidden GT-review mode (personal, local-only; NEVER synced to the backend).
@@ -1164,12 +1164,33 @@ function cropIsDirty() {
   if (!S.crop) return false;
   return S.crop.dirty === true || (S.crop.inProgress && S.crop.inProgress.length > 0);
 }
-/** In-app 3-way prompt (window.confirm can only offer two). Resolves to
- *  'save' | 'discard' | 'cancel'. Esc cancels (see the keydown handler). */
-function askNavChoice() {
+/** Per-action wording for the unsaved-marks prompt. 'nav' matches the static
+ *  HTML defaults; 'close' rewords the message and the save/discard buttons.
+ *  "Cancel" is the same for both. */
+const UNSAVED_PROMPT_STRINGS = {
+  nav: {
+    msg: 'You changed marks on this crop without saving. What should happen before moving to the adjacent crop?',
+    save: 'Save & go', discard: 'Discard & go',
+  },
+  close: {
+    msg: 'You changed marks on this crop without saving. What should happen before closing this crop?',
+    save: 'Save & close', discard: 'Discard & close',
+  },
+};
+/** In-app 3-way prompt (window.confirm can only offer two). `action` is
+ *  'nav' | 'close' and picks ONLY the wording — the choices and their
+ *  semantics are identical either way. Resolves to 'save' | 'discard' |
+ *  'cancel'. Esc cancels (see the keydown handler). */
+function askUnsavedChoice(action) {
   return new Promise((resolve) => {
     const dlg = $('crop-nav-confirm');
     if (!dlg) { resolve('cancel'); return; }
+    const str = UNSAVED_PROMPT_STRINGS[action] || UNSAVED_PROMPT_STRINGS.nav;
+    const msg = dlg.querySelector('.nav-confirm-msg');
+    if (msg) msg.textContent = str.msg;
+    const save = $('crop-nav-save'), discard = $('crop-nav-discard');
+    if (save) save.textContent = str.save;
+    if (discard) discard.textContent = str.discard;
     S.navDialog = (choice) => {
       S.navDialog = null;
       dlg.hidden = true;
@@ -1195,7 +1216,7 @@ async function navigateCrop(dir) {
   S.navBusy = true;
   try {
     if (cropIsDirty()) {
-      const choice = await askNavChoice();
+      const choice = await askUnsavedChoice('nav');
       if (choice === 'cancel') return;
       if (!S.crop) return;                      // modal closed while the prompt was up
       if (choice === 'save') {
@@ -1207,6 +1228,34 @@ async function navigateCrop(dir) {
       // uncommitted edits simply never leave S.crop.
     }
     await openCrop(target.id);
+  } finally {
+    S.navBusy = false;
+  }
+}
+/**
+ * Close request from the Close button or a backdrop click: same dirty test
+ * (cropIsDirty) and same 3-way prompt as navigateCrop, with the pending action
+ * being "close the modal" instead of "go to cell X" — askUnsavedChoice('close')
+ * only rewords the dialog. A clean crop closes immediately, no prompt.
+ * Shares S.navBusy so a close request can't race a pending nav prompt/jump.
+ */
+async function requestCloseCrop() {
+  if (S.navBusy) return;                       // a jump/prompt is already running
+  if (!S.crop || $('crop-modal').hidden) return;
+  if (!cropIsDirty()) { closeCrop(false); return; }
+  S.navBusy = true;
+  try {
+    const choice = await askUnsavedChoice('close');
+    if (choice === 'cancel') return;
+    if (!S.crop) return;                       // modal closed while the prompt was up
+    if (choice === 'save') {
+      const savedId = S.crop.cell.id;
+      await commitCrop();                      // fully awaited BEFORE the close, like navigateCrop
+      setStatus('saved ' + savedId);
+    }
+    // 'discard': closeCrop nulls S.crop, so the uncommitted edits never reach
+    // the pool — the next openCrop rebuilds marks from the saved pool.
+    closeCrop(false);
   } finally {
     S.navBusy = false;
   }
@@ -1239,7 +1288,7 @@ async function openCrop(cid) {
     inProgress: [],
     selected: { points: new Set(), lines: new Set() },  // indices of own marks currently selected
     selectBox: null,       // [c0, r0, c1, r1] in 1024² coords while rubber-band-dragging
-    dirty: false,          // unsaved mark edits (drives the navigation prompt)
+    dirty: false,          // unsaved mark edits (drives the unsaved-marks prompt on nav AND close)
   };
   loadCropMarksFor(cell);
   $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}   (${cell.gt_points.length} GT shafts)`;
@@ -1611,7 +1660,28 @@ function setupCropInteractions() {
     redrawCrop();
   });
   $('crop-save').addEventListener('click', () => { commitCrop(); setStatus('saved ' + S.crop.cell.id); });
-  $('crop-close').addEventListener('click', () => closeCrop(false));
+  // guarded: prompts Save & close / Discard & close / Cancel on unsaved marks
+  $('crop-close').addEventListener('click', () => requestCloseCrop());
+  // ---- backdrop click closes the crop view (guarded exactly like Close) ----
+  // Close ONLY when BOTH pointerdown and pointerup land on the backdrop itself:
+  // a drag that starts on the canvas/stage and ends outside the box (or the
+  // reverse) must not close. We listen on pointerup rather than click because
+  // a click whose down/up targets differ retargets to their common ancestor —
+  // which IS the backdrop — and would defeat the both-ends rule.
+  // While #crop-nav-confirm is open, its own overlay (absolute inset:0, above
+  // the box) receives the events, so e.target is never the modal; the
+  // S.navDialog test below is belt and braces. #dl-modal is a sibling overlay
+  // stacked above — its events never bubble through here.
+  const cropModal = $('crop-modal');
+  let backdropPress = false;   // did the last pointerdown land on the backdrop?
+  cropModal.addEventListener('pointerdown', (e) => { backdropPress = e.target === cropModal; });
+  cropModal.addEventListener('pointerup', (e) => {
+    const downOnBackdrop = backdropPress;
+    backdropPress = false;
+    if (!downOnBackdrop || e.target !== cropModal) return;
+    if (S.navDialog) return;   // the unsaved-marks prompt owns the interaction
+    requestCloseCrop();
+  });
   // ---- adjacent-crop navigation: edge arrows + the unsaved-changes prompt ----
   // stopPropagation on both mousedown and click so the stage/canvas never reads
   // an arrow press as a pan gesture or a point-placement click.
