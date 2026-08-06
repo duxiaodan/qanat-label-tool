@@ -158,12 +158,12 @@
       </div>
       <div class="modal-hint">click = add a point / polyline vertex · double-click or Enter ends a polyline ·
         click your own mark to select it · <b>left-drag = box-select multiple of your marks</b> · Delete removes selected ·
-        right-drag (or middle-drag) to pan · wheel to zoom · <b>arrow keys (or the edge arrows) jump to the adjacent crop</b> · Esc cancels · click outside the box closes</div>
+        right-drag (or middle-drag) to pan · wheel to zoom · <b>arrow keys (or the edge arrows) jump to the adjacent crop</b> · Esc cancels, then closes · click outside the box closes</div>
     </div>
 
     <!-- unsaved-marks prompt shown when leaving a dirty crop, whether by
          navigating to an adjacent crop OR by closing the modal (Close button /
-         backdrop click). The message and the save/discard labels below are the
+         backdrop click / Esc). The message and the save/discard labels below are the
          nav-wording defaults; askUnsavedChoice() in app.js rewrites them per
          action ("Save & close" / "Discard & close" when closing).
          Three choices (window.confirm can only offer two). Esc = cancel. -->

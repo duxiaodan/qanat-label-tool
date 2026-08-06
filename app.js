@@ -1233,7 +1233,7 @@ async function navigateCrop(dir) {
   }
 }
 /**
- * Close request from the Close button or a backdrop click: same dirty test
+ * Close request from the Close button, a backdrop click, or Esc: same dirty test
  * (cropIsDirty) and same 3-way prompt as navigateCrop, with the pending action
  * being "close the modal" instead of "go to cell X" — askUnsavedChoice('close')
  * only rewords the dialog. A clean crop closes immediately, no prompt.
@@ -1728,7 +1728,13 @@ function setupCropInteractions() {
     } else if (e.key === 'Escape') {
       if (S.crop.inProgress.length) { S.crop.inProgress = []; redrawCrop(); }
       else if (selCount() > 0 || S.crop.selectBox) { selClear(); S.crop.selectBox = null; redrawCrop(); }
-      else closeCrop(false);
+      // all three close routes (Close button, backdrop click, Esc) converge on
+      // requestCloseCrop(): dirty crops get the 3-way unsaved-marks prompt,
+      // clean crops close immediately. Fire-and-forget, same as the button.
+      // No recursion risk: while the prompt is up S.navDialog is set, so the
+      // next Esc is swallowed above as a prompt-cancel before reaching here,
+      // and S.navBusy makes a second requestCloseCrop a no-op regardless.
+      else requestCloseCrop();
     } else if (S.review.on && (e.key === 'a' || e.key === 'd') &&
                !e.ctrlKey && !e.metaKey && !e.altKey) {
       // GT-review shortcut (review mode only): a = accurate, d = drifted.
