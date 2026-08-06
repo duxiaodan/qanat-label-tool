@@ -771,14 +771,18 @@ function setupSwathPanZoom() {
     dragging = true; lastX = downX = e.clientX; lastY = downY = e.clientY;
     S.suppressCellClick = false; // only a real drag (below) re-arms this
   });
-  window.addEventListener('mouseup', (e) => {
+  function endDrag(e) {
     if (dragging && Math.hypot(e.clientX - downX, e.clientY - downY) > CLICK_MOVE_PX) {
       S.suppressCellClick = true; // gesture was a pan -> swallow the trailing cell click
     }
     dragging = false;
-  });
+  }
+  window.addEventListener('mouseup', endDrag);
   window.addEventListener('mousemove', (e) => {
     if (!dragging) return;
+    // The mouseup can be swallowed (context menu, alt-tab, pointer leaving the
+    // window); without this the map would keep following a button-less cursor.
+    if (e.buttons === 0) { endDrag(e); return; }
     S.view.x += e.clientX - lastX; S.view.y += e.clientY - lastY;
     lastX = e.clientX; lastY = e.clientY;
     applySwathTransform();
@@ -795,6 +799,10 @@ function setupSwathPanZoom() {
     S.view.scale = ns;
     applySwathTransform();
   }, { passive: false });
+  // mousedown above never filters on e.button, so a right-drag already pans —
+  // the browser context menu just popped up over it. Suppress it on the map
+  // ONLY, so right-click keeps working on the sidebar, topbar and the rest.
+  wrap.addEventListener('contextmenu', (e) => e.preventDefault());
 }
 
 // --------------------------------------------------------------------------- //
