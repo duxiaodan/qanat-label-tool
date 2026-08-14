@@ -4,5 +4,10 @@
   "kdf": "PBKDF2-SHA256",
   "cipher": "AES-256-GCM",
   "check": "b6oNNBQZS63bN/P/5fTO/SYfgpb08mN5/8E4WKFnl1sAk5Dd8VfW/rt/Y90hKqk=",
-  "marks_salt": "ioWSHSYx9v2/19bJvAALwA=="
+  "marks_salt": "ioWSHSYx9v2/19bJvAALwA==",
+  "su": {
+    "salt": "1Ci6zGaper0XkexTcy7Tyw==",
+    "iterations": 200000,
+    "file": "su.enc"
+  }
 }
