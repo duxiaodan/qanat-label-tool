@@ -11,7 +11,10 @@
 import { pixelToWorld, worldToPixel, nearestMark } from './geo.js';
 import { buildShaftsFeatureCollection, buildLinesFeatureCollection } from './geojson.js';
 import { deriveKey, decryptBlob, encryptBlob, verifyPasscode, openSuEnvelope, deriveWriteToken } from './crypto.js';
-import { fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks } from './sync.js';
+import {
+  fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks,
+  createSnapshot, listSnapshots, restoreSnapshot,
+} from './sync.js';
 import {
   attribution, othersDeleteIds, pruneOthers, dropPoolMarksByDbId, cropDirtyState,
 } from './suedit.js';
@@ -565,6 +568,15 @@ function setupSuperuserUI() {
   toggles.insertAdjacentElement('afterend', chip);
   inp.addEventListener('change', applySuEditCue);
   applySuEditCue();
+  // Snapshots button (opens #snap-modal). Backend-only: without Supabase there
+  // is nothing to snapshot, so the button simply isn't built.
+  if (backendOn() && !document.getElementById('btn-snapshots')) {
+    const b = document.createElement('button');
+    b.id = 'btn-snapshots';
+    b.textContent = 'Snapshots';
+    $('btn-refresh').insertAdjacentElement('beforebegin', b);
+    b.addEventListener('click', snapOpen);
+  }
 }
 function applySuEditCue() {
   const on = suEditOn();
@@ -579,6 +591,134 @@ function applySuEditCue() {
     S.crop.selected.oLines.clear();
     redrawCrop();
   }
+}
+
+// --------------------------------------------------------------------------- //
+// snapshots dialog (superuser only) — create / list / restore whole-scope
+// (board+project) snapshots via the sql/03 RPCs. The opener button exists only
+// in superuser sessions (setupSuperuserUI); the RPCs reject normal tokens
+// server-side regardless. Modal conventions mirror #dl-modal: fixed overlay,
+// backdrop click + Esc close, the crop modal's keydown stands down while open.
+// --------------------------------------------------------------------------- //
+/** The {token, actor} pair for superuser RPC calls (same as the save path). */
+function suAuth() { return { token: S.writeToken, actor: S.me }; }
+
+function snapSetMsg(msg, isErr) {
+  const el = $('snap-msg');
+  if (!el) return;
+  el.hidden = !msg;
+  el.textContent = msg || '';
+  el.classList.toggle('snap-msg-err', !!isErr);
+}
+function fmtWhen(iso) {
+  const t = Date.parse(iso || '');
+  return Number.isFinite(t) ? new Date(t).toLocaleString() : (iso || '—');
+}
+async function snapOpen() {
+  if (!S.su || !backendOn()) return;
+  $('snap-scope').textContent = `project ${S.project} · board ${S.board}`;
+  $('snap-label').value = '';
+  snapSetMsg('');
+  $('snap-modal').hidden = false;
+  await snapReloadList();
+}
+function snapClose() { $('snap-modal').hidden = true; }
+async function snapReloadList() {
+  const list = $('snap-list');
+  list.textContent = 'loading…';
+  let rows;
+  try { rows = await listSnapshots(SUPABASE, S.board, S.project, suAuth()); }
+  catch (e) {
+    list.textContent = '';
+    snapSetMsg('could not list snapshots: ' + (e.rpcMessage || e.message), true);
+    return;
+  }
+  list.innerHTML = '';
+  if (!rows.length) {
+    const em = document.createElement('div');
+    em.className = 'snap-empty';
+    em.textContent = 'no snapshots yet for this board + project';
+    list.appendChild(em);
+    return;
+  }
+  for (const s of rows) {
+    const row = document.createElement('div');
+    row.className = 'snap-row';
+    const cellEl = (cls, text, title) => {
+      const sp = document.createElement('span');
+      sp.className = cls;
+      sp.textContent = text;
+      if (title) sp.title = title;
+      row.appendChild(sp);
+    };
+    cellEl('snap-when', fmtWhen(s.created_at));
+    cellEl('snap-lab', s.label || '—', s.label || '');
+    cellEl('snap-actor', s.actor || '', s.actor || '');
+    cellEl('snap-n', `${s.row_count} row${s.row_count === 1 ? '' : 's'}`);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = 'Restore…';
+    btn.addEventListener('click', () => snapRestore(s));
+    row.appendChild(btn);
+    $('snap-list').appendChild(row);
+  }
+}
+async function snapCreate() {
+  const btn = $('snap-create');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  snapSetMsg('creating snapshot…');
+  try {
+    const out = await createSnapshot(SUPABASE, S.board, S.project,
+      $('snap-label').value.trim() || null, suAuth());
+    snapSetMsg(`snapshot #${out.id} created (${out.row_count} row${out.row_count === 1 ? '' : 's'})`);
+    $('snap-label').value = '';
+    await snapReloadList();
+  } catch (e) {
+    snapSetMsg('create failed: ' + (e.rpcMessage || e.message), true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+let _snapRestoreBusy = false; // one restore at a time (list buttons stay live)
+async function snapRestore(s) {
+  if (_snapRestoreBusy) return;
+  const label = s.label ? ` ("${s.label}")` : '';
+  // explicit consequences in the confirmation: the row count being restored
+  // AND the automatic pre-restore snapshot the server creates first.
+  const ok = confirm(
+    `Restore snapshot #${s.id}${label} from ${fmtWhen(s.created_at)}?\n\n` +
+    `This replaces ALL marks for this board + project with the snapshot's ` +
+    `${s.row_count} row${s.row_count === 1 ? '' : 's'}. A pre-restore snapshot of the ` +
+    `current state is created automatically first, so this can be undone.`);
+  if (!ok) return;
+  _snapRestoreBusy = true;
+  snapSetMsg('restoring…');
+  try {
+    const out = await restoreSnapshot(SUPABASE, s.id, suAuth());
+    snapSetMsg(`restored ${out.restored_rows} row${out.restored_rows === 1 ? '' : 's'} ` +
+      `from snapshot #${out.snapshot_id} — pre-restore snapshot #${out.pre_restore_snapshot_id} created`);
+    await snapReloadList();
+    await refreshMarks(); // re-pull the pool so the UI reflects the restored state
+  } catch (e) {
+    snapSetMsg('restore failed: ' + (e.rpcMessage || e.message), true);
+  } finally {
+    _snapRestoreBusy = false;
+  }
+}
+function setupSnapshotsDialog() {
+  const modal = $('snap-modal');
+  if (!modal) return;
+  modal.addEventListener('click', (e) => { if (e.target === modal) snapClose(); });
+  $('snap-close').addEventListener('click', snapClose);
+  $('snap-create').addEventListener('click', snapCreate);
+  $('snap-label').addEventListener('keydown', (e) => { if (e.key === 'Enter') snapCreate(); });
+  // Esc closes. The crop modal's keydown bails out while this dialog is open
+  // (see setupCropInteractions), so exactly one modal ever owns the keyboard.
+  document.addEventListener('keydown', (e) => {
+    if ($('snap-modal').hidden) return;
+    if (e.key === 'Escape') { e.preventDefault(); snapClose(); }
+  });
 }
 
 // --------------------------------------------------------------------------- //
@@ -1916,9 +2056,11 @@ function setupCropInteractions() {
   }));
   document.addEventListener('keydown', (e) => {
     if (!S.crop || $('crop-modal').hidden) return;
-    // the download dialog stacks above everything: while it is open it owns the
-    // keyboard (Esc closes IT), so the crop's Esc/arrow duties stand down.
+    // the download / snapshots dialogs stack above everything: while one is
+    // open it owns the keyboard (Esc closes IT), so the crop's Esc/arrow
+    // duties stand down.
     if (!$('dl-modal').hidden) return;
+    if (!$('snap-modal').hidden) return;
     // the unsaved-changes prompt is modal: Esc cancels it, everything else
     // (including the arrow keys and Esc's normal duties) is swallowed.
     if (S.navDialog) {
@@ -2343,6 +2485,7 @@ function boot() {
   $('gate-project').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('passcode').focus(); });
   $('btn-download').addEventListener('click', dlOpen);
   setupDownloadDialog();
+  setupSnapshotsDialog(); // inert until a superuser session builds its opener
   $('btn-refresh').addEventListener('click', () => { refreshMarks(); });
   // GT-review wiring only exists when the URL opts in (?gtreview=1); in normal
   // mode no listener is attached and every review element stays [hidden].

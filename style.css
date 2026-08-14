@@ -357,3 +357,47 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
 .dl-actions button#dl-go { background: #2a6df0; font-weight: 600; }
 .dl-actions button:hover:not(:disabled) { filter: brightness(1.2); }
 .dl-actions button:disabled { opacity: .45; cursor: not-allowed; }
+
+/* ---------- snapshots dialog (superuser only) ----------
+   Same overlay conventions as .dl-modal (fixed, centred, Esc + backdrop close);
+   its opener button only exists in superuser sessions. Stacked at the same
+   z-band as the download dialog — the two can never be open together (both
+   openers live in the topbar, which no modal leaves reachable). */
+.snap-modal { z-index: 80; }
+.snap-box {
+  background: #1b1e25; color: #e6e8ec; border: 1px solid #3a4152; border-radius: 8px;
+  padding: 18px 20px; width: min(640px, 94vw); max-height: 92vh; overflow-y: auto;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .55);
+}
+.snap-title { font-weight: 700; font-size: 15px; margin-bottom: 4px; }
+.snap-scope { font-size: 11px; color: #8b93a3; margin-bottom: 12px; word-break: break-all; }
+.snap-create { display: flex; gap: 8px; margin-bottom: 10px; }
+.snap-create input[type=text] {
+  flex: 1; background: #232833; color: #e6e8ec; border: 1px solid #3a4152;
+  border-radius: 5px; padding: 6px 9px; font-size: 13px;
+}
+.snap-create button, .snap-actions button, .snap-row button {
+  padding: 6px 12px; border-radius: 5px; border: none; background: #333a48; color: #eee;
+  cursor: pointer; font-size: 12px; white-space: nowrap;
+}
+.snap-create button { background: #2a6df0; font-weight: 600; }
+.snap-create button:disabled { opacity: .45; cursor: not-allowed; }
+.snap-create button:hover:not(:disabled), .snap-actions button:hover,
+.snap-row button:hover { filter: brightness(1.2); }
+.snap-msg { font-size: 12px; color: #6bbf59; margin: 4px 0 8px; line-height: 1.4; }
+.snap-msg.snap-msg-err { color: #e0836f; }
+.snap-list {
+  border: 1px solid #2c313c; border-radius: 5px; max-height: 46vh; overflow-y: auto;
+  font-size: 12px;
+}
+.snap-row {
+  display: grid; grid-template-columns: 150px 1fr 110px 70px auto;
+  gap: 8px; align-items: center; padding: 6px 8px; border-bottom: 1px solid #2c313c;
+}
+.snap-row:last-child { border-bottom: none; }
+.snap-when { color: #b9c0cd; font-variant-numeric: tabular-nums; }
+.snap-lab { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.snap-actor { color: #8b93a3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.snap-n { color: #f6c453; font-variant-numeric: tabular-nums; text-align: right; }
+.snap-empty { padding: 10px; color: #8b93a3; font-style: italic; }
+.snap-actions { display: flex; justify-content: flex-end; margin-top: 12px; }

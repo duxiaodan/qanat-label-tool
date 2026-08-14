@@ -198,6 +198,54 @@ export async function updateMark(cfg, markId, patch, auth) {
   return _rpc(cfg, 'rpc_update_mark', { token, actor, mark_id: Number(markId), patch: patch || {} });
 }
 
+// --------------------------------------------------------------------------- //
+// snapshots (superuser-only RPCs — sql/03_snapshots.sql). The server rejects
+// a normal token with "superuser token required"; nothing is enforced here.
+// --------------------------------------------------------------------------- //
+
+/**
+ * Create a snapshot of every mark row in (board, project) via
+ * rpc_create_snapshot.
+ * @param {string|null} label  optional human label
+ * @param {{token:string, actor:string}} auth
+ * @returns {Promise<{id:number, row_count:number}>}
+ */
+export async function createSnapshot(cfg, board, project, label, auth) {
+  if (!cfg) throw new Error('no supabase config');
+  const { token, actor } = _auth(auth);
+  return _rpc(cfg, 'rpc_create_snapshot', {
+    token, actor, label: label || null, board, project,
+  });
+}
+
+/**
+ * List snapshot METADATA for (board, project) via rpc_list_snapshots —
+ * id, created_at, actor, label, board, project, row_count; payload never
+ * included. Newest first (the RPC orders by id desc).
+ * @param {{token:string, actor:string}} auth (actor unused by this RPC)
+ * @returns {Promise<Array<object>>}
+ */
+export async function listSnapshots(cfg, board, project, auth) {
+  if (!cfg) throw new Error('no supabase config');
+  const { token } = _auth(auth);
+  const out = await _rpc(cfg, 'rpc_list_snapshots', { token, board, project });
+  return Array.isArray(out) ? out : [];
+}
+
+/**
+ * Restore a snapshot via rpc_restore_snapshot. The server first auto-creates
+ * an 'auto-pre-restore' snapshot of the current scope, then replaces the
+ * scoped marks with the payload (one transaction).
+ * @param {number} snapshotId
+ * @param {{token:string, actor:string}} auth
+ * @returns {Promise<{snapshot_id:number, pre_restore_snapshot_id:number, restored_rows:number}>}
+ */
+export async function restoreSnapshot(cfg, snapshotId, auth) {
+  if (!cfg) throw new Error('no supabase config');
+  const { token, actor } = _auth(auth);
+  return _rpc(cfg, 'rpc_restore_snapshot', { token, actor, snapshot_id: Number(snapshotId) });
+}
+
 /**
  * Delete ALL my rows for (board, labeler, cell_id). Not used by the normal
  * save path (which reconciles per row — see app.js commitCrop); kept as a

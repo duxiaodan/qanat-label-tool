@@ -239,6 +239,33 @@
     </div>
   </div>
 
+  <!-- snapshots dialog (SUPERUSER only). The markup is inert for normal users:
+       its opener (#btn-snapshots) is built at unlock only in superuser
+       sessions, and the underlying RPCs reject a normal token anyway.
+       Same modal conventions as #dl-modal: fixed overlay, Esc closes, the crop
+       modal's keydown stands down while it is open. -->
+  <div id="snap-modal" class="modal snap-modal" hidden role="dialog" aria-modal="true"
+       aria-labelledby="snap-title">
+    <div class="snap-box">
+      <div class="snap-title" id="snap-title">Snapshots</div>
+      <div class="snap-scope" id="snap-scope"></div>
+
+      <div class="snap-create">
+        <input type="text" id="snap-label" placeholder="optional label" maxlength="120"
+               aria-label="snapshot label" />
+        <button id="snap-create" type="button">Create snapshot</button>
+      </div>
+
+      <div id="snap-msg" class="snap-msg" hidden></div>
+      <!-- rows rebuilt from rpc_list_snapshots on open / create / restore -->
+      <div id="snap-list" class="snap-list"></div>
+
+      <div class="snap-actions">
+        <button id="snap-close" type="button">Close</button>
+      </div>
+    </div>
+  </div>
+
   <script type="module" src="app.js"></script>
 </body>
 </html>
