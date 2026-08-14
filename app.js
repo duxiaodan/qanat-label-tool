@@ -8,17 +8,20 @@
 //
 // Browser-only (uses DOM, fetch, localStorage). Not exercised by `node --test`.
 
-import { pixelToWorld, worldToPixel, nearestMark } from './geo.js';
+import {
+  pixelToWorld, worldToPixel, nearestMark, resolveLineGrab, clampDelta, translatePoints,
+} from './geo.js';
 import { buildShaftsFeatureCollection, buildLinesFeatureCollection } from './geojson.js';
 import { deriveKey, decryptBlob, encryptBlob, verifyPasscode, openSuEnvelope, deriveWriteToken } from './crypto.js';
 import {
-  fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks,
+  fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks, updateMark,
   createSnapshot, listSnapshots, restoreSnapshot,
   fetchMarkHistory, restoreMarkVersion,
 } from './sync.js';
 import {
   attribution, othersDeleteIds, pruneOthers, dropPoolMarksByDbId, cropDirtyState,
   singleSelectionDbId, canRestoreHistoryRow,
+  mergePendingMove, dropMovesForIds, applyPendingMoves, patchPoolMarksByDbId,
 } from './suedit.js';
 import {
   cellPasses, filterIsActive, pruneSelection, labelerOrder,
@@ -1508,13 +1511,14 @@ function updateCropNavButtons() {
   }
 }
 /** Unsaved-marks test: an explicit edit, a polyline still being drawn, or a
- *  pending (unsaved) superuser delete of someone else's mark. */
+ *  pending (unsaved) superuser delete/move of someone else's mark. */
 function cropIsDirty() {
   if (!S.crop) return false;
   return cropDirtyState({
     dirty: S.crop.dirty,
     inProgressLen: S.crop.inProgress ? S.crop.inProgress.length : 0,
     pendingOthers: S.crop.pendingOthersDeletes ? S.crop.pendingOthersDeletes.size : 0,
+    pendingMoves: S.crop.pendingOthersMoves ? S.crop.pendingOthersMoves.size : 0,
   });
 }
 /** Per-action wording for the unsaved-marks prompt. 'nav' matches the static
@@ -1649,6 +1653,12 @@ async function openCrop(cid) {
     // rpc_delete_marks (explicitly — the own-marks reconcile never touches
     // them); counted by cropIsDirty so the unsaved prompt guards them too.
     pendingOthersDeletes: new Set(),
+    // …and drag-MOVES of others' marks pending commit: dbId -> {kind, px|pts}
+    // (crop-px geometry). Committed by commitCrop via rpc_update_mark (geom
+    // only — the server stamps edited_by, labeler never changes). Last move
+    // wins; a pending delete of the same mark drops its move. Counted by
+    // cropIsDirty exactly like the pending deletes.
+    pendingOthersMoves: new Map(),
   };
   loadCropMarksFor(cell);
   $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}   (${cell.gt_points.length} GT shafts)`;
@@ -1690,11 +1700,14 @@ function loadCropMarksFor(cell) {
   }
   S.crop.marks = mine;
   // a mid-session refresh re-pulls the pool where still-unsaved others-deletes
-  // still exist as rows — prune them so they can't visually resurrect.
+  // still exist as rows — prune them so they can't visually resurrect. Same
+  // for still-unsaved others-MOVES: the rows hold the old geometry, so the
+  // pending geometry is re-applied over the reload.
   const pending = S.crop.pendingOthersDeletes || new Set();
+  const moves = S.crop.pendingOthersMoves || new Map();
   S.crop.others = {
-    points: pruneOthers(others.points, pending),
-    lines: pruneOthers(others.lines, pending),
+    points: applyPendingMoves(pruneOthers(others.points, pending), moves),
+    lines: applyPendingMoves(pruneOthers(others.lines, pending), moves),
   };
 }
 // after a refresh while the modal is open: reload others' marks (and any of mine
@@ -1766,7 +1779,11 @@ function deleteSelected() {
   for (const i of opi) removedOthers.push(...S.crop.others.points.splice(i, 1));
   const oli = [...S.crop.selected.oLines].sort((a, b) => b - a);
   for (const i of oli) removedOthers.push(...S.crop.others.lines.splice(i, 1));
-  for (const id of othersDeleteIds(removedOthers)) S.crop.pendingOthersDeletes.add(id);
+  const removedIds = othersDeleteIds(removedOthers);
+  for (const id of removedIds) S.crop.pendingOthersDeletes.add(id);
+  // delete wins over a pending move of the same mark: the row is going away,
+  // so the move intent is dropped with it.
+  S.crop.pendingOthersMoves = dropMovesForIds(S.crop.pendingOthersMoves, removedIds);
   selClear();
   redrawCrop();
 }
@@ -1972,6 +1989,62 @@ function hitTestOthers([col, row]) {
   }
   return null;
 }
+// ---- drag-move target resolution -------------------------------------------
+// A plain (non-additive) left press starts a DRAG-MOVE instead of the normal
+// select/box-select/draw gesture ONLY when it lands on an already-SELECTED,
+// movable mark: own marks always; others' marks only while "Edit others" is on
+// (their selections can only exist then anyway). Presses anywhere else — empty
+// imagery, unselected marks — keep their existing behavior bit-for-bit.
+// Polylines: a grab near a vertex (same tolerance as the click hit-test) drags
+// that vertex; a grab on a segment between vertices drags the whole line
+// rigidly. Reads S.crop, mutates nothing (the hover handler also calls this
+// for the grab-cursor affordance).
+function findCropDragTarget([col, row]) {
+  if (!S.crop) return null;
+  const tol = CROP_MARK_TOL_SCREEN_PX / Math.max(0.01, S.crop.view.scale);
+  const sel = S.crop.selected;
+  const su = suEditOn();
+  // resolve the press exactly like a click first (own marks on top, then
+  // others'): a press on an UNselected mark must stay a plain click.
+  const clickHit = hitTestOwn([col, row]) || (su ? hitTestOthers([col, row]) : null);
+  if (clickHit) {
+    const { kind, idx } = clickHit;
+    if (kind === 'point' && sel.points.has(idx)) {
+      return { group: 'own', kind: 'point', selKind: 'point', idx, mode: 'point' };
+    }
+    if (kind === 'opoint' && sel.oPoints.has(idx)) {
+      return { group: 'others', kind: 'point', selKind: 'opoint', idx, mode: 'point' };
+    }
+    if (kind === 'line' && sel.lines.has(idx)) {
+      const g = resolveLineGrab(S.crop.marks.lines[idx].pts, col, row, tol);
+      if (g) return { group: 'own', kind: 'line', selKind: 'line', idx, mode: g.mode, vIdx: g.vIdx };
+    }
+    if (kind === 'oline' && sel.oLines.has(idx)) {
+      const g = resolveLineGrab(S.crop.others.lines[idx].pts, col, row, tol);
+      if (g) return { group: 'others', kind: 'line', selKind: 'oline', idx, mode: g.mode, vIdx: g.vIdx };
+    }
+    return null;
+  }
+  // no click hit: the click hit-test only sees vertices, so a press on a
+  // SELECTED polyline's SEGMENT lands here — that grabs the whole line.
+  for (const idx of sel.lines) {
+    const g = resolveLineGrab(S.crop.marks.lines[idx].pts, col, row, tol);
+    if (g) return { group: 'own', kind: 'line', selKind: 'line', idx, mode: g.mode, vIdx: g.vIdx };
+  }
+  if (su) {
+    for (const idx of sel.oLines) {
+      const g = resolveLineGrab(S.crop.others.lines[idx].pts, col, row, tol);
+      if (g) return { group: 'others', kind: 'line', selKind: 'oline', idx, mode: g.mode, vIdx: g.vIdx };
+    }
+  }
+  return null;
+}
+/** The live mark object a drag target refers to (own or others' list). */
+function dragTargetMark(t) {
+  if (!S.crop || !t) return null;
+  const src = t.group === 'own' ? S.crop.marks : S.crop.others;
+  return t.kind === 'point' ? src.points[t.idx] : src.lines[t.idx];
+}
 // ---- hover tooltip: who labeled an OTHER user's mark (crop popup only) ----
 // Display-only: others' marks stay exactly as non-interactive as before for
 // clicks/selection, and my own (lime) marks deliberately show no tooltip.
@@ -2011,10 +2084,60 @@ function setupCropInteractions() {
   let panning = false, lastX = 0, lastY = 0;
   // ---- press gesture on the canvas: left-click = add/select; left-drag = box-select ----
   let pressActive = false, pressX = 0, pressY = 0, pressPx = null, pressMoved = false, pressAdditive = false;
+  // ---- drag-move of an already-selected mark (see findCropDragTarget) ----
+  // {group, kind, selKind, idx, mode, vIdx?, startPx, startClientX/Y, moved,
+  //  orig} — `orig` is a deep copy of the pre-drag geometry, so every
+  // pointermove re-derives from it (no accumulation drift) and Esc-cancel is a
+  // plain restore. Multi-selection: ONLY the grabbed mark moves, by design.
+  let cropDrag = null;
+
+  /** Revert an in-flight drag to the pre-drag geometry. True if one was active. */
+  function cancelCropDrag() {
+    if (!cropDrag) return false;
+    const d = cropDrag;
+    cropDrag = null;
+    canvas.style.cursor = '';
+    if (S.crop) {
+      const m = dragTargetMark(d);
+      if (m) {
+        if (d.kind === 'point') m.px = [d.orig[0], d.orig[1]];
+        else m.pts = d.orig.map((p) => [p[0], p[1]]);
+      }
+      drawCropOverlay();
+    }
+    return true;
+  }
+  /** A finished (moved) drag: commit the new geometry into the crop state. */
+  function commitCropDrag(d) {
+    const m = dragTargetMark(d);
+    if (!m) return;
+    const same = d.kind === 'point'
+      ? (m.px[0] === d.orig[0] && m.px[1] === d.orig[1])
+      : (m.pts.length === d.orig.length
+         && m.pts.every((p, i) => p[0] === d.orig[i][0] && p[1] === d.orig[i][1]));
+    if (same) { redrawCrop(); return; }   // clamped back to the start — no change
+    if (d.group === 'own') {
+      // a moved own mark is a CHANGED mark for the reconcile-on-save: drop its
+      // dbId so commitCrop deletes the old row and inserts the new geometry as
+      // a fresh row that echoes `created` (the original timestamp survives —
+      // the same shape as the stale-dbId failed-save recovery path).
+      m.dbId = null;
+      S.crop.dirty = true;
+    } else {
+      // others' mark (superuser): a pending UPDATE, committed by "Save work"
+      // via rpc_update_mark. Last move of the same mark wins.
+      S.crop.pendingOthersMoves = mergePendingMove(
+        S.crop.pendingOthersMoves, m.dbId,
+        d.kind === 'point'
+          ? { kind: 'point', px: [m.px[0], m.px[1]] }
+          : { kind: 'line', pts: m.pts.map((p) => [p[0], p[1]]) });
+    }
+    redrawCrop();
+  }
 
   stage.addEventListener('contextmenu', (e) => { if (S.crop) e.preventDefault(); });
   stage.addEventListener('mousedown', (e) => {
-    if (!S.crop) return;
+    if (!S.crop || cropDrag) return;   // a drag-move owns the mouse
     if (e.button === 1 || e.button === 2 || (e.button === 0 && e.target === stage)) {
       if (e.button === 1) e.preventDefault();
       panning = true; lastX = e.clientX; lastY = e.clientY;
@@ -2024,14 +2147,62 @@ function setupCropInteractions() {
   canvas.addEventListener('mousedown', (e) => {
     if (!S.crop || e.button !== 0) return;   // non-left bubbles to stage for panning
     e.stopPropagation();
+    const px = canvasEventToPx(e);
+    const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+    // a plain press on an already-selected mark grabs it for a drag-move;
+    // additive (shift/ctrl/meta) presses keep their selection semantics.
+    if (!additive) {
+      const t = findCropDragTarget(px);
+      if (t) {
+        const m = dragTargetMark(t);
+        cropDrag = {
+          ...t,
+          startPx: px,
+          startClientX: e.clientX, startClientY: e.clientY,
+          moved: false,
+          orig: t.kind === 'point' ? [m.px[0], m.px[1]] : m.pts.map((p) => [p[0], p[1]]),
+        };
+        canvas.style.cursor = 'grabbing';
+        hideCropHoverTip();
+        return;
+      }
+    }
     pressActive = true; pressMoved = false; pressX = e.clientX; pressY = e.clientY;
-    pressPx = canvasEventToPx(e);
-    pressAdditive = e.shiftKey || e.ctrlKey || e.metaKey;
+    pressPx = px;
+    pressAdditive = additive;
     S.crop.selectBox = null;
     hideCropHoverTip();   // a click/box-select press is starting
   });
   window.addEventListener('mousemove', (e) => {
     if (!S.crop) return;
+    if (cropDrag) {
+      if (!cropDrag.moved
+          && Math.abs(e.clientX - cropDrag.startClientX)
+           + Math.abs(e.clientY - cropDrag.startClientY) > 3) cropDrag.moved = true;
+      if (cropDrag.moved) {
+        const cur = canvasEventToPx(e);
+        const dc = cur[0] - cropDrag.startPx[0], dr = cur[1] - cropDrag.startPx[1];
+        const m = dragTargetMark(cropDrag);
+        if (!m) return;
+        if (cropDrag.kind === 'point') {
+          // the point follows the cursor (delta from the grab, no jump),
+          // clamped to the crop bounds
+          const [cdc, cdr] = clampDelta([cropDrag.orig], dc, dr);
+          m.px = [cropDrag.orig[0] + cdc, cropDrag.orig[1] + cdr];
+        } else if (cropDrag.mode === 'vertex') {
+          const ov = cropDrag.orig[cropDrag.vIdx];
+          const [cdc, cdr] = clampDelta([ov], dc, dr);
+          m.pts = cropDrag.orig.map((p, i) => (
+            i === cropDrag.vIdx ? [ov[0] + cdc, ov[1] + cdr] : [p[0], p[1]]));
+        } else {
+          // whole polyline, rigid; the clamp stops the drag at the crop edge
+          const [cdc, cdr] = clampDelta(cropDrag.orig, dc, dr);
+          m.pts = translatePoints(cropDrag.orig, cdc, cdr);
+        }
+        drawCropOverlay();   // vectors only; imagery unchanged while dragging
+      }
+      return;
+    }
     if (panning) {
       S.crop.view.x += e.clientX - lastX; S.crop.view.y += e.clientY - lastY;
       lastX = e.clientX; lastY = e.clientY; applyCropTransform();
@@ -2047,6 +2218,21 @@ function setupCropInteractions() {
     }
   });
   window.addEventListener('mouseup', () => {
+    if (cropDrag) {
+      const d = cropDrag;
+      cropDrag = null;
+      canvas.style.cursor = '';
+      if (!S.crop) return;
+      if (!d.moved) {
+        // a stationary press-release on a selected mark keeps the old click
+        // behavior: collapse the selection to just that mark.
+        selSet(d.selKind, d.idx, false);
+        redrawCrop();
+        return;
+      }
+      commitCropDrag(d);
+      return;
+    }
     if (panning) panning = false;
     if (pressActive) {
       pressActive = false;
@@ -2073,6 +2259,10 @@ function setupCropInteractions() {
   stage.addEventListener('wheel', (e) => {
     if (!S.crop) return;
     e.preventDefault();
+    // wheel is IGNORED while a drag-move is in flight: zooming re-maps the
+    // cursor->image transform under the grabbed mark mid-gesture, which reads
+    // as the mark jumping. Simplest safe choice: freeze the view until release.
+    if (cropDrag) return;
     const rect = stage.getBoundingClientRect();
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
     const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
@@ -2091,8 +2281,11 @@ function setupCropInteractions() {
   // bail first while any gesture is active (pan / press drag / polyline draw).
   stage.addEventListener('pointermove', (e) => {
     if (!S.crop) { hideCropHoverTip(); return; }
-    if (panning || pressActive || S.crop.inProgress.length) { hideCropHoverTip(); return; }
+    if (panning || pressActive || cropDrag || S.crop.inProgress.length) { hideCropHoverTip(); return; }
     const [col, row] = canvasEventToPx(e);
+    // grab affordance: `grab` exactly where a plain left press would start a
+    // drag-move (selected own mark; selected other's mark with Edit others on)
+    canvas.style.cursor = findCropDragTarget([col, row]) ? 'grab' : '';
     const tol = CROP_MARK_TOL_SCREEN_PX / Math.max(0.01, S.crop.view.scale);
     const hit = nearestMark(
       S.crop.others.points.map((p) => p.px),
@@ -2200,6 +2393,14 @@ function setupCropInteractions() {
       if (e.key === 'Escape') { e.preventDefault(); closeNavDialog('cancel'); }
       return;
     }
+    // a drag-move owns the keyboard while the mouse is down: Esc cancels the
+    // DRAG (mark snaps back; selection, polyline, close are all untouched —
+    // this deliberately slots before every other Esc duty); arrows / Delete /
+    // Enter stand down so the crop can't navigate or mutate mid-drag.
+    if (cropDrag) {
+      if (e.key === 'Escape') { e.preventDefault(); cancelCropDrag(); }
+      return;
+    }
     if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
       // same action as the matching edge button; a no-op when that neighbour
       // is missing. inside the crop modal the arrows belong to crop navigation
@@ -2242,9 +2443,15 @@ async function commitCrop() {
     S.crop.marks.lines.push({ pts: S.crop.inProgress.slice(), ac: $('crop-autocontrast').checked });
   }
   S.crop.inProgress = [];
-  // Snapshot the pending superuser others-deletes NOW: S.crop can be nulled or
-  // replaced while the awaits below are in flight (closeCrop / navigation).
+  // Snapshot the pending superuser others-deletes AND others-moves NOW: S.crop
+  // can be nulled or replaced while the awaits below are in flight (closeCrop /
+  // navigation).
   const pendingOthers = new Set(S.crop.pendingOthersDeletes || []);
+  const pendingMoves = new Map(S.crop.pendingOthersMoves || []);
+  /** pending-move crop-px geometry -> world coords (shape matches the row kind). */
+  const moveWorld = (mv) => (mv.kind === 'point'
+    ? pixelToWorld(mv.px[0], mv.px[1], cell.world_bbox)
+    : mv.pts.map(([c, r]) => pixelToWorld(c, r, cell.world_bbox)));
   // drop ONLY MY old marks for this cell; never touch others' marks.
   S.shaftMarks = S.shaftMarks.filter((m) => !(m.cropId === cell.id && m.labeler === S.me));
   S.lineMarks = S.lineMarks.filter((m) => !(m.cropId === cell.id && m.labeler === S.me));
@@ -2337,6 +2544,25 @@ async function commitCrop() {
         await deleteMarksByIds(SUPABASE, S.board, S.me, cell.id, [...pendingOthers], S.project, auth);
         applyOthersDeletes(cell, pendingOthers);
       }
+      // superuser cross-labeler MOVES ("Edit others" drag-move): one
+      // rpc_update_mark per moved row, patching ONLY the geom ciphertext —
+      // every provenance column still describes the same crop, `labeler` is
+      // never touched, and the server stamps edited_by = actor. Confirmed
+      // moves are applied even when a later one in the batch fails (the
+      // finally), so exactly the unconfirmed ones stay pending (and the crop
+      // dirty) instead of being lost or double-applied.
+      if (pendingMoves.size) {
+        const confirmed = new Map();
+        try {
+          for (const [id, mv] of pendingMoves) {
+            const world = moveWorld(mv);
+            const row = await updateMark(SUPABASE, id, { geom: await encryptGeom(world) }, auth);
+            confirmed.set(id, { world, editedBy: (row && row.edited_by) || null });
+          }
+        } finally {
+          if (confirmed.size) applyOthersMoves(cell, confirmed);
+        }
+      }
       S.unsynced = false;
       setSyncStatus('saved', 'ok');
     } catch (e) {
@@ -2347,9 +2573,14 @@ async function commitCrop() {
       const why = e && e.rpcMessage ? ` (${e.rpcMessage})` : '';
       setSyncStatus(`unsynced — kept locally${why}`, 'unsynced');
     }
-  } else if (pendingOthers.size) {
-    // localStorage-only mode: no server to confirm — apply the deletes locally.
-    applyOthersDeletes(cell, pendingOthers);
+  } else {
+    // localStorage-only mode: no server to confirm — apply deletes/moves locally.
+    if (pendingOthers.size) applyOthersDeletes(cell, pendingOthers);
+    if (pendingMoves.size) {
+      const local = new Map();
+      for (const [id, mv] of pendingMoves) local.set(id, { world: moveWorld(mv) });
+      applyOthersMoves(cell, local);
+    }
   }
   persist();
   // everything the user drew is now in the pool (and, when configured, the DB) —
@@ -2370,6 +2601,25 @@ function applyOthersDeletes(cell, ids) {
   refreshDoneMarks();
   rebuildMineLayer();
   applyLayerToggles();
+}
+/** Confirmed cross-labeler moves: patch the pool rows' geometry (+ editedBy),
+ *  clear them from the crop's pending-moves map, refresh the moved marks'
+ *  tooltip attribution in the open crop (the crop view already shows the new
+ *  geometry), and repaint the swath marks layer. A move never changes which
+ *  cells are done or who labeled where, so the filter machinery stays put. */
+function applyOthersMoves(cell, byId) {
+  S.shaftMarks = patchPoolMarksByDbId(S.shaftMarks, byId);
+  S.lineMarks = patchPoolMarksByDbId(S.lineMarks, byId);
+  if (S.crop && S.crop.cell === cell) {
+    S.crop.pendingOthersMoves = dropMovesForIds(S.crop.pendingOthersMoves, byId.keys());
+    for (const list of [S.crop.others.points, S.crop.others.lines]) {
+      for (const m of list) {
+        const p = m && m.dbId != null ? byId.get(m.dbId) : null;
+        if (p && p.editedBy !== undefined) m.editedBy = p.editedBy;
+      }
+    }
+  }
+  rebuildMineLayer();   // others' dots/lines moved on the swath overview
 }
 
 // --------------------------------------------------------------------------- //

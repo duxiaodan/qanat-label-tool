@@ -69,6 +69,72 @@ export function dropPoolMarksByDbId(pool, ids) {
 }
 
 /**
+ * Merge one drag-move into the pending others-moves map (dbId -> geometry
+ * entry, {kind:'point', px:[c,r]} or {kind:'line', pts:[[c,r]..]}). LAST MOVE
+ * WINS: moving the same mark again simply replaces its entry. Only marks that
+ * exist server-side (finite numeric dbId) can be patched via rpc_update_mark;
+ * anything else leaves the map unchanged. Returns a NEW Map.
+ * @param {Map<number, object>|null|undefined} moves
+ * @param {number|null|undefined} dbId
+ * @param {object} entry
+ * @returns {Map<number, object>}
+ */
+export function mergePendingMove(moves, dbId, entry) {
+  const out = new Map(moves || []);
+  if (typeof dbId === 'number' && Number.isFinite(dbId) && entry) out.set(dbId, entry);
+  return out;
+}
+
+/**
+ * Drop pending moves for marks that are now pending DELETION (delete wins:
+ * a deleted mark's move is meaningless — the row is going away). Also the
+ * post-commit cleanup once a move is confirmed. Returns a NEW Map.
+ * @param {Map<number, object>|null|undefined} moves
+ * @param {Iterable<number>} ids
+ * @returns {Map<number, object>}
+ */
+export function dropMovesForIds(moves, ids) {
+  const out = new Map(moves || []);
+  for (const id of ids || []) out.delete(id);
+  return out;
+}
+
+/**
+ * Re-apply pending (unsaved) moves over a freshly reloaded others-list, so a
+ * mid-session refresh (which re-pulls the pool, where the rows still hold the
+ * OLD geometry) cannot visually snap a moved-but-unsaved mark back. Marks are
+ * matched by dbId; a kind mismatch (defensive) leaves the mark untouched.
+ * @param {Array<{dbId?:number|null, px?:Array, pts?:Array}>} marks
+ * @param {Map<number, {kind:string, px?:Array, pts?:Array}>|null|undefined} moves
+ * @returns {Array} marks with pending geometry substituted (fresh arrays)
+ */
+export function applyPendingMoves(marks, moves) {
+  if (!moves || moves.size === 0) return (marks || []).slice();
+  return (marks || []).map((m) => {
+    if (!m || m.dbId == null || !moves.has(m.dbId)) return m;
+    const mv = moves.get(m.dbId);
+    if (mv && mv.kind === 'point' && m.px && mv.px) return { ...m, px: [mv.px[0], mv.px[1]] };
+    if (mv && mv.kind === 'line' && m.pts && mv.pts) return { ...m, pts: mv.pts.map((p) => [p[0], p[1]]) };
+    return m;
+  });
+}
+
+/**
+ * Patch pool marks by db row id (post-commit: the server confirmed an update,
+ * e.g. {world, editedBy} after a cross-labeler move). Marks without a dbId or
+ * not in the map are returned as-is; patched marks are fresh objects.
+ * @param {Array<{dbId?:number|null}>} pool
+ * @param {Map<number, object>|null|undefined} byId  dbId -> partial mark patch
+ * @returns {Array}
+ */
+export function patchPoolMarksByDbId(pool, byId) {
+  if (!byId || byId.size === 0) return (pool || []).slice();
+  return (pool || []).map((m) => (
+    (m && m.dbId != null && byId.has(m.dbId)) ? { ...m, ...byId.get(m.dbId) } : m
+  ));
+}
+
+/**
  * The db row id behind the crop's selection, IFF exactly one mark is selected
  * (own or others') and that mark exists server-side. This is the enablement
  * rule for the History… button: history is per-row, so a multi-selection or a
@@ -103,12 +169,15 @@ export function canRestoreHistoryRow(row) {
 
 /**
  * The crop-level dirty test, as one pure decision: unsaved own-mark edits, an
- * in-progress polyline, OR pending others-edits all make the crop dirty (and
- * therefore guarded by the 3-way save/discard/cancel prompt on nav/close).
- * @param {{dirty?: boolean, inProgressLen?: number, pendingOthers?: number}} s
+ * in-progress polyline, OR pending others-edits (deletes AND drag-moves) all
+ * make the crop dirty (and therefore guarded by the 3-way save/discard/cancel
+ * prompt on nav/close).
+ * @param {{dirty?: boolean, inProgressLen?: number, pendingOthers?: number,
+ *          pendingMoves?: number}} s
  * @returns {boolean}
  */
 export function cropDirtyState(s) {
   if (!s) return false;
-  return s.dirty === true || (s.inProgressLen || 0) > 0 || (s.pendingOthers || 0) > 0;
+  return s.dirty === true || (s.inProgressLen || 0) > 0
+    || (s.pendingOthers || 0) > 0 || (s.pendingMoves || 0) > 0;
 }

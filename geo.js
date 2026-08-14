@@ -86,3 +86,75 @@ export function nearestMark(points, lines, col, row, tol) {
   });
   return best;
 }
+
+/**
+ * Where a press at (col, row) grabs a polyline, for drag-move.
+ *
+ * Vertex first: the NEAREST vertex within `vertexTol` wins -> that single
+ * vertex is dragged. Otherwise, if the press is within `tol` of any SEGMENT,
+ * the whole polyline is dragged rigidly. Beyond both -> null (no grab).
+ * All coordinates + tolerances share one space, exactly like nearestMark.
+ *
+ * @param {Array<[number,number]>} pts  polyline vertices
+ * @param {number} col
+ * @param {number} row
+ * @param {number} tol       segment (whole-line) grab tolerance
+ * @param {number} [vertexTol=tol]  vertex grab tolerance
+ * @returns {{mode:'vertex', vIdx:number}|{mode:'whole'}|null}
+ */
+export function resolveLineGrab(pts, col, row, tol, vertexTol = tol) {
+  if (!pts || !pts.length) return null;
+  let vIdx = -1, bestD2 = Infinity;
+  const vt2 = vertexTol * vertexTol;
+  pts.forEach(([c, r], i) => {
+    const d2 = (c - col) ** 2 + (r - row) ** 2;
+    if (d2 <= vt2 && d2 < bestD2) { vIdx = i; bestD2 = d2; }
+  });
+  if (vIdx >= 0) return { mode: 'vertex', vIdx };
+  if (pts.length < 2) return null;               // single-vertex "line": vertex or nothing
+  let d2 = Infinity;
+  for (let s = 0; s + 1 < pts.length; s++) {
+    d2 = Math.min(d2, segmentDist2(col, row, pts[s][0], pts[s][1], pts[s + 1][0], pts[s + 1][1]));
+  }
+  return d2 <= tol * tol ? { mode: 'whole' } : null;
+}
+
+/**
+ * Clamp a rigid-translate delta so EVERY point stays inside [0, size]².
+ * Returns the largest |delta| <= the requested one that keeps all points in
+ * bounds (a drag "stops at the edge" instead of escaping the crop). A point
+ * already out of bounds on an axis with an empty feasible interval gets 0 on
+ * that axis (never move it further out, never force it around).
+ *
+ * @param {Array<[number,number]>} pts
+ * @param {number} dc  requested column delta
+ * @param {number} dr  requested row delta
+ * @param {number} [size=1024]
+ * @returns {[number, number]} the clamped [dc, dr]
+ */
+export function clampDelta(pts, dc, dr, size = 1024) {
+  if (!pts || !pts.length) return [0, 0];
+  let minC = Infinity, maxC = -Infinity, minR = Infinity, maxR = -Infinity;
+  for (const [c, r] of pts) {
+    if (c < minC) minC = c;
+    if (c > maxC) maxC = c;
+    if (r < minR) minR = r;
+    if (r > maxR) maxR = r;
+  }
+  const clampAxis = (d, lo, hi) => (lo > hi ? 0 : Math.min(hi, Math.max(lo, d)));
+  return [
+    clampAxis(dc, -minC, size - maxC),
+    clampAxis(dr, -minR, size - maxR),
+  ];
+}
+
+/**
+ * Rigidly translate a vertex list (fresh arrays; input untouched).
+ * @param {Array<[number,number]>} pts
+ * @param {number} dc
+ * @param {number} dr
+ * @returns {Array<[number,number]>}
+ */
+export function translatePoints(pts, dc, dr) {
+  return (pts || []).map(([c, r]) => [c + dc, r + dr]);
+}
