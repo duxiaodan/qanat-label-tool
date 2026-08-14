@@ -135,6 +135,43 @@ export function patchPoolMarksByDbId(pool, byId) {
 }
 
 /**
+ * After rpc_insert_marks: stamp the server-assigned row id (dbId) and
+ * created_at onto EVERY local object describing each inserted mark. Matching
+ * is by geom ciphertext — unique per row (AES-GCM random IV) and byte-stable
+ * across the round-trip, unlike array order (inserts may split into several
+ * POSTs by key signature).
+ *
+ * Each insert record carries up to TWO object graphs for the same mark:
+ *   mark — the pool-shaped object (S.shaftMarks / S.lineMarks), and
+ *   src  — the originating crop-modal entry (S.crop.marks.points/lines),
+ *          present while the crop that saved is still open.
+ * BOTH must learn the new dbId + created. If only the pool object is updated,
+ * the still-open crop keeps a dbId-less entry: its History… button stays
+ * disabled until the crop is reopened, and a SECOND save of the same open crop
+ * re-runs the reconcile on the "new-looking" mark — deleting the fresh row and
+ * re-inserting it under a NEW id (identity/history churn, and created_at is
+ * not echoed). Mutates in place; unmatched rows are skipped.
+ * @param {Array<{mark:object, src?:object|null, row:{geom:string}}>} inserts
+ * @param {Array<{id:number, geom:string, created_at?:string}>|null|undefined} inserted
+ * @returns {number} count of inserted rows matched back to an insert record
+ */
+export function backfillInsertedIds(inserts, inserted) {
+  const byGeom = new Map((inserts || []).map((x) => [x.row.geom, x]));
+  let n = 0;
+  for (const ins of inserted || []) {
+    const rec = byGeom.get(ins.geom);
+    if (!rec) continue;
+    for (const t of [rec.mark, rec.src]) {
+      if (!t) continue;
+      t.dbId = ins.id;
+      t.created = ins.created_at || t.created || null;
+    }
+    n += 1;
+  }
+  return n;
+}
+
+/**
  * The db row id behind the crop's selection, IFF exactly one mark is selected
  * (own or others') and that mark exists server-side. This is the enablement
  * rule for the History… button: history is per-row, so a multi-selection or a

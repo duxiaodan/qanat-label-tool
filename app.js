@@ -22,7 +22,7 @@ import {
   attribution, othersDeleteIds, pruneOthers, dropPoolMarksByDbId, cropDirtyState,
   historyButtonState, collapseHistoryRows, historyOpLabel, historyRestoreState,
   mergePendingMove, dropMovesForIds, applyPendingMoves, patchPoolMarksByDbId,
-  shortHash, snapshotDupBadges,
+  backfillInsertedIds, shortHash, snapshotDupBadges,
 } from './suedit.js';
 import {
   cellPasses, filterIsActive, pruneSelection, labelerOrder,
@@ -2576,13 +2576,24 @@ async function commitCrop() {
   };
   const myShafts = [];
   const myLines = [];
+  // pool-shaped mark -> the crop entry it was built FROM. TWO object graphs
+  // describe each of my marks while this crop stays open: the pool object
+  // (S.shaftMarks/S.lineMarks) and the crop's own entry (S.crop.marks). The
+  // insert backfill below must stamp dbId/created on BOTH (backfillInsertedIds,
+  // suedit.js) — a side Map, not a property on the mark, so the link can never
+  // leak into persist()/GeoJSON export.
+  const srcOf = new Map();
   for (const p of S.crop.marks.points) {
     const [x, y] = pixelToWorld(p.px[0], p.px[1], cell.world_bbox);
-    myShafts.push({ cropId: cell.id, pPos: cell.p_pos, world: [x, y], created: p.created || null, dbId: p.dbId ?? null, kind: KIND_SHAFT, labeler: S.me, ...prov, autocontrast: p.ac ?? null });
+    const m = { cropId: cell.id, pPos: cell.p_pos, world: [x, y], created: p.created || null, dbId: p.dbId ?? null, kind: KIND_SHAFT, labeler: S.me, ...prov, autocontrast: p.ac ?? null };
+    srcOf.set(m, p);
+    myShafts.push(m);
   }
   for (const ln of S.crop.marks.lines) {
     if (ln.pts.length < 2) continue;
-    myLines.push({ cropId: cell.id, pPos: cell.p_pos, world: ln.pts.map(([c, r]) => pixelToWorld(c, r, cell.world_bbox)), created: ln.created || null, dbId: ln.dbId ?? null, kind: KIND_CHANNEL, labeler: S.me, ...prov, autocontrast: ln.ac ?? null });
+    const m = { cropId: cell.id, pPos: cell.p_pos, world: ln.pts.map(([c, r]) => pixelToWorld(c, r, cell.world_bbox)), created: ln.created || null, dbId: ln.dbId ?? null, kind: KIND_CHANNEL, labeler: S.me, ...prov, autocontrast: ln.ac ?? null };
+    srcOf.set(m, ln);
+    myLines.push(m);
   }
   S.shaftMarks.push(...myShafts);
   S.lineMarks.push(...myLines);
@@ -2623,22 +2634,22 @@ async function commitCrop() {
       const inserts = [];
       for (const m of mine) {
         if (m.dbId != null && existingIds.has(m.dbId)) continue; // untouched — leave its row alone
-        inserts.push({ mark: m, row: { kind: m.kind, geom: await encryptGeom(m.world), ...rowProv, autocontrast: m.autocontrast, created_at: m.created || undefined } });
+        inserts.push({ mark: m, src: srcOf.get(m) || null, row: { kind: m.kind, geom: await encryptGeom(m.world), ...rowProv, autocontrast: m.autocontrast, created_at: m.created || undefined } });
       }
       // writes go through the token-gated RPCs; actor = the gate name.
       const auth = { token: S.writeToken, actor: S.me };
       await deleteMarksByIds(SUPABASE, S.board, S.me, cell.id, toDelete, S.project, auth);
       const inserted = await insertMarks(SUPABASE, S.board, S.me, cell.id, inserts.map((x) => x.row), S.project, auth);
       // tag freshly-inserted marks with their dbId (so the next save skips them)
-      // and their server-stamped created_at (so any future re-insert echoes it).
-      // Match by geom ciphertext — unique per row (AES-GCM random IV) and stable
-      // across the round-trip, unlike array order (inserts may split into
-      // several POSTs by key signature).
-      const byGeom = new Map(inserts.map((x) => [x.row.geom, x.mark]));
-      for (const ins of inserted || []) {
-        const m = byGeom.get(ins.geom);
-        if (m) { m.dbId = ins.id; m.created = ins.created_at || m.created; }
-      }
+      // and their server-stamped created_at (so any future re-insert echoes it),
+      // matched back by geom ciphertext. BOTH object graphs get the stamp: the
+      // pool mark AND (via each insert's `src` link) the still-open crop's own
+      // entry. Backfilling only the pool half is the historical bug: the open
+      // crop kept a dbId:null entry, so History… stayed disabled until reopen,
+      // and a second save of the same crop deleted + re-inserted the fresh row
+      // under a NEW id, breaking the mark's identity/history chain. See
+      // backfillInsertedIds (suedit.js) for the matching rules.
+      backfillInsertedIds(inserts, inserted);
       // OWN drag-moves: identity-preserving UPDATEs. A moved own mark KEPT its
       // dbId, so the reconcile above counted it as kept (not deleted, not
       // re-inserted) — its row is patched in place via rpc_update_mark {geom}
@@ -2721,6 +2732,10 @@ async function commitCrop() {
   // guard on the cell because closeCrop(true) can null/replace S.crop meanwhile.
   if (S.crop && S.crop.cell === cell) S.crop.dirty = false;
   redrawCrop();
+  // a selected just-saved mark now HAS a dbId — flip its History… button from
+  // "unsaved mark — save first" to enabled without requiring a selection
+  // change. Safe on every path (no-op without the button / a closed crop).
+  updateHistoryButton();
 }
 /** Confirmed cross-labeler deletes: drop the rows from the pool, clear them
  *  from the crop's pending set, and repaint everything the pool drives. */
