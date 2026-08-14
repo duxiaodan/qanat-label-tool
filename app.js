@@ -22,7 +22,7 @@ import {
   attribution, othersDeleteIds, pruneOthers, dropPoolMarksByDbId, cropDirtyState,
   historyButtonState, collapseHistoryRows, historyOpLabel, historyRestoreState,
   mergePendingMove, dropMovesForIds, applyPendingMoves, patchPoolMarksByDbId,
-  backfillInsertedIds, shortHash, snapshotDupBadges,
+  backfillInsertedIds, shortHash, snapIdent, snapshotDupBadges,
 } from './suedit.js';
 import {
   cellPasses, filterIsActive, pruneSelection, labelerOrder,
@@ -673,6 +673,8 @@ async function snapOpen() {
   await snapReloadList();
 }
 function snapClose() { $('snap-modal').hidden = true; }
+/** Rebuild the list; returns the fetched rows (null when listing failed) so
+ *  callers can look up metadata — e.g. the auto-pre-restore row's hash. */
 async function snapReloadList() {
   const list = $('snap-list');
   list.textContent = 'loading…';
@@ -681,7 +683,7 @@ async function snapReloadList() {
   catch (e) {
     list.textContent = '';
     snapSetMsg('could not list snapshots: ' + (e.rpcMessage || e.message), true);
-    return;
+    return null;
   }
   list.innerHTML = '';
   if (!rows.length) {
@@ -689,7 +691,7 @@ async function snapReloadList() {
     em.className = 'snap-empty';
     em.textContent = 'no snapshots yet for this board + project';
     list.appendChild(em);
-    return;
+    return rows;
   }
   // duplicate-content badges: each later row whose content_sha already
   // appeared points at the EARLIEST snapshot with that content (suedit.js)
@@ -732,6 +734,7 @@ async function snapReloadList() {
     row.appendChild(btn);
     $('snap-list').appendChild(row);
   }
+  return rows;
 }
 async function snapCreate() {
   const btn = $('snap-create');
@@ -741,8 +744,8 @@ async function snapCreate() {
   try {
     const out = await createSnapshot(SUPABASE, S.board, S.project,
       $('snap-label').value.trim() || null, suAuth());
-    const h = shortHash(out.snap_hash);
-    snapSetMsg(`snapshot ${h || '#' + out.id} created (${out.row_count} row${out.row_count === 1 ? '' : 's'})`);
+    // hash-only identity (snapIdent falls back to #id only for a hashless row)
+    snapSetMsg(`snapshot ${snapIdent(out.snap_hash, out.id)} created (${out.row_count} row${out.row_count === 1 ? '' : 's'})`);
     $('snap-label').value = '';
     await snapReloadList();
   } catch (e) {
@@ -755,10 +758,9 @@ let _snapRestoreBusy = false; // one restore at a time (list buttons stay live)
 async function snapRestore(s) {
   if (_snapRestoreBusy) return;
   const label = s.label ? ` ("${s.label}")` : '';
-  // git-style identity in the confirmation (falls back to #id for any
-  // pre-migration row that never got a snap_hash)
-  const hash = shortHash(s.snap_hash);
-  const ident = hash ? `${hash} (#${s.id})` : `#${s.id}`;
+  // hash-only identity in the confirmation, matching the list rows (snapIdent
+  // falls back to #id only for a pre-migration row that never got a snap_hash)
+  const ident = snapIdent(s.snap_hash, s.id);
   // explicit consequences in the confirmation: the row count being restored
   // AND the automatic pre-restore snapshot the server creates first.
   const ok = confirm(
@@ -771,9 +773,17 @@ async function snapRestore(s) {
   snapSetMsg('restoring…');
   try {
     const out = await restoreSnapshot(SUPABASE, s.id, suAuth());
-    snapSetMsg(`restored ${out.restored_rows} row${out.restored_rows === 1 ? '' : 's'} ` +
-      `from snapshot #${out.snapshot_id} — pre-restore snapshot #${out.pre_restore_snapshot_id} created`);
-    await snapReloadList();
+    // The RPC returns numeric ids only; the auto-pre-restore snapshot's hash
+    // lives in the refreshed list, so reload FIRST, then compose the message
+    // hash-only (like the confirm above). If listing failed, its error message
+    // stands — same visibility as before, when reload overwrote the success.
+    const rows = await snapReloadList();
+    if (rows) {
+      const pre = rows.find((r) => r.id === out.pre_restore_snapshot_id);
+      snapSetMsg(`restored ${out.restored_rows} row${out.restored_rows === 1 ? '' : 's'} ` +
+        `from snapshot ${snapIdent(s.snap_hash, out.snapshot_id)} — pre-restore snapshot ` +
+        `${snapIdent(pre && pre.snap_hash, out.pre_restore_snapshot_id)} created`);
+    }
     await refreshMarks(); // re-pull the pool so the UI reflects the restored state
   } catch (e) {
     snapSetMsg('restore failed: ' + (e.rpcMessage || e.message), true);

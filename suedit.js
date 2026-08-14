@@ -383,6 +383,22 @@ export function shortHash(h) {
 }
 
 /**
+ * User-facing identity of a snapshot in messages/confirms: the same 7-char
+ * short hash the list rows lead with. ONLY a hashless snapshot (pre-migration
+ * degenerate case — the row the list shows as "—") falls back to `#<id>` so a
+ * message is never empty; with neither hash nor id it degrades to '—'.
+ * Internal RPC calls keep using the numeric id — this is display-only.
+ * @param {string|null|undefined} hash  full snap_hash (or already-short form)
+ * @param {number|null|undefined} id    numeric snapshot id (fallback only)
+ * @returns {string}
+ */
+export function snapIdent(hash, id) {
+  const h = shortHash(hash);
+  if (h) return h;
+  return (id === null || id === undefined) ? '—' : `#${id}`;
+}
+
+/**
  * Duplicate-content badges for the snapshots dialog. Rows come from
  * rpc_list_snapshots in ANY order (the RPC sends newest-first); duplication is
  * resolved globally against the EARLIEST snapshot (lowest id — ids are
