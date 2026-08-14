@@ -1582,8 +1582,9 @@ function updateCropNavButtons() {
     b.title = n ? `${NAV_LABEL[dir]} → ${n.id}` : '';
   }
 }
-/** Unsaved-marks test: an explicit edit, a polyline still being drawn, or a
- *  pending (unsaved) superuser delete/move of someone else's mark. */
+/** Unsaved-marks test: an explicit edit, a polyline still being drawn, a
+ *  pending (unsaved) superuser delete/move of someone else's mark, or a
+ *  pending (unsaved) move of an own already-saved mark. */
 function cropIsDirty() {
   if (!S.crop) return false;
   return cropDirtyState({
@@ -1591,6 +1592,7 @@ function cropIsDirty() {
     inProgressLen: S.crop.inProgress ? S.crop.inProgress.length : 0,
     pendingOthers: S.crop.pendingOthersDeletes ? S.crop.pendingOthersDeletes.size : 0,
     pendingMoves: S.crop.pendingOthersMoves ? S.crop.pendingOthersMoves.size : 0,
+    pendingOwnMoves: S.crop.pendingOwnMoves ? S.crop.pendingOwnMoves.size : 0,
   });
 }
 /** Per-action wording for the unsaved-marks prompt. 'nav' matches the static
@@ -1731,6 +1733,14 @@ async function openCrop(cid) {
     // wins; a pending delete of the same mark drops its move. Counted by
     // cropIsDirty exactly like the pending deletes.
     pendingOthersMoves: new Map(),
+    // …and drag-MOVES of OWN already-saved marks (same dbId -> {kind, px|pts}
+    // shape). A moved own mark KEEPS its dbId — the reconcile treats it as
+    // kept — and "Save work" commits the move as an identity-preserving
+    // rpc_update_mark {geom} on the same row (id, created_at and the history
+    // chain all survive; own-row updates never stamp edited_by). Last move
+    // wins; deleting the mark drops its move; counted by cropIsDirty;
+    // refresh-proof via applyPendingMoves in loadCropMarksFor.
+    pendingOwnMoves: new Map(),
   };
   loadCropMarksFor(cell);
   $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}   (${cell.gt_points.length} GT shafts)`;
@@ -1770,7 +1780,15 @@ function loadCropMarksFor(cell) {
     if (m.labeler === S.me) mine.lines.push({ pts: ln, ac: m.autocontrast ?? null, created: m.created || null, dbId: m.dbId ?? null });
     else others.lines.push({ pts: ln, labeler: m.labeler || '', dbId: m.dbId ?? null, editedBy: m.editedBy || null });
   }
-  S.crop.marks = mine;
+  // a moved-but-unsaved OWN mark keeps its dbId, so a mid-session refresh
+  // re-derives it from the pool — where the server row still holds the OLD
+  // geometry. Re-apply the pending own-moves over the reload so the move
+  // cannot visually snap back (exactly the others-moves treatment below).
+  const ownMoves = S.crop.pendingOwnMoves || new Map();
+  S.crop.marks = {
+    points: applyPendingMoves(mine.points, ownMoves),
+    lines: applyPendingMoves(mine.lines, ownMoves),
+  };
   // a mid-session refresh re-pulls the pool where still-unsaved others-deletes
   // still exist as rows — prune them so they can't visually resurrect. Same
   // for still-unsaved others-MOVES: the rows hold the old geometry, so the
@@ -1837,11 +1855,15 @@ function selectFromBox(box, additive) {
 }
 function deleteSelected() {
   if (!S.crop || selCount() === 0) return;
+  const removedOwn = [];
   const pi = [...S.crop.selected.points].sort((a, b) => b - a);
-  for (const i of pi) S.crop.marks.points.splice(i, 1);
+  for (const i of pi) removedOwn.push(...S.crop.marks.points.splice(i, 1));
   const li = [...S.crop.selected.lines].sort((a, b) => b - a);
-  for (const i of li) S.crop.marks.lines.splice(i, 1);
+  for (const i of li) removedOwn.push(...S.crop.marks.lines.splice(i, 1));
   if (pi.length || li.length) S.crop.dirty = true;
+  // delete wins over a pending OWN move too: the row is deleted by the
+  // reconcile on save, so the move intent is dropped with it.
+  S.crop.pendingOwnMoves = dropMovesForIds(S.crop.pendingOwnMoves, othersDeleteIds(removedOwn));
   // others' marks: remove from the crop view NOW, but the DB rows only go on
   // save — their ids enter the pending set that commitCrop turns into an
   // explicit rpc_delete_marks call. (oPoints/oLines can only be non-empty
@@ -2188,21 +2210,26 @@ function setupCropInteractions() {
       : (m.pts.length === d.orig.length
          && m.pts.every((p, i) => p[0] === d.orig[i][0] && p[1] === d.orig[i][1]));
     if (same) { redrawCrop(); return; }   // clamped back to the start — no change
+    const entry = d.kind === 'point'
+      ? { kind: 'point', px: [m.px[0], m.px[1]] }
+      : { kind: 'line', pts: m.pts.map((p) => [p[0], p[1]]) };
     if (d.group === 'own') {
-      // a moved own mark is a CHANGED mark for the reconcile-on-save: drop its
-      // dbId so commitCrop deletes the old row and inserts the new geometry as
-      // a fresh row that echoes `created` (the original timestamp survives —
-      // the same shape as the stale-dbId failed-save recovery path).
-      m.dbId = null;
-      S.crop.dirty = true;
+      if (typeof m.dbId === 'number' && Number.isFinite(m.dbId)) {
+        // an already-SAVED own mark keeps its identity across a move: the
+        // dbId STAYS (so the reconcile-on-save leaves the row alone) and the
+        // move becomes a pending own-move, committed by "Save work" as an
+        // rpc_update_mark {geom} on the SAME row — id, created_at and the
+        // mark's history chain all survive. Last move of the mark wins.
+        S.crop.pendingOwnMoves = mergePendingMove(S.crop.pendingOwnMoves, m.dbId, entry);
+      } else {
+        // a never-saved mark has no row to patch — its local coords already
+        // moved; the ordinary insert-on-save path picks them up.
+        S.crop.dirty = true;
+      }
     } else {
       // others' mark (superuser): a pending UPDATE, committed by "Save work"
       // via rpc_update_mark. Last move of the same mark wins.
-      S.crop.pendingOthersMoves = mergePendingMove(
-        S.crop.pendingOthersMoves, m.dbId,
-        d.kind === 'point'
-          ? { kind: 'point', px: [m.px[0], m.px[1]] }
-          : { kind: 'line', pts: m.pts.map((p) => [p[0], p[1]]) });
+      S.crop.pendingOthersMoves = mergePendingMove(S.crop.pendingOthersMoves, m.dbId, entry);
     }
     redrawCrop();
   }
@@ -2389,8 +2416,11 @@ function setupCropInteractions() {
     if (S.crop.inProgress.length) { S.crop.inProgress.pop(); S.crop.dirty = true; }
     else if (S.crop.marks.points.length || S.crop.marks.lines.length) {
       // undo whichever was added last is ambiguous after reload; pop a point first, else a line
-      if (S.crop.marks.points.length) S.crop.marks.points.pop();
-      else S.crop.marks.lines.pop();
+      const popped = S.crop.marks.points.length
+        ? S.crop.marks.points.pop() : S.crop.marks.lines.pop();
+      // the popped mark's row is deleted by the reconcile on save — a pending
+      // own-move of it goes with it.
+      S.crop.pendingOwnMoves = dropMovesForIds(S.crop.pendingOwnMoves, othersDeleteIds([popped]));
       S.crop.dirty = true;
     }
     selClear();
@@ -2400,6 +2430,7 @@ function setupCropInteractions() {
     if (!S.crop) return;
     if (!confirm('Remove all your marks for this crop?')) return;
     S.crop.marks.points = []; S.crop.marks.lines = []; S.crop.inProgress = []; S.crop.selectBox = null; selClear();
+    S.crop.pendingOwnMoves = new Map();   // every own row goes on save — no moves left to commit
     S.crop.dirty = true;
     redrawCrop();
   });
@@ -2515,11 +2546,12 @@ async function commitCrop() {
     S.crop.marks.lines.push({ pts: S.crop.inProgress.slice(), ac: $('crop-autocontrast').checked });
   }
   S.crop.inProgress = [];
-  // Snapshot the pending superuser others-deletes AND others-moves NOW: S.crop
-  // can be nulled or replaced while the awaits below are in flight (closeCrop /
-  // navigation).
+  // Snapshot the pending superuser others-deletes, others-moves AND own-moves
+  // NOW: S.crop can be nulled or replaced while the awaits below are in flight
+  // (closeCrop / navigation).
   const pendingOthers = new Set(S.crop.pendingOthersDeletes || []);
   const pendingMoves = new Map(S.crop.pendingOthersMoves || []);
+  const pendingOwn = new Map(S.crop.pendingOwnMoves || []);
   /** pending-move crop-px geometry -> world coords (shape matches the row kind). */
   const moveWorld = (mv) => (mv.kind === 'point'
     ? pixelToWorld(mv.px[0], mv.px[1], cell.world_bbox)
@@ -2607,6 +2639,31 @@ async function commitCrop() {
         const m = byGeom.get(ins.geom);
         if (m) { m.dbId = ins.id; m.created = ins.created_at || m.created; }
       }
+      // OWN drag-moves: identity-preserving UPDATEs. A moved own mark KEPT its
+      // dbId, so the reconcile above counted it as kept (not deleted, not
+      // re-inserted) — its row is patched in place via rpc_update_mark {geom}
+      // with the user's own token instead. Server-side an own-row update never
+      // stamps edited_by and never touches created_at, so the id, timestamp
+      // and history chain all survive the move. Per-row confirm mirrors the
+      // others-moves path below: a mid-batch failure keeps exactly the
+      // unconfirmed moves pending (and the crop dirty). A move whose row was
+      // deleted this save (or vanished server-side) is moot — the reconcile
+      // already resolved the row; its entry is simply dropped.
+      if (pendingOwn.size) {
+        const confirmedOwn = [];
+        try {
+          for (const [id, mv] of pendingOwn) {
+            if (keptIds.has(id)) {
+              await updateMark(SUPABASE, id, { geom: await encryptGeom(moveWorld(mv)) }, auth);
+            }
+            confirmedOwn.push(id);
+          }
+        } finally {
+          if (confirmedOwn.length && S.crop && S.crop.cell === cell && S.crop.pendingOwnMoves) {
+            S.crop.pendingOwnMoves = dropMovesForIds(S.crop.pendingOwnMoves, confirmedOwn);
+          }
+        }
+      }
       // superuser cross-labeler deletes ("Edit others"): committed as an
       // EXPLICIT rpc_delete_marks call — the own-marks reconcile above is
       // scoped to S.me and never touches others' rows. Pool rows are dropped
@@ -2652,6 +2709,11 @@ async function commitCrop() {
       const local = new Map();
       for (const [id, mv] of pendingMoves) local.set(id, { world: moveWorld(mv) });
       applyOthersMoves(cell, local);
+    }
+    // own moves: the pool rebuild above already took the moved geometry —
+    // nothing stays pending without a server to sync.
+    if (pendingOwn.size && S.crop && S.crop.cell === cell && S.crop.pendingOwnMoves) {
+      S.crop.pendingOwnMoves = dropMovesForIds(S.crop.pendingOwnMoves, pendingOwn.keys());
     }
   }
   persist();

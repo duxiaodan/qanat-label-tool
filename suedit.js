@@ -164,9 +164,10 @@ export function singleSelectionDbId(sel, marks, others) {
  * server-side. Viewing an OWN mark's history is not a cross-labeler edit, so it
  * does NOT require the "Edit others" toggle — only others' marks do (their
  * selections can only exist while the toggle is on anyway; the check here is a
- * defensive backstop). A single own mark WITHOUT a dbId is the freshly-drawn or
- * freshly-MOVED case (a drag-move intentionally drops the dbId until saved) —
- * that gets the "save first" hint instead of the generic one.
+ * defensive backstop). A single own mark WITHOUT a dbId is the freshly-drawn,
+ * NEVER-SAVED case — a drag-move keeps the dbId now (own moves commit as
+ * identity-preserving UPDATEs on the same row), so only never-saved marks get
+ * the "save first" hint instead of the generic one.
  * @param {{su:boolean, editOthers:boolean,
  *          sel:{points:Set<number>, lines:Set<number>,
  *               oPoints:Set<number>, oLines:Set<number>}|null|undefined,
@@ -372,15 +373,17 @@ export function snapshotDupBadges(rows) {
 
 /**
  * The crop-level dirty test, as one pure decision: unsaved own-mark edits, an
- * in-progress polyline, OR pending others-edits (deletes AND drag-moves) all
- * make the crop dirty (and therefore guarded by the 3-way save/discard/cancel
- * prompt on nav/close).
+ * in-progress polyline, pending others-edits (deletes AND drag-moves), OR
+ * pending OWN drag-moves (a saved own mark moved but not yet committed via
+ * rpc_update_mark) all make the crop dirty (and therefore guarded by the
+ * 3-way save/discard/cancel prompt on nav/close).
  * @param {{dirty?: boolean, inProgressLen?: number, pendingOthers?: number,
- *          pendingMoves?: number}} s
+ *          pendingMoves?: number, pendingOwnMoves?: number}} s
  * @returns {boolean}
  */
 export function cropDirtyState(s) {
   if (!s) return false;
   return s.dirty === true || (s.inProgressLen || 0) > 0
-    || (s.pendingOthers || 0) > 0 || (s.pendingMoves || 0) > 0;
+    || (s.pendingOthers || 0) > 0 || (s.pendingMoves || 0) > 0
+    || (s.pendingOwnMoves || 0) > 0;
 }
