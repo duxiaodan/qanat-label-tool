@@ -74,7 +74,28 @@ body {
    toggle is on, body.su-edit-on tints the topbar and the crop modal amber and
    the chip spells out the armed state, so cross-labeler editing is never a
    surprise. */
-#su-edit-wrap { color: #f6a623; font-weight: 600; }
+#su-edit-wrap { color: #f6a623; font-weight: 600; position: relative; }
+/* the real checkbox stays focusable for keyboard/AT (Space toggles, native
+   checkbox semantics announce state) but is visually removed — the .su-switch
+   pill is the whole visual. */
+#su-edit-wrap input[type=checkbox] {
+  position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0;
+}
+.su-switch {
+  flex: 0 0 auto; width: 28px; height: 16px; border-radius: 999px;
+  background: #3a4152; border: 1px solid #4a5468; box-sizing: border-box;
+  position: relative; transition: background .15s, border-color .15s;
+}
+.su-switch::after {
+  content: ''; position: absolute; top: 1px; left: 1px; width: 12px; height: 12px;
+  border-radius: 50%; background: #b9c0cd; transition: left .15s, background .15s;
+}
+#tg-editothers:checked + .su-switch { background: #f6a623; border-color: #f6a623; }
+#tg-editothers:checked + .su-switch::after { left: 13px; background: #201503; }
+#tg-editothers:focus-visible + .su-switch {
+  box-shadow: 0 0 0 2px #20242c, 0 0 0 4px #2a6df0;
+}
+#su-edit-wrap:hover .su-switch { border-color: #f6a623; }
 .su-chip {
   background: #f6a623; color: #201503; padding: 2px 9px; border-radius: 10px;
   font-size: 11px; font-weight: 700; white-space: nowrap;

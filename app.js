@@ -554,14 +554,22 @@ function suEditOn() {
 function setupSuperuserUI() {
   const toggles = document.querySelector('#topbar .toggles');
   if (!toggles || document.getElementById('tg-editothers')) return;
-  // "Edit others" checkbox, appended to the layer toggles. Unchecked by
+  // "Edit others" control, appended to the layer toggles. Unchecked by
   // construction (fresh element per unlock; nothing ever persists it).
+  // Rendered as a slide switch: the REAL <input type=checkbox> stays in the
+  // DOM (visually hidden but focusable — all wiring, Space toggling and
+  // native checkbox semantics untouched); the pill track + thumb is the
+  // .su-switch span, pure CSS driven by :checked / :focus-visible.
   const lab = document.createElement('label');
   lab.id = 'su-edit-wrap';
   const inp = document.createElement('input');
   inp.type = 'checkbox';
   inp.id = 'tg-editothers';
+  const track = document.createElement('span');
+  track.className = 'su-switch';
+  track.setAttribute('aria-hidden', 'true');
   lab.appendChild(inp);
+  lab.appendChild(track);
   lab.appendChild(document.createTextNode(' Edit others'));
   toggles.appendChild(lab);
   // the strong visual cue while cross-labeler editing is armed
