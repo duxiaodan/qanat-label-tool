@@ -128,3 +128,30 @@ export async function verifyPasscode(cryptoJson, passcode) {
     return false;
   }
 }
+
+/**
+ * Try to open a superuser envelope (build_su_envelope in
+ * build_label_tool_site.py): AES-256-GCM blob whose key derives from the
+ * SUPERUSER passcode and whose payload carries the NORMAL site passcode.
+ * Success means the entered passcode IS the superuser passcode — the caller
+ * then unlocks the site with the recovered normal passcode. Binds to the
+ * password only; no name/username is involved anywhere.
+ *
+ * @param {{salt:string, iterations:number, file?:string}} suMeta  crypto.json's "su" field
+ * @param {Uint8Array|ArrayBuffer} blobBytes  contents of su.enc
+ * @param {string} passcode  the passcode the user typed at the gate
+ * @returns {Promise<{v:number, su:true, passcode:string}|null>} payload, or
+ *          null on wrong passcode / tamper / malformed payload (never throws).
+ */
+export async function openSuEnvelope(suMeta, blobBytes, passcode) {
+  try {
+    const salt = _b64ToBytes(suMeta.salt);
+    const key = await deriveKey(passcode, salt, suMeta.iterations);
+    const pt = await decryptBlob(key, blobBytes);
+    const payload = JSON.parse(new TextDecoder().decode(pt));
+    if (payload && payload.su === true && typeof payload.passcode === 'string') return payload;
+    return null;
+  } catch (e) {
+    return null;
+  }
+}

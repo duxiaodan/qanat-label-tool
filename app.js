@@ -10,7 +10,7 @@
 
 import { pixelToWorld, worldToPixel, nearestMark } from './geo.js';
 import { buildShaftsFeatureCollection, buildLinesFeatureCollection } from './geojson.js';
-import { deriveKey, decryptBlob, encryptBlob, verifyPasscode } from './crypto.js';
+import { deriveKey, decryptBlob, encryptBlob, verifyPasscode, openSuEnvelope } from './crypto.js';
 import { fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks } from './sync.js';
 import {
   cellPasses, filterIsActive, pruneSelection, labelerOrder,
@@ -37,6 +37,8 @@ const S = {
   // identity (set at the gate; `me` is normalized for matching, `meDisplay` shown/exported)
   me: '',               // normalized owner key (trim+collapse+lowercase)
   meDisplay: '',        // as-typed display/export name
+  su: false,            // superuser session — the SU passcode opened the gate via the
+                        // su envelope (password-only role: any name + su passcode)
   board: null,          // namespace per dataset (mirrors storageKey suffix)
   // per-session marks (each mark carries `labeler` owner + optional `dbId`)
   shaftMarks: [],       // {cropId, pPos, world:[x,y], created, labeler, dbId?}
@@ -432,8 +434,25 @@ async function unlock() {
   let cj;
   try { cj = await fetchJson('crypto.json'); }
   catch (e) { $('gate-msg').textContent = 'cannot load crypto.json — is the site served correctly?'; return; }
-  const ok = await verifyPasscode(cj, pw);
-  if (!ok) { $('gate-msg').textContent = 'wrong passcode'; return; }
+  // Superuser envelope first: when the site carries one (crypto.json "su" +
+  // su.enc), try the entered passcode against it. Success -> superuser session;
+  // the envelope payload yields the NORMAL passcode, and everything below
+  // proceeds exactly as if that had been typed. Failure (or no envelope) ->
+  // the normal sentinel path, unchanged. Role binds to the PASSWORD ONLY —
+  // any name + the su passcode is a superuser, by design.
+  let sitePw = pw;
+  S.su = false;
+  if (cj.su && cj.su.salt) {
+    try {
+      const suBlob = await fetchBytes(cj.su.file || 'su.enc');
+      const payload = await openSuEnvelope(cj.su, suBlob, pw);
+      if (payload) { S.su = true; sitePw = payload.passcode; }
+    } catch (e) { /* su.enc unfetchable -> fall through to the normal path */ }
+  }
+  if (!S.su) {
+    const ok = await verifyPasscode(cj, pw);
+    if (!ok) { $('gate-msg').textContent = 'wrong passcode'; return; }
+  }
   // identity: normalize for matching, remember the display name for suggestions.
   S.meDisplay = nameRaw.trim().replace(/\s+/g, ' ');
   S.me = normalize(S.meDisplay);
@@ -446,13 +465,13 @@ async function unlock() {
   $('gate-loading').hidden = false;
   try {
     const salt = Uint8Array.from(atob(cj.salt), (c) => c.charCodeAt(0));
-    S.key = await deriveKey(pw, salt, cj.iterations);
+    S.key = await deriveKey(sitePw, salt, cj.iterations);
     // DB-row geometry key: derived from marks_salt, which survives site rebuilds
     // (the site salt above does not). Old deployments have no marks_salt ->
     // fall back to the site key so their existing rows keep decrypting.
     if (cj.marks_salt) {
       const msalt = Uint8Array.from(atob(cj.marks_salt), (c) => c.charCodeAt(0));
-      S.marksKey = await deriveKey(pw, msalt, cj.iterations);
+      S.marksKey = await deriveKey(sitePw, msalt, cj.iterations);
     } else {
       S.marksKey = S.key;
     }
