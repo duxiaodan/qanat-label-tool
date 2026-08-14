@@ -20,7 +20,7 @@ import {
 } from './sync.js';
 import {
   attribution, othersDeleteIds, pruneOthers, dropPoolMarksByDbId, cropDirtyState,
-  singleSelectionDbId, canRestoreHistoryRow,
+  historyButtonState, canRestoreHistoryRow,
   mergePendingMove, dropMovesForIds, applyPendingMoves, patchPoolMarksByDbId,
   shortHash, snapshotDupBadges,
 } from './suedit.js';
@@ -592,26 +592,40 @@ function setupSuperuserUI() {
     b.addEventListener('click', snapOpen);
   }
   // History… button in the crop-modal toolbar (backend-only: history lives in
-  // the DB). Enabled ONLY with "Edit others" on and exactly one selected mark
-  // that has a db row (see updateHistoryButton).
+  // the DB). Enabled with exactly one selected SAVED mark: own marks need only
+  // the superuser session (viewing own history is not a cross-labeler edit);
+  // others' marks additionally need "Edit others" ON (their selections can
+  // only exist then anyway). Rule lives in historyButtonState (suedit.js).
   if (backendOn() && !document.getElementById('crop-history')) {
     const h = document.createElement('button');
     h.id = 'crop-history';
     h.type = 'button';
     h.textContent = 'History…';
     h.disabled = true;
-    h.title = 'Edit others + select exactly one saved mark';
+    h.title = 'select exactly one saved mark';
     $('crop-undo').insertAdjacentElement('beforebegin', h);
     h.addEventListener('click', histOpen);
   }
 }
-/** Enablement for #crop-history: Edit others ON + a single selected mark with
- *  a db id (own or others'). Safe to call any time (no-op without the button). */
+/** The pure enablement decision for #crop-history over the current crop state
+ *  (see historyButtonState in suedit.js). */
+function histState() {
+  return historyButtonState({
+    su: S.su,
+    editOthers: suEditOn(),
+    sel: S.crop && S.crop.selected,
+    marks: S.crop && S.crop.marks,
+    others: S.crop && S.crop.others,
+  });
+}
+/** Enablement + tooltip for #crop-history. Safe to call any time (no-op
+ *  without the button). */
 function updateHistoryButton() {
   const h = document.getElementById('crop-history');
   if (!h) return;
-  h.disabled = !(suEditOn() && S.crop
-    && singleSelectionDbId(S.crop.selected, S.crop.marks, S.crop.others) != null);
+  const st = histState();
+  h.disabled = !st.enabled;
+  h.title = st.hint;
 }
 function applySuEditCue() {
   const on = suEditOn();
@@ -800,8 +814,9 @@ function histSetMsg(msg, isErr) {
 }
 async function histOpen() {
   if (!S.su || !backendOn() || !S.crop) return;
-  const id = singleSelectionDbId(S.crop.selected, S.crop.marks, S.crop.others);
-  if (id == null) return;
+  const st = histState();
+  if (!st.enabled || st.dbId == null) return;
+  const id = st.dbId;
   _histMarkId = id;
   $('hist-title').textContent = `Mark history — row #${id}`;
   histSetMsg('');

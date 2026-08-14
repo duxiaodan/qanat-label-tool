@@ -157,6 +157,47 @@ export function singleSelectionDbId(sel, marks, others) {
 }
 
 /**
+ * Full enablement decision for the crop toolbar's History… button, as one pure
+ * function: {enabled, dbId, hint} (hint doubles as the button tooltip).
+ *
+ * The rule: a SUPERUSER session and exactly one selected mark that exists
+ * server-side. Viewing an OWN mark's history is not a cross-labeler edit, so it
+ * does NOT require the "Edit others" toggle — only others' marks do (their
+ * selections can only exist while the toggle is on anyway; the check here is a
+ * defensive backstop). A single own mark WITHOUT a dbId is the freshly-drawn or
+ * freshly-MOVED case (a drag-move intentionally drops the dbId until saved) —
+ * that gets the "save first" hint instead of the generic one.
+ * @param {{su:boolean, editOthers:boolean,
+ *          sel:{points:Set<number>, lines:Set<number>,
+ *               oPoints:Set<number>, oLines:Set<number>}|null|undefined,
+ *          marks:{points:Array, lines:Array}|null|undefined,
+ *          others:{points:Array, lines:Array}|null|undefined}} s
+ * @returns {{enabled:boolean, dbId:number|null, hint:string}}
+ */
+export function historyButtonState(s) {
+  const off = (hint) => ({ enabled: false, dbId: null, hint });
+  const generic = 'select exactly one saved mark';
+  if (!s || !s.su || !s.sel || !s.marks || !s.others) return off(generic);
+  const own = [];
+  for (const i of s.sel.points || []) own.push(s.marks.points[i]);
+  for (const i of s.sel.lines || []) own.push(s.marks.lines[i]);
+  const oth = [];
+  for (const i of s.sel.oPoints || []) oth.push(s.others.points[i]);
+  for (const i of s.sel.oLines || []) oth.push(s.others.lines[i]);
+  if (own.length + oth.length !== 1) return off(generic);
+  const pick = own.length === 1 ? own[0] : oth[0];
+  if (!pick) return off(generic);
+  if (oth.length === 1 && !s.editOthers) {
+    return off("turn on Edit others to view another labeler's mark history");
+  }
+  const id = pick.dbId;
+  if (typeof id !== 'number' || !Number.isFinite(id)) {
+    return off('unsaved mark — save first to view its history');
+  }
+  return { enabled: true, dbId: id, hint: "view this mark's history" };
+}
+
+/**
  * Whether a rpc_mark_history entry can be rolled back to: only entries with an
  * old_row (UPDATE / DELETE). INSERT entries have no previous version — the
  * server rejects them, so the button is disabled client-side too.
