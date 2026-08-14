@@ -248,6 +248,16 @@ body {
 /* vector overlay: stage-sized, never CSS-transformed, click-through so all the
    mouse handlers stay on #crop-canvas / #crop-stage underneath. */
 #crop-overlay { position: absolute; left: 0; top: 0; pointer-events: none; }
+/* hover tooltip: which OTHER labeler made the mark under the cursor. Position
+   (left/top) is set by showCropHoverTip in app.js; click-through like the
+   overlay so it never intercepts a gesture even right under the pointer. */
+.crop-hover-tip {
+  position: absolute; z-index: 6; pointer-events: none;
+  max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  background: rgba(20, 24, 32, .92); color: #ffb75e;   /* echoes the orange marks */
+  border: 1px solid rgba(255, 149, 0, .55); border-radius: 5px;
+  padding: 2px 7px; font-size: 12px; line-height: 1.5;
+}
 .modal-hint { font-size: 11px; color: #889; margin-top: 6px; }
 
 /* ---------- adjacent-crop navigation ----------

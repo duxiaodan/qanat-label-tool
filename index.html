@@ -147,6 +147,10 @@
         <!-- screen-space vector overlay: NOT CSS-transformed, so marks keep a
              constant screen size at any zoom (see drawCropOverlay in app.js) -->
         <canvas id="crop-overlay"></canvas>
+        <!-- hover tooltip: which OTHER labeler made the mark under the cursor
+             (showCropHoverTip in app.js). pointer-events:none in CSS, so it can
+             never swallow the stage/canvas mouse gestures. -->
+        <div id="crop-hover-tip" class="crop-hover-tip" hidden></div>
         <!-- adjacent-crop navigation: one edge-overlay button per direction.
              Each is shown ONLY when that neighbour cell exists in the manifest
              (updateCropNavButtons in app.js recomputes on every openCrop), so a

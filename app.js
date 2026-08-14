@@ -8,7 +8,7 @@
 //
 // Browser-only (uses DOM, fetch, localStorage). Not exercised by `node --test`.
 
-import { pixelToWorld, worldToPixel } from './geo.js';
+import { pixelToWorld, worldToPixel, nearestMark } from './geo.js';
 import { buildShaftsFeatureCollection, buildLinesFeatureCollection } from './geojson.js';
 import { deriveKey, decryptBlob, encryptBlob, verifyPasscode } from './crypto.js';
 import { fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks } from './sync.js';
@@ -1317,16 +1317,16 @@ function loadCropMarksFor(cell) {
   // my marks keep their per-mark autocontrast flag (`ac`; null on pre-provenance
   // rows), their `created` timestamp AND their `dbId` — an untouched mark keeps
   // its row byte-identical across saves (the reconcile in commitCrop skips it);
-  // others' are display-only bare coords.
+  // others' are display-only coords + the owner's name for the hover tooltip.
   for (const m of S.shaftMarks) if (m.cropId === cid) {
     const px = worldToPixel(m.world[0], m.world[1], cell.world_bbox);
     if (m.labeler === S.me) mine.points.push({ px, ac: m.autocontrast ?? null, created: m.created || null, dbId: m.dbId ?? null });
-    else others.points.push(px);
+    else others.points.push({ px, labeler: m.labeler || '' });
   }
   for (const m of S.lineMarks) if (m.cropId === cid) {
     const ln = m.world.map(([x, y]) => worldToPixel(x, y, cell.world_bbox));
     if (m.labeler === S.me) mine.lines.push({ pts: ln, ac: m.autocontrast ?? null, created: m.created || null, dbId: m.dbId ?? null });
-    else others.lines.push(ln);
+    else others.lines.push({ pts: ln, labeler: m.labeler || '' });
   }
   S.crop.marks = mine;
   S.crop.others = others;
@@ -1338,6 +1338,7 @@ function reloadCropMarks() {
   loadCropMarksFor(S.crop.cell);
   selClear();
   S.crop.selectBox = null;
+  hideCropHoverTip();  // the hovered mark may have vanished; next pointermove re-tests
   redrawCrop();
 }
 function closeCrop(save) {
@@ -1345,6 +1346,7 @@ function closeCrop(save) {
   closeNavDialog('cancel');  // never leave the nav prompt up over a closed modal
   S.crop = null;
   drawCropOverlay();   // wipe the vector overlay so nothing is stale on reopen
+  hideCropHoverTip();  // never leave a hover name up over a closed/reopened crop
   $('crop-modal').hidden = true;
 }
 // ---- selection helpers (S.crop.selected = {points:Set<idx>, lines:Set<idx>}) ----
@@ -1465,14 +1467,14 @@ function drawCropOverlay() {
   if (S.crop.others && (S.crop.others.points.length || S.crop.others.lines.length)) {
     ctx.save();
     ctx.strokeStyle = '#ff9500'; ctx.fillStyle = '#ff9500'; ctx.lineWidth = 2; ctx.globalAlpha = 0.95;
-    for (const ln of S.crop.others.lines) {
+    for (const { pts: ln } of S.crop.others.lines) {
       if (ln.length < 1) continue;
       ctx.beginPath();
       ln.forEach(([c, r], i) => { if (i === 0) ctx.moveTo(SX(c), SY(r)); else ctx.lineTo(SX(c), SY(r)); });
       ctx.stroke();
       for (const [c, r] of ln) { ctx.beginPath(); ctx.arc(SX(c), SY(r), 2.5, 0, 2 * Math.PI); ctx.fill(); }
     }
-    for (const [c, r] of S.crop.others.points) { ctx.beginPath(); ctx.arc(SX(c), SY(r), 4, 0, 2 * Math.PI); ctx.fill(); }
+    for (const { px: [c, r] } of S.crop.others.points) { ctx.beginPath(); ctx.arc(SX(c), SY(r), 4, 0, 2 * Math.PI); ctx.fill(); }
     ctx.restore();
   }
   // my marks (lime); selected ones get a magenta halo
@@ -1546,6 +1548,27 @@ function hitTestOwn([col, row]) {
   }
   return null;
 }
+// ---- hover tooltip: who labeled an OTHER user's mark (crop popup only) ----
+// Display-only: others' marks stay exactly as non-interactive as before for
+// clicks/selection, and my own (lime) marks deliberately show no tooltip.
+function hideCropHoverTip() {
+  const tip = $('crop-hover-tip');
+  if (tip && !tip.hidden) tip.hidden = true;
+}
+// (sx, sy) = cursor position in stage-relative CSS px
+function showCropHoverTip(name, sx, sy) {
+  const tip = $('crop-hover-tip'), stage = $('crop-stage');
+  if (!tip || !stage) return;
+  tip.textContent = name;
+  tip.hidden = false;
+  // near the cursor with a small offset, clamped inside the stage bounds
+  // (measure only after the text is set — the width depends on the name)
+  const pad = 4, off = 14;
+  const left = Math.min(sx + off, stage.clientWidth - tip.offsetWidth - pad);
+  const top = Math.min(sy + off, stage.clientHeight - tip.offsetHeight - pad);
+  tip.style.left = Math.max(pad, left) + 'px';
+  tip.style.top = Math.max(pad, top) + 'px';
+}
 function finishInProgressLine() {
   // provenance: the line is stamped with the toggle state at COMPLETION time
   // (dblclick/Enter/mode-switch/commit flush), one `ac` flag per line.
@@ -1571,6 +1594,7 @@ function setupCropInteractions() {
     if (e.button === 1 || e.button === 2 || (e.button === 0 && e.target === stage)) {
       if (e.button === 1) e.preventDefault();
       panning = true; lastX = e.clientX; lastY = e.clientY;
+      hideCropHoverTip();   // a pan is starting
     }
   });
   canvas.addEventListener('mousedown', (e) => {
@@ -1580,6 +1604,7 @@ function setupCropInteractions() {
     pressPx = canvasEventToPx(e);
     pressAdditive = e.shiftKey || e.ctrlKey || e.metaKey;
     S.crop.selectBox = null;
+    hideCropHoverTip();   // a click/box-select press is starting
   });
   window.addEventListener('mousemove', (e) => {
     if (!S.crop) return;
@@ -1629,7 +1654,33 @@ function setupCropInteractions() {
     S.crop.view.x = mx - (mx - S.crop.view.x) * (ns / S.crop.view.scale);
     S.crop.view.y = my - (my - S.crop.view.y) * (ns / S.crop.view.scale);
     S.crop.view.scale = ns; applyCropTransform();
+    hideCropHoverTip();   // marks moved under the cursor; next pointermove re-tests
   }, { passive: false });
+
+  // ---- hover on an OTHER labeler's mark shows who made it (crop popup only) ----
+  // Screen-space convention mirrors hitTestOwn exactly: cursor -> image px via
+  // canvasEventToPx (the canvas rect already reflects the CSS transform), and
+  // the constant SCREEN-px tolerance divided by the view scale into image px.
+  // A linear scan over the crop's few hundred marks per pointermove is cheap;
+  // bail first while any gesture is active (pan / press drag / polyline draw).
+  stage.addEventListener('pointermove', (e) => {
+    if (!S.crop) { hideCropHoverTip(); return; }
+    if (panning || pressActive || S.crop.inProgress.length) { hideCropHoverTip(); return; }
+    const [col, row] = canvasEventToPx(e);
+    const tol = CROP_MARK_TOL_SCREEN_PX / Math.max(0.01, S.crop.view.scale);
+    const hit = nearestMark(
+      S.crop.others.points.map((p) => p.px),
+      S.crop.others.lines.map((l) => l.pts),
+      col, row, tol,
+    );
+    const who = hit && (hit.kind === 'point'
+      ? S.crop.others.points[hit.idx]
+      : S.crop.others.lines[hit.idx]).labeler;
+    if (!who) { hideCropHoverTip(); return; }
+    const rect = stage.getBoundingClientRect();
+    showCropHoverTip(who, e.clientX - rect.left, e.clientY - rect.top);
+  });
+  stage.addEventListener('pointerleave', hideCropHoverTip);
 
   canvas.addEventListener('dblclick', (e) => {
     if (!S.crop) return;
