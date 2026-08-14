@@ -209,6 +209,95 @@ export function canRestoreHistoryRow(row) {
 }
 
 /**
+ * Same-geometry test between two marks_history row copies (old_row/new_row
+ * jsonb objects). `geom` is AES ciphertext, but ciphertext equality is still a
+ * faithful one-way signal: identical bytes => identical geometry (rows are
+ * copied verbatim through snapshots/restores, never re-encrypted), while a
+ * genuinely-moved mark always re-encrypts to different bytes. `kind` is
+ * compared too so a defensive kind flip never reads as "no change".
+ */
+function _sameRowGeom(a, b) {
+  return !!(a && b && a.geom != null && a.geom === b.geom && a.kind === b.kind);
+}
+
+/**
+ * Collapse a mark's rpc_mark_history rows for display.
+ *
+ * rpc_restore_snapshot deletes + re-inserts EVERY scoped mark, so each
+ * restore gives a mark a DELETE+INSERT pair with identical changed_at and
+ * via='snapshot_restore'. Shown raw (newest-first), that pair reads as
+ * "insert then delete" — alarming for marks the restore didn't even change.
+ * This collapses each such pair into ONE synthetic entry.
+ *
+ * Returns display entries, newest-first (within identical timestamps: hid
+ * DESCENDING = reverse transaction order, so even uncollapsed same-instant
+ * rows read in true reverse-chronological order). Each entry is either
+ *   {kind:'entry', row}                                — a plain history row
+ *   {kind:'restore', hid, changed_at, actor, noChange, delRow, insRow}
+ * where hid/delRow are the DELETE side — its old_row is the PRE-restore
+ * version, i.e. what "Restore" should bring back — and noChange means the
+ * restore left the mark's geometry untouched (Restore button disabled).
+ *
+ * Pairing requires BOTH sides (same changed_at string, via='snapshot_restore',
+ * one DELETE + one INSERT). Asymmetric leftovers — e.g. a mark created after
+ * the snapshot gets only a DELETE from the restore, one deleted after the
+ * snapshot gets only an INSERT — are NOT collapsed and pass through as plain
+ * entries.
+ * @param {Array<{hid:number, op:string, changed_at:string, actor?:string,
+ *                via?:string|null, old_row?:object|null, new_row?:object|null}>} rows
+ * @returns {Array<object>}
+ */
+export function collapseHistoryRows(rows) {
+  const list = (rows || []).filter((r) => r && typeof r === 'object').slice();
+  list.sort((a, b) => {
+    const ta = Date.parse(a.changed_at || '');
+    const tb = Date.parse(b.changed_at || '');
+    // Date.parse drops sub-ms precision; exact-equal parses (incl. both NaN)
+    // fall through to hid, which IS transaction order at full precision.
+    if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return tb - ta;
+    return (b.hid || 0) - (a.hid || 0);
+  });
+  const out = [];
+  for (let i = 0; i < list.length; i++) {
+    const ins = list[i];
+    const del = list[i + 1];
+    if (del
+        && ins.via === 'snapshot_restore' && del.via === 'snapshot_restore'
+        && ins.op === 'INSERT' && del.op === 'DELETE'
+        && ins.changed_at != null && ins.changed_at === del.changed_at) {
+      out.push({
+        kind: 'restore',
+        hid: del.hid,
+        changed_at: del.changed_at,
+        actor: del.actor || ins.actor || '',
+        noChange: _sameRowGeom(del.old_row, ins.new_row),
+        delRow: del,
+        insRow: ins,
+      });
+      i++; // the DELETE side is consumed by the pair
+      continue;
+    }
+    out.push({ kind: 'entry', row: ins });
+  }
+  return out;
+}
+
+/**
+ * Display label for an UNCOLLAPSED history row. Version restores read as a
+ * restore ("↺ version restore"); an asymmetric snapshot-restore leftover keeps
+ * its op but says where it came from; everything else ('edit' / NULL / legacy)
+ * keeps the plain op label.
+ * @param {{op?:string, via?:string|null}|null|undefined} row
+ * @returns {string}
+ */
+export function historyOpLabel(row) {
+  const op = (row && row.op) || '?';
+  if (row && row.via === 'version_restore') return '↺ version restore';
+  if (row && row.via === 'snapshot_restore') return `${op} (snapshot restore)`;
+  return op;
+}
+
+/**
  * 7-char git-style display form of a stored full-length hash. Empty string
  * for anything that isn't a string (missing hash on a pre-migration row).
  * @param {string|null|undefined} h

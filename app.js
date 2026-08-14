@@ -20,7 +20,7 @@ import {
 } from './sync.js';
 import {
   attribution, othersDeleteIds, pruneOthers, dropPoolMarksByDbId, cropDirtyState,
-  historyButtonState, canRestoreHistoryRow,
+  historyButtonState, canRestoreHistoryRow, collapseHistoryRows, historyOpLabel,
   mergePendingMove, dropMovesForIds, applyPendingMoves, patchPoolMarksByDbId,
   shortHash, snapshotDupBadges,
 } from './suedit.js';
@@ -846,7 +846,9 @@ async function histReload() {
     list.appendChild(em);
     return;
   }
-  for (const r of rows) {
+  // snapshot-restore DELETE+INSERT churn pairs collapse into one "↺ snapshot
+  // restore" entry; ordering stays newest-first (suedit.js collapseHistoryRows)
+  for (const en of collapseHistoryRows(rows)) {
     const row = document.createElement('div');
     row.className = 'hist-row';
     const cellEl = (cls, text) => {
@@ -855,18 +857,35 @@ async function histReload() {
       sp.textContent = text;
       row.appendChild(sp);
     };
-    cellEl('hist-op hist-op-' + String(r.op || '').toLowerCase(), r.op || '?');
-    cellEl('hist-when', fmtWhen(r.changed_at));
-    cellEl('hist-actor', r.actor || '');
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.textContent = 'Restore this version';
-    if (canRestoreHistoryRow(r)) {
-      btn.addEventListener('click', () => histRestore(r));
+    if (en.kind === 'restore') {
+      cellEl('hist-op hist-op-restore', '↺ snapshot restore');
+      cellEl('hist-when', fmtWhen(en.changed_at));
+      cellEl('hist-actor', en.actor || '');
+      if (en.noChange) {
+        // the restore left this mark's geometry untouched — nothing to undo
+        btn.disabled = true;
+        btn.title = 'no change — this restore left the mark as it was';
+      } else {
+        // the DELETE side's old_row IS the pre-restore version
+        btn.addEventListener('click', () => histRestore(en.delRow));
+      }
     } else {
-      // INSERT entries have no old_row — nothing to roll back to
-      btn.disabled = true;
-      btn.title = 'an INSERT has no previous version';
+      const r = en.row;
+      const restoreLike = r.via === 'version_restore' || r.via === 'snapshot_restore';
+      cellEl('hist-op ' + (restoreLike ? 'hist-op-restore'
+        : 'hist-op-' + String(r.op || '').toLowerCase()), historyOpLabel(r));
+      cellEl('hist-when', fmtWhen(r.changed_at));
+      cellEl('hist-actor', r.actor || '');
+      if (canRestoreHistoryRow(r)) {
+        btn.addEventListener('click', () => histRestore(r));
+      } else {
+        // INSERT entries have no old_row — nothing to roll back to
+        btn.disabled = true;
+        btn.title = 'an INSERT has no previous version';
+      }
     }
     row.appendChild(btn);
     list.appendChild(row);

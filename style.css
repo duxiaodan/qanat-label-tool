@@ -368,6 +368,8 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
 .hist-op-insert { color: #6bbf59; }
 .hist-op-update { color: #f6c453; }
 .hist-op-delete { color: #e0836f; }
+/* collapsed snapshot-restore pairs + version restores ("↺ …" labels) */
+.hist-op-restore { color: #7ec8e3; text-transform: none; }
 .hist-when { color: #b9c0cd; font-variant-numeric: tabular-nums; }
 .hist-actor { color: #8b93a3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hist-row button {
