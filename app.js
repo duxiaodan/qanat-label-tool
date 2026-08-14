@@ -10,7 +10,7 @@
 
 import { pixelToWorld, worldToPixel, nearestMark } from './geo.js';
 import { buildShaftsFeatureCollection, buildLinesFeatureCollection } from './geojson.js';
-import { deriveKey, decryptBlob, encryptBlob, verifyPasscode, openSuEnvelope } from './crypto.js';
+import { deriveKey, decryptBlob, encryptBlob, verifyPasscode, openSuEnvelope, deriveWriteToken } from './crypto.js';
 import { fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks } from './sync.js';
 import {
   cellPasses, filterIsActive, pruneSelection, labelerOrder,
@@ -39,6 +39,9 @@ const S = {
   meDisplay: '',        // as-typed display/export name
   su: false,            // superuser session — the SU passcode opened the gate via the
                         // su envelope (password-only role: any name + su passcode)
+  writeToken: null,     // sha256_hex('qanat-write-v1'||entered passcode) — auth for the
+                        // write RPCs; the token doubles as the role (x=normal, y=superuser).
+                        // MEMORY ONLY: never persisted to localStorage/sessionStorage.
   board: null,          // namespace per dataset (mirrors storageKey suffix)
   // per-session marks (each mark carries `labeler` owner + optional `dbId`)
   shaftMarks: [],       // {cropId, pPos, world:[x,y], created, labeler, dbId?}
@@ -453,6 +456,9 @@ async function unlock() {
     const ok = await verifyPasscode(cj, pw);
     if (!ok) { $('gate-msg').textContent = 'wrong passcode'; return; }
   }
+  // Write-RPC token from the passcode AS ENTERED (x -> normal, y -> superuser;
+  // the server decides the role by hashing the token again). In-memory only.
+  S.writeToken = backendOn() ? await deriveWriteToken(pw) : null;
   // identity: normalize for matching, remember the display name for suggestions.
   S.meDisplay = nameRaw.trim().replace(/\s+/g, ' ');
   S.me = normalize(S.meDisplay);
@@ -1894,8 +1900,10 @@ async function commitCrop() {
         if (m.dbId != null && existingIds.has(m.dbId)) continue; // untouched — leave its row alone
         inserts.push({ mark: m, row: { kind: m.kind, geom: await encryptGeom(m.world), ...rowProv, autocontrast: m.autocontrast, created_at: m.created || undefined } });
       }
-      await deleteMarksByIds(SUPABASE, S.board, S.me, cell.id, toDelete, S.project);
-      const inserted = await insertMarks(SUPABASE, S.board, S.me, cell.id, inserts.map((x) => x.row), S.project);
+      // writes go through the token-gated RPCs; actor = the gate name.
+      const auth = { token: S.writeToken, actor: S.me };
+      await deleteMarksByIds(SUPABASE, S.board, S.me, cell.id, toDelete, S.project, auth);
+      const inserted = await insertMarks(SUPABASE, S.board, S.me, cell.id, inserts.map((x) => x.row), S.project, auth);
       // tag freshly-inserted marks with their dbId (so the next save skips them)
       // and their server-stamped created_at (so any future re-insert echoes it).
       // Match by geom ciphertext — unique per row (AES-GCM random IV) and stable
@@ -1909,9 +1917,12 @@ async function commitCrop() {
       S.unsynced = false;
       setSyncStatus('saved', 'ok');
     } catch (e) {
-      // keep local, flag unsynced, retry on next save/refresh.
+      // keep local, flag unsynced, retry on next save/refresh. Surface the
+      // server's rejection reason (e.g. "invalid write token") — a rejected
+      // write must read clearly, not silently look like a network blip.
       S.unsynced = true;
-      setSyncStatus('unsynced — kept locally', 'unsynced');
+      const why = e && e.rpcMessage ? ` (${e.rpcMessage})` : '';
+      setSyncStatus(`unsynced — kept locally${why}`, 'unsynced');
     }
   }
   persist();

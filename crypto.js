@@ -130,6 +130,23 @@ export async function verifyPasscode(cryptoJson, passcode) {
 }
 
 /**
+ * Derive the write-RPC token from the passcode the user entered at the gate:
+ *   token = sha256_hex('qanat-write-v1' || passcode)   (lowercase hex)
+ * The server hashes this token AGAIN and matches it against write_auth, so the
+ * role (normal vs superuser) is decided by WHICH passcode was entered — the
+ * token doubles as the role. Keep it in memory only; never persist it.
+ * @param {string} passcode
+ * @returns {Promise<string>} 64-char lowercase hex
+ */
+export async function deriveWriteToken(passcode) {
+  const digest = await _subtle().digest('SHA-256', enc.encode('qanat-write-v1' + passcode));
+  const u8 = new Uint8Array(digest);
+  let s = '';
+  for (let i = 0; i < u8.length; i++) s += u8[i].toString(16).padStart(2, '0');
+  return s;
+}
+
+/**
  * Try to open a superuser envelope (build_su_envelope in
  * build_label_tool_site.py): AES-256-GCM blob whose key derives from the
  * SUPERUSER passcode and whose payload carries the NORMAL site passcode.

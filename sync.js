@@ -4,6 +4,18 @@
 // see everyone's progress. Geometry stays encrypted: callers pass/receive the
 // already-base64'd AES ciphertext in `geom` — crypto lives in app.js, never here.
 //
+// READS go straight to PostgREST (`anon` keeps SELECT on public.marks).
+// WRITES all go through token-gated security-definer RPCs — anon lost
+// INSERT/UPDATE/DELETE on the table (sql/02_write_rpcs.sql):
+//   POST /rest/v1/rpc/rpc_insert_marks   {token, actor, rows}    -> inserted rows
+//   POST /rest/v1/rpc/rpc_delete_marks   {token, actor, ids}     -> count deleted
+//   POST /rest/v1/rpc/rpc_update_mark    {token, actor, mark_id, patch} -> row
+// `auth` = {token, actor}: token = sha256_hex('qanat-write-v1'||passcode)
+// (deriveWriteToken in crypto.js — computed once at unlock, memory only; which
+// passcode was typed decides the role server-side), actor = the gate name.
+// Ownership is enforced SERVER-side: a normal token may only touch rows whose
+// labeler equals actor; cross-labeler writes need the superuser token.
+//
 // Every function is a clean no-op / throw when `cfg` is falsy, so app.js can
 // branch on "no backend configured" and fall back to localStorage-only.
 //
@@ -27,9 +39,35 @@ async function _check(r, what) {
   if (!r.ok) {
     let body = '';
     try { body = await r.text(); } catch (e) { /* ignore */ }
-    throw new Error(`supabase ${what} -> ${r.status} ${body}`.trim());
+    // PostgREST errors are JSON {code, message, ...} — surface `message` so a
+    // rejected write (e.g. "invalid write token") reads clearly in the UI.
+    let msg = body;
+    try { const j = JSON.parse(body); if (j && j.message) msg = j.message; } catch (e) { /* not JSON */ }
+    const err = new Error(`supabase ${what} -> ${r.status} ${msg}`.trim());
+    err.status = r.status;
+    err.rpcMessage = typeof msg === 'string' ? msg : '';
+    throw err;
   }
   return r;
+}
+
+/** POST /rest/v1/rpc/<fn> with the anon apikey; returns the parsed JSON body. */
+async function _rpc(cfg, fn, args) {
+  const r = await fetch(`${_base(cfg)}/rest/v1/rpc/${fn}`, {
+    method: 'POST',
+    headers: _headers(cfg),
+    body: JSON.stringify(args),
+  });
+  await _check(r, fn);
+  return r.json();
+}
+
+/** Validate the {token, actor} pair every write needs; throws early with a
+ * clearer message than the server's "write token required". */
+function _auth(auth) {
+  if (!auth || !auth.token) throw new Error('no write token (locked site?)');
+  if (!auth.actor) throw new Error('no actor for write');
+  return auth;
 }
 
 /** Page size for fetchAllMarks. Supabase caps every REST response at its
@@ -67,12 +105,13 @@ export async function fetchAllMarks(cfg, board, project) {
 const PROVENANCE_ROW_FIELDS = [
   'world_bbox', 'crs', 'crop_px', 'tifs', 'crop_sha256', 'build_id', 'p_pos', 'autocontrast',
   // created_at: echoed back on re-saves so a re-inserted mark keeps its
-  // first-save server timestamp; left undefined on new marks → DB default now().
+  // first-save server timestamp; left undefined on new marks → the RPC's
+  // coalesce(created_at, now()) applies.
   'created_at',
 ];
 
 /** The `(board, project, labeler, cell_id)` scope filter shared by the
- * cell-level calls. `project` is part of the scope so that saving a crop in
+ * cell-level READS. `project` is part of the scope so that saving a crop in
  * one project can never delete or reconcile away the same user's rows for the
  * same crop in ANOTHER project. */
 function _cellScope(board, labeler, cellId, project) {
@@ -97,36 +136,40 @@ export async function fetchMyCellMarks(cfg, board, labeler, cellId, project) {
 }
 
 /**
- * DELETE specific rows by id, still scoped to (board, labeler, cell_id) as a
- * belt-and-braces guard so a buggy id list can never touch another labeler's
- * (or cell's) rows. No-op on an empty id list.
+ * Delete specific rows by id via rpc_delete_marks. The old direct-table DELETE
+ * carried a (board, labeler, cell_id) filter as a belt-and-braces guard; the
+ * RPC deletes by id only, but ownership is now enforced server-side — a normal
+ * token cannot delete another labeler's rows no matter what ids it sends (the
+ * ids themselves still come from the scoped fetchMyCellMarks). No-op on an
+ * empty id list.
  * @param {Array<number>} ids
+ * @param {{token:string, actor:string}} auth
+ * @returns {Promise<number|null>} rows deleted (null on empty no-op)
  */
-export async function deleteMarksByIds(cfg, board, labeler, cellId, ids, project) {
+export async function deleteMarksByIds(cfg, board, labeler, cellId, ids, project, auth) {
   if (!cfg) throw new Error('no supabase config');
   if (!ids || ids.length === 0) return null;
-  const q = `${_cellScope(board, labeler, cellId, project)}&id=in.(${ids.map(Number).join(',')})`;
-  const url = `${_base(cfg)}/rest/v1/marks?${q}`;
-  const r = await fetch(url, { method: 'DELETE', headers: _headers(cfg) });
-  await _check(r, 'deleteMarksByIds');
-  return r;
+  const { token, actor } = _auth(auth);
+  const n = await _rpc(cfg, 'rpc_delete_marks', { token, actor, ids: ids.map(Number) });
+  return typeof n === 'number' ? n : Number(n);
 }
 
 /**
- * POST new encrypted rows for one (board, labeler, cell_id). Each row should be
- * `{kind, geom}` (+ optional PROVENANCE_ROW_FIELDS, passed through verbatim —
- * dumb pass-through, no crypto here); board/labeler/cell_id are filled in.
+ * Insert new encrypted rows for one (board, labeler, cell_id) via
+ * rpc_insert_marks. Each row should be `{kind, geom}` (+ optional
+ * PROVENANCE_ROW_FIELDS, passed through verbatim — dumb pass-through, no
+ * crypto here); board/project/labeler/cell_id are filled in.
  *
- * PostgREST bulk inserts reject arrays whose objects have differing key sets
- * (PGRST102 "All object keys must match", and this deployment lacks
- * `missing=default`). Rows legitimately differ: re-inserted marks echo their
- * created_at while new marks omit it so the DB default now() applies. So
- * POST one request per distinct key signature.
+ * One POST for ALL rows: the RPC takes a jsonb array, so the old PostgREST
+ * PGRST102 "all object keys must match" constraint (which forced one POST per
+ * key signature) no longer applies — rows with and without created_at ride in
+ * the same request, and the server's coalesce(created_at, now()) fills gaps.
  *
  * @param {Array<{kind:string, geom:string}>} rows
- * @returns {Promise<Array<object>>} the inserted rows (PostgREST `return=representation`)
+ * @param {{token:string, actor:string}} auth
+ * @returns {Promise<Array<object>>} the inserted rows (the RPC returns setof marks)
  */
-export async function insertMarks(cfg, board, labeler, cellId, rows, project) {
+export async function insertMarks(cfg, board, labeler, cellId, rows, project, auth) {
   if (!cfg) throw new Error('no supabase config');
   const payload = (rows || []).map((row) => {
     const out = { board, project, labeler, cell_id: cellId, kind: row.kind, geom: row.geom };
@@ -134,36 +177,38 @@ export async function insertMarks(cfg, board, labeler, cellId, rows, project) {
     return out;
   });
   if (payload.length === 0) return [];
-  const groups = new Map();
-  for (const row of payload) {
-    const sig = Object.keys(row).sort().join(',');
-    if (!groups.has(sig)) groups.set(sig, []);
-    groups.get(sig).push(row);
-  }
-  const url = `${_base(cfg)}/rest/v1/marks`;
-  const inserted = [];
-  for (const rows_ of groups.values()) {
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: { ..._headers(cfg), Prefer: 'return=representation' },
-      body: JSON.stringify(rows_),
-    });
-    await _check(r, 'insertMarks');
-    inserted.push(...await r.json());
-  }
-  return inserted;
+  const { token, actor } = _auth(auth);
+  const inserted = await _rpc(cfg, 'rpc_insert_marks', { token, actor, rows: payload });
+  return Array.isArray(inserted) ? inserted : [];
 }
 
 /**
- * DELETE ALL my rows for (board, labeler, cell_id). Not used by the normal
- * save path (which reconciles per row — see app.js commitCrop); kept as a
- * utility for admin/cleanup use.
- * @param {{url:string, anonKey:string}|null|undefined} cfg
+ * Patch one mark row via rpc_update_mark. `patch` is a plain object of mutable
+ * marks columns (kind, geom, provenance, …). A normal token may only update
+ * rows whose labeler = actor; a superuser token may cross labelers (the server
+ * then stamps `edited_by = actor` on the row).
+ * @param {number} markId
+ * @param {object} patch
+ * @param {{token:string, actor:string}} auth
+ * @returns {Promise<object>} the updated row
  */
-export async function deleteMyCellMarks(cfg, board, labeler, cellId) {
+export async function updateMark(cfg, markId, patch, auth) {
   if (!cfg) throw new Error('no supabase config');
-  const url = `${_base(cfg)}/rest/v1/marks?${_cellScope(board, labeler, cellId)}`;
-  const r = await fetch(url, { method: 'DELETE', headers: _headers(cfg) });
-  await _check(r, 'deleteMyCellMarks');
-  return r;
+  const { token, actor } = _auth(auth);
+  return _rpc(cfg, 'rpc_update_mark', { token, actor, mark_id: Number(markId), patch: patch || {} });
+}
+
+/**
+ * Delete ALL my rows for (board, labeler, cell_id). Not used by the normal
+ * save path (which reconciles per row — see app.js commitCrop); kept as a
+ * utility for admin/cleanup use. Now RPC-backed: reads the scoped ids first,
+ * then deletes them via rpc_delete_marks.
+ * @param {{url:string, anonKey:string}|null|undefined} cfg
+ * @param {{token:string, actor:string}} auth
+ * @returns {Promise<number|null>} rows deleted (null when the cell had none)
+ */
+export async function deleteMyCellMarks(cfg, board, labeler, cellId, project, auth) {
+  if (!cfg) throw new Error('no supabase config');
+  const existing = await fetchMyCellMarks(cfg, board, labeler, cellId, project);
+  return deleteMarksByIds(cfg, board, labeler, cellId, existing.map((r) => r.id), project, auth);
 }
