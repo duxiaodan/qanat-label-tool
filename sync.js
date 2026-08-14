@@ -248,8 +248,10 @@ export async function restoreSnapshot(cfg, snapshotId, auth) {
 
 /**
  * One mark's full audit trail via rpc_mark_history (superuser-only): jsonb
- * array of {hid, op, changed_at, actor, old_row, new_row}, newest first.
- * old_row/new_row are full marks rows (geom still ciphertext).
+ * array of {hid, op, changed_at, actor, via, old_row, new_row}, newest first.
+ * old_row/new_row are full marks rows (geom still ciphertext); `via` is the
+ * write path that produced the entry ('edit' | 'snapshot_restore' |
+ * 'version_restore' | null for direct/legacy writes — sql/05_history_via.sql).
  * @param {number} markId
  * @param {{token:string, actor:string}} auth (actor unused by this RPC)
  * @returns {Promise<Array<object>>}
