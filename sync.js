@@ -247,6 +247,35 @@ export async function restoreSnapshot(cfg, snapshotId, auth) {
 }
 
 /**
+ * One mark's full audit trail via rpc_mark_history (superuser-only): jsonb
+ * array of {hid, op, changed_at, actor, old_row, new_row}, newest first.
+ * old_row/new_row are full marks rows (geom still ciphertext).
+ * @param {number} markId
+ * @param {{token:string, actor:string}} auth (actor unused by this RPC)
+ * @returns {Promise<Array<object>>}
+ */
+export async function fetchMarkHistory(cfg, markId, auth) {
+  if (!cfg) throw new Error('no supabase config');
+  const { token } = _auth(auth);
+  const out = await _rpc(cfg, 'rpc_mark_history', { token, mark_id: Number(markId) });
+  return Array.isArray(out) ? out : [];
+}
+
+/**
+ * Roll one mark back to a history entry's old_row via rpc_restore_mark_version
+ * (superuser-only). Updates in place, or re-inserts with the original id if
+ * the mark was deleted; INSERT entries (old_row null) are rejected server-side.
+ * @param {number} hid  the history entry id
+ * @param {{token:string, actor:string}} auth
+ * @returns {Promise<object>} the restored marks row
+ */
+export async function restoreMarkVersion(cfg, hid, auth) {
+  if (!cfg) throw new Error('no supabase config');
+  const { token, actor } = _auth(auth);
+  return _rpc(cfg, 'rpc_restore_mark_version', { token, actor, hid: Number(hid) });
+}
+
+/**
  * Delete ALL my rows for (board, labeler, cell_id). Not used by the normal
  * save path (which reconciles per row — see app.js commitCrop); kept as a
  * utility for admin/cleanup use. Now RPC-backed: reads the scoped ids first,

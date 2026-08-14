@@ -14,9 +14,11 @@ import { deriveKey, decryptBlob, encryptBlob, verifyPasscode, openSuEnvelope, de
 import {
   fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks,
   createSnapshot, listSnapshots, restoreSnapshot,
+  fetchMarkHistory, restoreMarkVersion,
 } from './sync.js';
 import {
   attribution, othersDeleteIds, pruneOthers, dropPoolMarksByDbId, cropDirtyState,
+  singleSelectionDbId, canRestoreHistoryRow,
 } from './suedit.js';
 import {
   cellPasses, filterIsActive, pruneSelection, labelerOrder,
@@ -577,6 +579,27 @@ function setupSuperuserUI() {
     $('btn-refresh').insertAdjacentElement('beforebegin', b);
     b.addEventListener('click', snapOpen);
   }
+  // History… button in the crop-modal toolbar (backend-only: history lives in
+  // the DB). Enabled ONLY with "Edit others" on and exactly one selected mark
+  // that has a db row (see updateHistoryButton).
+  if (backendOn() && !document.getElementById('crop-history')) {
+    const h = document.createElement('button');
+    h.id = 'crop-history';
+    h.type = 'button';
+    h.textContent = 'History…';
+    h.disabled = true;
+    h.title = 'Edit others + select exactly one saved mark';
+    $('crop-undo').insertAdjacentElement('beforebegin', h);
+    h.addEventListener('click', histOpen);
+  }
+}
+/** Enablement for #crop-history: Edit others ON + a single selected mark with
+ *  a db id (own or others'). Safe to call any time (no-op without the button). */
+function updateHistoryButton() {
+  const h = document.getElementById('crop-history');
+  if (!h) return;
+  h.disabled = !(suEditOn() && S.crop
+    && singleSelectionDbId(S.crop.selected, S.crop.marks, S.crop.others) != null);
 }
 function applySuEditCue() {
   const on = suEditOn();
@@ -591,6 +614,7 @@ function applySuEditCue() {
     S.crop.selected.oLines.clear();
     redrawCrop();
   }
+  updateHistoryButton(); // enablement depends on the toggle, not just selection
 }
 
 // --------------------------------------------------------------------------- //
@@ -719,6 +743,106 @@ function setupSnapshotsDialog() {
     if ($('snap-modal').hidden) return;
     if (e.key === 'Escape') { e.preventDefault(); snapClose(); }
   });
+}
+
+// --------------------------------------------------------------------------- //
+// per-mark history + rollback (superuser only, crop view) — a compact panel
+// over the crop stage listing rpc_mark_history rows (op · when · actor) with a
+// "Restore this version" per entry (rpc_restore_mark_version). Deliberately
+// minimal: no diff rendering — old_row/new_row geometry is ciphertext anyway.
+// --------------------------------------------------------------------------- //
+let _histMarkId = null;   // the mark whose trail the open panel shows
+let _histBusy = false;    // one restore at a time
+
+function histSetMsg(msg, isErr) {
+  const el = $('hist-msg');
+  if (!el) return;
+  el.hidden = !msg;
+  el.textContent = msg || '';
+  el.classList.toggle('hist-msg-err', !!isErr);
+}
+async function histOpen() {
+  if (!S.su || !backendOn() || !S.crop) return;
+  const id = singleSelectionDbId(S.crop.selected, S.crop.marks, S.crop.others);
+  if (id == null) return;
+  _histMarkId = id;
+  $('hist-title').textContent = `Mark history — row #${id}`;
+  histSetMsg('');
+  $('hist-panel').hidden = false;
+  await histReload();
+}
+function histClose() {
+  $('hist-panel').hidden = true;
+  _histMarkId = null;
+}
+async function histReload() {
+  if (_histMarkId == null) return;
+  const list = $('hist-list');
+  list.textContent = 'loading…';
+  let rows;
+  try { rows = await fetchMarkHistory(SUPABASE, _histMarkId, suAuth()); }
+  catch (e) {
+    list.textContent = '';
+    histSetMsg('could not load history: ' + (e.rpcMessage || e.message), true);
+    return;
+  }
+  list.innerHTML = '';
+  if (!rows.length) {
+    const em = document.createElement('div');
+    em.className = 'hist-empty';
+    em.textContent = 'no history for this mark (it predates the audit trail)';
+    list.appendChild(em);
+    return;
+  }
+  for (const r of rows) {
+    const row = document.createElement('div');
+    row.className = 'hist-row';
+    const cellEl = (cls, text) => {
+      const sp = document.createElement('span');
+      sp.className = cls;
+      sp.textContent = text;
+      row.appendChild(sp);
+    };
+    cellEl('hist-op hist-op-' + String(r.op || '').toLowerCase(), r.op || '?');
+    cellEl('hist-when', fmtWhen(r.changed_at));
+    cellEl('hist-actor', r.actor || '');
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = 'Restore this version';
+    if (canRestoreHistoryRow(r)) {
+      btn.addEventListener('click', () => histRestore(r));
+    } else {
+      // INSERT entries have no old_row — nothing to roll back to
+      btn.disabled = true;
+      btn.title = 'an INSERT has no previous version';
+    }
+    row.appendChild(btn);
+    list.appendChild(row);
+  }
+}
+async function histRestore(r) {
+  if (_histBusy || _histMarkId == null) return;
+  _histBusy = true;
+  histSetMsg('restoring…');
+  try {
+    await restoreMarkVersion(SUPABASE, r.hid, suAuth());
+    histSetMsg(`restored the version before ${fmtWhen(r.changed_at)} (entry #${r.hid})`);
+    // re-pull the pool so the crop (and swath) show the restored geometry;
+    // refreshMarks -> reloadCropMarks clears the selection, and the trail
+    // itself just grew by one UPDATE entry — reload it too.
+    await refreshMarks();
+    await histReload();
+  } catch (e) {
+    histSetMsg('restore failed: ' + (e.rpcMessage || e.message), true);
+  } finally {
+    _histBusy = false;
+  }
+}
+function setupHistoryPanel() {
+  const panel = $('hist-panel');
+  if (!panel) return;
+  panel.addEventListener('click', (e) => { if (e.target === panel) histClose(); });
+  $('hist-close').addEventListener('click', histClose);
 }
 
 // --------------------------------------------------------------------------- //
@@ -1586,6 +1710,7 @@ function reloadCropMarks() {
 function closeCrop(save) {
   if (S.crop && save) commitCrop();
   closeNavDialog('cancel');  // never leave the nav prompt up over a closed modal
+  histClose();               // …nor the history panel
   S.crop = null;
   drawCropOverlay();   // wipe the vector overlay so nothing is stale on reopen
   hideCropHoverTip();  // never leave a hover name up over a closed/reopened crop
@@ -1805,6 +1930,8 @@ function redrawCrop() {
   if (!S.crop) return;
   redrawCropImage();
   drawCropOverlay();
+  // every selection change funnels through here — keep History… in sync
+  updateHistoryButton();
 }
 function canvasEventToPx(e) {
   const canvas = $('crop-canvas');
@@ -2061,6 +2188,12 @@ function setupCropInteractions() {
     // duties stand down.
     if (!$('dl-modal').hidden) return;
     if (!$('snap-modal').hidden) return;
+    // the history panel owns the keyboard while open: Esc closes it, every
+    // other crop key (arrows, Delete, …) stands down.
+    if (!$('hist-panel').hidden) {
+      if (e.key === 'Escape') { e.preventDefault(); histClose(); }
+      return;
+    }
     // the unsaved-changes prompt is modal: Esc cancels it, everything else
     // (including the arrow keys and Esc's normal duties) is swallowed.
     if (S.navDialog) {
@@ -2486,6 +2619,7 @@ function boot() {
   $('btn-download').addEventListener('click', dlOpen);
   setupDownloadDialog();
   setupSnapshotsDialog(); // inert until a superuser session builds its opener
+  setupHistoryPanel();    // likewise
   $('btn-refresh').addEventListener('click', () => { refreshMarks(); });
   // GT-review wiring only exists when the URL opts in (?gtreview=1); in normal
   // mode no listener is attached and every review element stays [hidden].

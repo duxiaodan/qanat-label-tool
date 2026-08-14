@@ -69,6 +69,39 @@ export function dropPoolMarksByDbId(pool, ids) {
 }
 
 /**
+ * The db row id behind the crop's selection, IFF exactly one mark is selected
+ * (own or others') and that mark exists server-side. This is the enablement
+ * rule for the History… button: history is per-row, so a multi-selection or a
+ * never-saved mark (no dbId yet) has nothing to show.
+ * @param {{points:Set<number>, lines:Set<number>, oPoints:Set<number>, oLines:Set<number>}} sel
+ * @param {{points:Array, lines:Array}} marks   own marks ({dbId} entries)
+ * @param {{points:Array, lines:Array}} others  others' marks ({dbId} entries)
+ * @returns {number|null}
+ */
+export function singleSelectionDbId(sel, marks, others) {
+  if (!sel || !marks || !others) return null;
+  const picks = [];
+  for (const i of sel.points || []) picks.push(marks.points[i]);
+  for (const i of sel.lines || []) picks.push(marks.lines[i]);
+  for (const i of sel.oPoints || []) picks.push(others.points[i]);
+  for (const i of sel.oLines || []) picks.push(others.lines[i]);
+  if (picks.length !== 1 || !picks[0]) return null;
+  const id = picks[0].dbId;
+  return (typeof id === 'number' && Number.isFinite(id)) ? id : null;
+}
+
+/**
+ * Whether a rpc_mark_history entry can be rolled back to: only entries with an
+ * old_row (UPDATE / DELETE). INSERT entries have no previous version — the
+ * server rejects them, so the button is disabled client-side too.
+ * @param {{old_row?: object|null}} row
+ * @returns {boolean}
+ */
+export function canRestoreHistoryRow(row) {
+  return !!(row && row.old_row != null && typeof row.old_row === 'object');
+}
+
+/**
  * The crop-level dirty test, as one pure decision: unsaved own-mark edits, an
  * in-progress polyline, OR pending others-edits all make the crop dirty (and
  * therefore guarded by the 3-way save/discard/cancel prompt on nav/close).

@@ -319,6 +319,50 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
 .nav-confirm-btns button#crop-nav-save { background: #2a6df0; font-weight: 600; }
 .nav-confirm-btns button:hover { filter: brightness(1.2); }
 
+/* ---------- per-mark history panel (superuser only) ----------
+   Overlays the crop modal like .nav-confirm (same z-band; the two can't be
+   open together — the nav prompt only appears on nav/close, which the panel's
+   keyboard ownership blocks). Opener #crop-history exists only in superuser
+   sessions. */
+.hist-panel {
+  position: absolute; inset: 0; z-index: 58;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, .55);
+}
+.hist-box {
+  background: #232833; color: #e6e8ec; border: 1px solid #3a4152; border-radius: 8px;
+  padding: 16px 18px; width: min(560px, 92vw); max-height: 80vh; overflow-y: auto;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .55);
+}
+.hist-title { font-weight: 700; margin-bottom: 10px; }
+.hist-msg { font-size: 12px; color: #6bbf59; margin-bottom: 8px; line-height: 1.4; }
+.hist-msg.hist-msg-err { color: #e0836f; }
+.hist-list { border: 1px solid #2c313c; border-radius: 5px; font-size: 12px; }
+.hist-row {
+  display: grid; grid-template-columns: 62px 150px 1fr auto;
+  gap: 8px; align-items: center; padding: 6px 8px; border-bottom: 1px solid #2c313c;
+}
+.hist-row:last-child { border-bottom: none; }
+.hist-op { font-weight: 700; text-transform: uppercase; font-size: 11px; }
+.hist-op-insert { color: #6bbf59; }
+.hist-op-update { color: #f6c453; }
+.hist-op-delete { color: #e0836f; }
+.hist-when { color: #b9c0cd; font-variant-numeric: tabular-nums; }
+.hist-actor { color: #8b93a3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hist-row button {
+  padding: 4px 9px; border-radius: 5px; border: none; background: #333a48; color: #eee;
+  cursor: pointer; font-size: 11px; white-space: nowrap;
+}
+.hist-row button:hover:not(:disabled) { filter: brightness(1.2); }
+.hist-row button:disabled { opacity: .4; cursor: not-allowed; }
+.hist-empty { padding: 10px; color: #8b93a3; font-style: italic; }
+.hist-actions { display: flex; justify-content: flex-end; margin-top: 12px; }
+.hist-actions button {
+  padding: 6px 12px; border-radius: 5px; border: none; background: #333a48; color: #eee;
+  cursor: pointer; font-size: 12px;
+}
+.hist-actions button:hover { filter: brightness(1.2); }
+
 /* ---------- download dialog ----------
    Reuses `.modal` (fixed overlay, centred flex) but with its own small box —
    the crop modal's `.modal-box` is a full-height stage. z-index sits ABOVE the

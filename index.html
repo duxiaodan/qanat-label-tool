@@ -183,6 +183,26 @@
         </div>
       </div>
     </div>
+
+    <!-- per-mark history + rollback (SUPERUSER only). Inert for normal users:
+         its opener (#crop-history) is built at unlock only in superuser
+         sessions, and rpc_mark_history/rpc_restore_mark_version reject normal
+         tokens anyway. Overlays the crop stage like #crop-nav-confirm; while
+         open it owns the keyboard (Esc closes it — see the crop keydown). -->
+    <div id="hist-panel" class="hist-panel" hidden>
+      <div class="hist-box">
+        <div class="hist-title" id="hist-title">Mark history</div>
+        <div id="hist-msg" class="hist-msg" hidden></div>
+        <!-- rows from rpc_mark_history, newest first: op · changed_at · actor
+             + a "Restore this version" button (disabled on INSERT entries,
+             which have no previous version). No diff rendering — old_row/
+             new_row geometry is ciphertext anyway. -->
+        <div id="hist-list" class="hist-list"></div>
+        <div class="hist-actions">
+          <button id="hist-close" type="button">Close</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- download dialog: three INDEPENDENT axes (crops / marks by / created) that
