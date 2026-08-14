@@ -198,14 +198,16 @@ export function historyButtonState(s) {
 }
 
 /**
- * Whether a rpc_mark_history entry can be rolled back to: only entries with an
- * old_row (UPDATE / DELETE). INSERT entries have no previous version — the
- * server rejects them, so the button is disabled client-side too.
- * @param {{old_row?: object|null}} row
+ * Whether a rpc_mark_history entry is a restorable STATE. Under state
+ * semantics (sql/06) each entry represents the mark AFTER that operation, so
+ * only entries with a new_row (INSERT / UPDATE) are valid targets. DELETE
+ * entries have no post-state — the server rejects them ("restoring a deleted
+ * state — delete the mark instead"), so the button is disabled client-side too.
+ * @param {{new_row?: object|null}} row
  * @returns {boolean}
  */
 export function canRestoreHistoryRow(row) {
-  return !!(row && row.old_row != null && typeof row.old_row === 'object');
+  return !!(row && row.new_row != null && typeof row.new_row === 'object');
 }
 
 /**
@@ -234,9 +236,11 @@ function _sameRowGeom(a, b) {
  * rows read in true reverse-chronological order). Each entry is either
  *   {kind:'entry', row}                                — a plain history row
  *   {kind:'restore', hid, changed_at, actor, noChange, delRow, insRow}
- * where hid/delRow are the DELETE side — its old_row is the PRE-restore
- * version, i.e. what "Restore" should bring back — and noChange means the
- * restore left the mark's geometry untouched (Restore button disabled).
+ * where hid is the INSERT side — under state semantics the collapsed row
+ * represents the mark's state AFTER the snapshot restore, and the INSERT
+ * side's new_row IS that state, i.e. what "Restore" should bring back —
+ * and noChange means the restore left the mark's geometry untouched
+ * (Restore button disabled).
  *
  * Pairing requires BOTH sides (same changed_at string, via='snapshot_restore',
  * one DELETE + one INSERT). Asymmetric leftovers — e.g. a mark created after
@@ -267,7 +271,7 @@ export function collapseHistoryRows(rows) {
         && ins.changed_at != null && ins.changed_at === del.changed_at) {
       out.push({
         kind: 'restore',
-        hid: del.hid,
+        hid: ins.hid,
         changed_at: del.changed_at,
         actor: del.actor || ins.actor || '',
         noChange: _sameRowGeom(del.old_row, ins.new_row),
@@ -295,6 +299,39 @@ export function historyOpLabel(row) {
   if (row && row.via === 'version_restore') return '↺ version restore';
   if (row && row.via === 'snapshot_restore') return `${op} (snapshot restore)`;
   return op;
+}
+
+/**
+ * Per-row Restore button decision for the history panel, under STATE
+ * semantics: every displayed row is a state the mark has been in, and Restore
+ * returns the mark to that state.
+ *
+ *   * the NEWEST displayed row IS the current state -> disabled ("current");
+ *   * a collapsed snapshot-restore row restores the POST-restore state (the
+ *     INSERT side's new_row — `en.hid` is already wired to it by
+ *     collapseHistoryRows), disabled when the restore changed nothing;
+ *   * a DELETE row has no post-state -> disabled (an unpaired lone DELETE
+ *     from a snapshot restore falls under this rule too);
+ *   * INSERT / UPDATE rows are valid targets (an INSERT's new_row is the
+ *     mark's first state).
+ *
+ * @param {object|null|undefined} en   one collapseHistoryRows display entry
+ * @param {boolean} isNewest           is this the first (newest) entry?
+ * @returns {{enabled:boolean, hid:number|null, hint:string}}
+ */
+export function historyRestoreState(en, isNewest) {
+  const off = (hint) => ({ enabled: false, hid: null, hint });
+  if (!en) return off('');
+  if (isNewest) return off('current state — the mark is already here');
+  if (en.kind === 'restore') {
+    if (en.noChange) return off('no change — this restore left the mark as it was');
+    return { enabled: true, hid: en.hid, hint: 'return the mark to its state after this restore' };
+  }
+  const r = en.row;
+  if (!canRestoreHistoryRow(r)) {
+    return off('a DELETE has no state to restore — delete the mark instead');
+  }
+  return { enabled: true, hid: r.hid, hint: 'return the mark to its state after this operation' };
 }
 
 /**

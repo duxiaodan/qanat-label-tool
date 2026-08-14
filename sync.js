@@ -264,9 +264,12 @@ export async function fetchMarkHistory(cfg, markId, auth) {
 }
 
 /**
- * Roll one mark back to a history entry's old_row via rpc_restore_mark_version
- * (superuser-only). Updates in place, or re-inserts with the original id if
- * the mark was deleted; INSERT entries (old_row null) are rejected server-side.
+ * Return one mark to a history entry's STATE via rpc_restore_mark_version
+ * (superuser-only, state semantics — sql/06): applies the entry's new_row,
+ * i.e. the mark's state AFTER that operation. Updates in place, or re-inserts
+ * with the original id if the mark was deleted; DELETE entries (new_row null)
+ * are rejected server-side ("restoring a deleted state — delete the mark
+ * instead"); INSERT entries are valid targets.
  * @param {number} hid  the history entry id
  * @param {{token:string, actor:string}} auth
  * @returns {Promise<object>} the restored marks row

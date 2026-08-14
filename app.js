@@ -20,7 +20,7 @@ import {
 } from './sync.js';
 import {
   attribution, othersDeleteIds, pruneOthers, dropPoolMarksByDbId, cropDirtyState,
-  historyButtonState, canRestoreHistoryRow, collapseHistoryRows, historyOpLabel,
+  historyButtonState, collapseHistoryRows, historyOpLabel, historyRestoreState,
   mergePendingMove, dropMovesForIds, applyPendingMoves, patchPoolMarksByDbId,
   shortHash, snapshotDupBadges,
 } from './suedit.js';
@@ -799,8 +799,14 @@ function setupSnapshotsDialog() {
 // --------------------------------------------------------------------------- //
 // per-mark history + rollback (superuser only, crop view) — a compact panel
 // over the crop stage listing rpc_mark_history rows (op · when · actor) with a
-// "Restore this version" per entry (rpc_restore_mark_version). Deliberately
-// minimal: no diff rendering — old_row/new_row geometry is ciphertext anyway.
+// "Restore this version" per entry (rpc_restore_mark_version). STATE semantics
+// (git-log style, sql/06): each row is the mark's state AFTER that operation
+// and Restore returns the mark to that state — the newest row is the current
+// state (disabled, "current"), DELETE rows have no state to restore (disabled),
+// INSERT rows are valid targets. A restore is itself an audited write, so the
+// panel reload shows the restored state as the new (disabled) newest row — the
+// loop terminates visually. Deliberately minimal: no diff rendering —
+// old_row/new_row geometry is ciphertext anyway.
 // --------------------------------------------------------------------------- //
 let _histMarkId = null;   // the mark whose trail the open panel shows
 let _histBusy = false;    // one restore at a time
@@ -848,7 +854,8 @@ async function histReload() {
   }
   // snapshot-restore DELETE+INSERT churn pairs collapse into one "↺ snapshot
   // restore" entry; ordering stays newest-first (suedit.js collapseHistoryRows)
-  for (const en of collapseHistoryRows(rows)) {
+  const entries = collapseHistoryRows(rows);
+  entries.forEach((en, i) => {
     const row = document.createElement('div');
     row.className = 'hist-row';
     const cellEl = (cls, text) => {
@@ -857,21 +864,10 @@ async function histReload() {
       sp.textContent = text;
       row.appendChild(sp);
     };
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.textContent = 'Restore this version';
     if (en.kind === 'restore') {
       cellEl('hist-op hist-op-restore', '↺ snapshot restore');
       cellEl('hist-when', fmtWhen(en.changed_at));
       cellEl('hist-actor', en.actor || '');
-      if (en.noChange) {
-        // the restore left this mark's geometry untouched — nothing to undo
-        btn.disabled = true;
-        btn.title = 'no change — this restore left the mark as it was';
-      } else {
-        // the DELETE side's old_row IS the pre-restore version
-        btn.addEventListener('click', () => histRestore(en.delRow));
-      }
     } else {
       const r = en.row;
       const restoreLike = r.via === 'version_restore' || r.via === 'snapshot_restore';
@@ -879,25 +875,33 @@ async function histReload() {
         : 'hist-op-' + String(r.op || '').toLowerCase()), historyOpLabel(r));
       cellEl('hist-when', fmtWhen(r.changed_at));
       cellEl('hist-actor', r.actor || '');
-      if (canRestoreHistoryRow(r)) {
-        btn.addEventListener('click', () => histRestore(r));
-      } else {
-        // INSERT entries have no old_row — nothing to roll back to
-        btn.disabled = true;
-        btn.title = 'an INSERT has no previous version';
-      }
+    }
+    // STATE semantics: Restore returns the mark to this row's state. The
+    // decision (newest = current -> disabled; DELETE rows disabled; no-change
+    // snapshot restores disabled; everything else enabled, collapsed rows
+    // wired to the INSERT side) is one pure function — suedit.js.
+    const st = historyRestoreState(en, i === 0);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = i === 0 ? 'Current' : 'Restore this state';
+    if (st.enabled) {
+      const when = en.kind === 'restore' ? en.changed_at : en.row.changed_at;
+      btn.addEventListener('click', () => histRestore(st.hid, when));
+    } else {
+      btn.disabled = true;
+      btn.title = st.hint;
     }
     row.appendChild(btn);
     list.appendChild(row);
-  }
+  });
 }
-async function histRestore(r) {
+async function histRestore(hid, changedAt) {
   if (_histBusy || _histMarkId == null) return;
   _histBusy = true;
   histSetMsg('restoring…');
   try {
-    await restoreMarkVersion(SUPABASE, r.hid, suAuth());
-    histSetMsg(`restored the version before ${fmtWhen(r.changed_at)} (entry #${r.hid})`);
+    await restoreMarkVersion(SUPABASE, hid, suAuth());
+    histSetMsg(`restored the state as of ${fmtWhen(changedAt)} (entry #${hid})`);
     // re-pull the pool so the crop (and swath) show the restored geometry;
     // refreshMarks -> reloadCropMarks clears the selection, and the trail
     // itself just grew by one UPDATE entry — reload it too.
