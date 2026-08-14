@@ -22,7 +22,7 @@ import {
   attribution, othersDeleteIds, pruneOthers, dropPoolMarksByDbId, cropDirtyState,
   historyButtonState, collapseHistoryRows, historyOpLabel, historyRestoreState,
   mergePendingMove, dropMovesForIds, applyPendingMoves, patchPoolMarksByDbId,
-  backfillInsertedIds, shortHash, snapIdent, snapshotDupBadges,
+  backfillInsertedIds, shortHash, snapIdent, snapRowTitle, snapshotDupBadges,
 } from './suedit.js';
 import {
   cellPasses, filterIsActive, pruneSelection, labelerOrder,
@@ -696,15 +696,25 @@ async function snapReloadList() {
   // duplicate-content badges: each later row whose content_sha already
   // appeared points at the EARLIEST snapshot with that content (suedit.js)
   const dupBadges = snapshotDupBadges(rows);
+  // Two-line rows: line 1 = hash (+ dup badge) · date/time · row count ·
+  // actor; line 2 = the label (dim, clamped to 2 lines by CSS), omitted
+  // entirely for label-less snapshots. The Restore button sits right of the
+  // text block, vertically centred across both lines (row grid, see CSS).
   for (const s of rows) {
     const row = document.createElement('div');
     row.className = 'snap-row';
-    const cellEl = (cls, text, title) => {
+    // hover supplement: the FULL record (64-char hash, exact stored
+    // timestamp, full label, actor, row count) — pure helper in suedit.js
+    row.title = snapRowTitle(s);
+    const main = document.createElement('div');
+    main.className = 'snap-main';
+    const line1 = document.createElement('div');
+    line1.className = 'snap-line1';
+    const cellEl = (cls, text) => {
       const sp = document.createElement('span');
       sp.className = cls;
       sp.textContent = text;
-      if (title) sp.title = title;
-      row.appendChild(sp);
+      line1.appendChild(sp);
     };
     // leading git-style id: 7-char snap_hash, plus a dim "≡ <earliest>" badge
     // when this snapshot's content duplicates an earlier one
@@ -712,7 +722,6 @@ async function snapReloadList() {
     hashEl.className = 'snap-hash';
     const own = document.createElement('code');
     own.textContent = shortHash(s.snap_hash) || '—';
-    own.title = s.snap_hash || '';
     hashEl.appendChild(own);
     const dupOf = dupBadges.get(s.id);
     if (dupOf) {
@@ -722,11 +731,18 @@ async function snapReloadList() {
       badge.title = `same content as snapshot ${shortHash(dupOf)} (earliest with this content)`;
       hashEl.appendChild(badge);
     }
-    row.appendChild(hashEl);
+    line1.appendChild(hashEl);
     cellEl('snap-when', fmtWhen(s.created_at));
-    cellEl('snap-lab', s.label || '—', s.label || '');
-    cellEl('snap-actor', s.actor || '', s.actor || '');
     cellEl('snap-n', `${s.row_count} row${s.row_count === 1 ? '' : 's'}`);
+    cellEl('snap-actor', s.actor || '');
+    main.appendChild(line1);
+    if (s.label) {
+      const lab = document.createElement('div');
+      lab.className = 'snap-lab';
+      lab.textContent = s.label;
+      main.appendChild(lab);
+    }
+    row.appendChild(main);
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.textContent = 'Restore…';

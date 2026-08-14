@@ -399,6 +399,27 @@ export function snapIdent(hash, id) {
 }
 
 /**
+ * Hover-tooltip text (title attribute) for one snapshots-dialog row: the FULL
+ * record — 64-char snap_hash, exact stored timestamp, full label, actor, row
+ * count — one field per line. A supplement to the visible two-line row (which
+ * shortens the hash, localizes the time and clamps the label), never the only
+ * access to anything. Missing fields degrade to explicit placeholders.
+ * @param {{snap_hash?:string, created_at?:string, label?:string,
+ *          actor?:string, row_count?:number}|null|undefined} s
+ * @returns {string}
+ */
+export function snapRowTitle(s) {
+  const r = s || {};
+  return [
+    `hash: ${r.snap_hash || '(none)'}`,
+    `created: ${r.created_at || '(unknown)'}`,
+    `label: ${r.label || '(none)'}`,
+    `actor: ${r.actor || '(unknown)'}`,
+    `rows: ${r.row_count == null ? '?' : r.row_count}`,
+  ].join('\n');
+}
+
+/**
  * Duplicate-content badges for the snapshots dialog. Rows come from
  * rpc_list_snapshots in ANY order (the RPC sends newest-first); duplication is
  * resolved globally against the EARLIEST snapshot (lowest id — ids are

@@ -431,9 +431,11 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
    z-band as the download dialog — the two can never be open together (both
    openers live in the topbar, which no modal leaves reachable). */
 .snap-modal { z-index: 80; }
+/* wider than .dl-box (460px) — line 1 of a row carries hash + badge + time +
+   count + actor and needs the room; 94vw keeps narrow screens scroll-free */
 .snap-box {
   background: #1b1e25; color: #e6e8ec; border: 1px solid #3a4152; border-radius: 8px;
-  padding: 18px 20px; width: min(640px, 94vw); max-height: 92vh; overflow-y: auto;
+  padding: 18px 20px; width: min(720px, 94vw); max-height: 92vh; overflow-y: auto;
   box-shadow: 0 12px 40px rgba(0, 0, 0, .55);
 }
 .snap-title { font-weight: 700; font-size: 15px; margin-bottom: 4px; }
@@ -457,22 +459,33 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
   border: 1px solid #2c313c; border-radius: 5px; max-height: 46vh; overflow-y: auto;
   font-size: 12px;
 }
+/* Two-line rows: .snap-main stacks line 1 (hash · when · count · actor) over
+   the optional label line; the Restore button sits in its own right-hand grid
+   column, vertically centred across both lines. minmax(0,1fr) + min-width:0
+   let the text block shrink (ellipsis/wrap) instead of forcing h-scroll. */
 .snap-row {
-  display: grid; grid-template-columns: max-content 150px 1fr 110px 70px auto;
-  gap: 8px; align-items: center; padding: 6px 8px; border-bottom: 1px solid #2c313c;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px; align-items: center; padding: 6px 8px; border-bottom: 1px solid #2c313c;
 }
 .snap-row:last-child { border-bottom: none; }
+.snap-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.snap-line1 { display: flex; align-items: baseline; gap: 10px; min-width: 0; flex-wrap: wrap; }
 /* leading git-style hash: own 7-char snap_hash, plus the dim "≡ <earliest>"
    duplicate-content badge (same content_sha as an earlier snapshot) */
-.snap-hash { display: flex; align-items: center; gap: 6px; }
+.snap-hash { display: flex; align-items: baseline; gap: 6px; }
 .snap-hash code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px; color: #e8b04c;
 }
 .snap-hash code.snap-dup { color: #5c6577; }
 .snap-when { color: #b9c0cd; font-variant-numeric: tabular-nums; }
-.snap-lab { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.snap-actor { color: #8b93a3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.snap-n { color: #f6c453; font-variant-numeric: tabular-nums; text-align: right; }
+/* line 2: the label — dim, smaller, clamped to 2 lines with ellipsis */
+.snap-lab {
+  font-size: 11px; color: #8b93a3; line-height: 1.35; word-break: break-word;
+  display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2;
+  -webkit-box-orient: vertical; overflow: hidden;
+}
+.snap-actor { color: #8b93a3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.snap-n { color: #f6c453; font-variant-numeric: tabular-nums; }
 .snap-empty { padding: 10px; color: #8b93a3; font-style: italic; }
 .snap-actions { display: flex; justify-content: flex-end; margin-top: 12px; }
