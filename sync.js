@@ -208,7 +208,7 @@ export async function updateMark(cfg, markId, patch, auth) {
  * rpc_create_snapshot.
  * @param {string|null} label  optional human label
  * @param {{token:string, actor:string}} auth
- * @returns {Promise<{id:number, row_count:number}>}
+ * @returns {Promise<{id:number, row_count:number, content_sha:string, snap_hash:string}>}
  */
 export async function createSnapshot(cfg, board, project, label, auth) {
   if (!cfg) throw new Error('no supabase config');
@@ -220,8 +220,8 @@ export async function createSnapshot(cfg, board, project, label, auth) {
 
 /**
  * List snapshot METADATA for (board, project) via rpc_list_snapshots —
- * id, created_at, actor, label, board, project, row_count; payload never
- * included. Newest first (the RPC orders by id desc).
+ * id, created_at, actor, label, board, project, row_count, content_sha,
+ * snap_hash; payload never included. Newest first (the RPC orders by id desc).
  * @param {{token:string, actor:string}} auth (actor unused by this RPC)
  * @returns {Promise<Array<object>>}
  */

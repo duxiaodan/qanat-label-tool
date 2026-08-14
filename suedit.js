@@ -168,6 +168,42 @@ export function canRestoreHistoryRow(row) {
 }
 
 /**
+ * 7-char git-style display form of a stored full-length hash. Empty string
+ * for anything that isn't a string (missing hash on a pre-migration row).
+ * @param {string|null|undefined} h
+ * @returns {string}
+ */
+export function shortHash(h) {
+  return (typeof h === 'string') ? h.slice(0, 7) : '';
+}
+
+/**
+ * Duplicate-content badges for the snapshots dialog. Rows come from
+ * rpc_list_snapshots in ANY order (the RPC sends newest-first); duplication is
+ * resolved globally against the EARLIEST snapshot (lowest id — ids are
+ * monotonic with creation) holding each content_sha. Every later row with the
+ * same content_sha gets a badge pointing at that earliest row's snap_hash —
+ * including content that changed and later returned. The earliest occurrence
+ * itself gets no badge. Rows without an id or content_sha (pre-migration,
+ * defensive) neither anchor nor receive badges.
+ * @param {Array<{id?:number, content_sha?:string, snap_hash?:string}>} rows
+ * @returns {Map<number, string>} row id -> the earliest same-content row's
+ *   FULL snap_hash (callers shorten for display)
+ */
+export function snapshotDupBadges(rows) {
+  const usable = (rows || []).filter((r) => r && r.id != null && r.content_sha);
+  usable.sort((a, b) => a.id - b.id);
+  const earliest = new Map(); // content_sha -> earliest row
+  const out = new Map();      // later row id -> earliest row's snap_hash
+  for (const r of usable) {
+    const first = earliest.get(r.content_sha);
+    if (first === undefined) earliest.set(r.content_sha, r);
+    else out.set(r.id, first.snap_hash || '');
+  }
+  return out;
+}
+
+/**
  * The crop-level dirty test, as one pure decision: unsaved own-mark edits, an
  * in-progress polyline, OR pending others-edits (deletes AND drag-moves) all
  * make the crop dirty (and therefore guarded by the 3-way save/discard/cancel

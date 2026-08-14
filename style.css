@@ -456,10 +456,18 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
   font-size: 12px;
 }
 .snap-row {
-  display: grid; grid-template-columns: 150px 1fr 110px 70px auto;
+  display: grid; grid-template-columns: max-content 150px 1fr 110px 70px auto;
   gap: 8px; align-items: center; padding: 6px 8px; border-bottom: 1px solid #2c313c;
 }
 .snap-row:last-child { border-bottom: none; }
+/* leading git-style hash: own 7-char snap_hash, plus the dim "≡ <earliest>"
+   duplicate-content badge (same content_sha as an earlier snapshot) */
+.snap-hash { display: flex; align-items: center; gap: 6px; }
+.snap-hash code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px; color: #e8b04c;
+}
+.snap-hash code.snap-dup { color: #5c6577; }
 .snap-when { color: #b9c0cd; font-variant-numeric: tabular-nums; }
 .snap-lab { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .snap-actor { color: #8b93a3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

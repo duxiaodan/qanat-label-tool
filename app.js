@@ -22,6 +22,7 @@ import {
   attribution, othersDeleteIds, pruneOthers, dropPoolMarksByDbId, cropDirtyState,
   singleSelectionDbId, canRestoreHistoryRow,
   mergePendingMove, dropMovesForIds, applyPendingMoves, patchPoolMarksByDbId,
+  shortHash, snapshotDupBadges,
 } from './suedit.js';
 import {
   cellPasses, filterIsActive, pruneSelection, labelerOrder,
@@ -676,6 +677,9 @@ async function snapReloadList() {
     list.appendChild(em);
     return;
   }
+  // duplicate-content badges: each later row whose content_sha already
+  // appeared points at the EARLIEST snapshot with that content (suedit.js)
+  const dupBadges = snapshotDupBadges(rows);
   for (const s of rows) {
     const row = document.createElement('div');
     row.className = 'snap-row';
@@ -686,6 +690,23 @@ async function snapReloadList() {
       if (title) sp.title = title;
       row.appendChild(sp);
     };
+    // leading git-style id: 7-char snap_hash, plus a dim "≡ <earliest>" badge
+    // when this snapshot's content duplicates an earlier one
+    const hashEl = document.createElement('span');
+    hashEl.className = 'snap-hash';
+    const own = document.createElement('code');
+    own.textContent = shortHash(s.snap_hash) || '—';
+    own.title = s.snap_hash || '';
+    hashEl.appendChild(own);
+    const dupOf = dupBadges.get(s.id);
+    if (dupOf) {
+      const badge = document.createElement('code');
+      badge.className = 'snap-dup';
+      badge.textContent = `≡ ${shortHash(dupOf)}`;
+      badge.title = `same content as snapshot ${shortHash(dupOf)} (earliest with this content)`;
+      hashEl.appendChild(badge);
+    }
+    row.appendChild(hashEl);
     cellEl('snap-when', fmtWhen(s.created_at));
     cellEl('snap-lab', s.label || '—', s.label || '');
     cellEl('snap-actor', s.actor || '', s.actor || '');
@@ -706,7 +727,8 @@ async function snapCreate() {
   try {
     const out = await createSnapshot(SUPABASE, S.board, S.project,
       $('snap-label').value.trim() || null, suAuth());
-    snapSetMsg(`snapshot #${out.id} created (${out.row_count} row${out.row_count === 1 ? '' : 's'})`);
+    const h = shortHash(out.snap_hash);
+    snapSetMsg(`snapshot ${h || '#' + out.id} created (${out.row_count} row${out.row_count === 1 ? '' : 's'})`);
     $('snap-label').value = '';
     await snapReloadList();
   } catch (e) {
@@ -719,10 +741,14 @@ let _snapRestoreBusy = false; // one restore at a time (list buttons stay live)
 async function snapRestore(s) {
   if (_snapRestoreBusy) return;
   const label = s.label ? ` ("${s.label}")` : '';
+  // git-style identity in the confirmation (falls back to #id for any
+  // pre-migration row that never got a snap_hash)
+  const hash = shortHash(s.snap_hash);
+  const ident = hash ? `${hash} (#${s.id})` : `#${s.id}`;
   // explicit consequences in the confirmation: the row count being restored
   // AND the automatic pre-restore snapshot the server creates first.
   const ok = confirm(
-    `Restore snapshot #${s.id}${label} from ${fmtWhen(s.created_at)}?\n\n` +
+    `Restore snapshot ${ident}${label} from ${fmtWhen(s.created_at)}?\n\n` +
     `This replaces ALL marks for this board + project with the snapshot's ` +
     `${s.row_count} row${s.row_count === 1 ? '' : 's'}. A pre-restore snapshot of the ` +
     `current state is created automatically first, so this can be undone.`);
