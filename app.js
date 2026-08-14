@@ -13,6 +13,9 @@ import { buildShaftsFeatureCollection, buildLinesFeatureCollection } from './geo
 import { deriveKey, decryptBlob, encryptBlob, verifyPasscode, openSuEnvelope, deriveWriteToken } from './crypto.js';
 import { fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks } from './sync.js';
 import {
+  attribution, othersDeleteIds, pruneOthers, dropPoolMarksByDbId, cropDirtyState,
+} from './suedit.js';
+import {
   cellPasses, filterIsActive, pruneSelection, labelerOrder,
   rankPercent, fmtPercent, filterSummary, rectSubpath, spotlightPaths,
 } from './cellfilter.js';
@@ -271,6 +274,9 @@ async function pullAllMarks() {
       buildId: row.build_id ?? null,
       autocontrast: row.autocontrast ?? null,
       project: row.project ?? null,
+      // who last cross-edited this mark (server-stamped, superuser edits only);
+      // drives the dual-attribution hover tooltip in the crop view.
+      editedBy: row.edited_by ?? null,
     };
     if (row.kind === KIND_SHAFT) {
       // a shaft is stored as {world:[x,y]} (a flat pair); tolerate a nested
@@ -511,6 +517,9 @@ async function unlock() {
   $('gate').hidden = true;
   $('app').hidden = false;
   sessionStorage.setItem('qanat-unlocked', '1');
+  // superuser-only UI (Edit-others toggle, Snapshots, History). Built HERE, not
+  // in the static HTML, so for normal users none of it is in the DOM at all.
+  if (S.su) setupSuperuserUI();
   computeLabelerCells();   // before buildSideList: the per-labeler cell sets
   initRankSlider();        // rank bounds now that S.cells is known (full range)
   rebuildLabelerChecks();  // needs the freshly pulled pool and S.meDisplay
@@ -520,6 +529,56 @@ async function unlock() {
   fitSwath();
   updateDownloadEnabled();
   if (S.review.on) reviewRefreshUI(); // reveal counter/button + paint badges/tints
+}
+
+// --------------------------------------------------------------------------- //
+// superuser tools — built at unlock ONLY when S.su, so a normal user's DOM
+// carries none of it (not merely hidden). The "Edit others" toggle is DEFAULT
+// OFF on every login and never persisted: cross-labeler editing is a per-
+// session, deliberate opt-in. While ON, the topbar and crop modal tint amber
+// and a chip reads "editing others' marks" (applySuEditCue).
+// --------------------------------------------------------------------------- //
+/** Cross-labeler editing is live: superuser session AND the toggle is checked. */
+function suEditOn() {
+  const tg = document.getElementById('tg-editothers');
+  return S.su && !!(tg && tg.checked);
+}
+function setupSuperuserUI() {
+  const toggles = document.querySelector('#topbar .toggles');
+  if (!toggles || document.getElementById('tg-editothers')) return;
+  // "Edit others" checkbox, appended to the layer toggles. Unchecked by
+  // construction (fresh element per unlock; nothing ever persists it).
+  const lab = document.createElement('label');
+  lab.id = 'su-edit-wrap';
+  const inp = document.createElement('input');
+  inp.type = 'checkbox';
+  inp.id = 'tg-editothers';
+  lab.appendChild(inp);
+  lab.appendChild(document.createTextNode(' Edit others'));
+  toggles.appendChild(lab);
+  // the strong visual cue while cross-labeler editing is armed
+  const chip = document.createElement('span');
+  chip.id = 'su-chip';
+  chip.className = 'su-chip';
+  chip.textContent = "editing others' marks";
+  chip.hidden = true;
+  toggles.insertAdjacentElement('afterend', chip);
+  inp.addEventListener('change', applySuEditCue);
+  applySuEditCue();
+}
+function applySuEditCue() {
+  const on = suEditOn();
+  document.body.classList.toggle('su-edit-on', on);
+  const chip = document.getElementById('su-chip');
+  if (chip) chip.hidden = !on;
+  // turning the toggle OFF drops any others-selection (their marks are
+  // read-only again); pending, still-unsaved others-deletes stay pending —
+  // they are part of the crop's dirty state until saved or discarded.
+  if (!on && S.crop) {
+    S.crop.selected.oPoints.clear();
+    S.crop.selected.oLines.clear();
+    redrawCrop();
+  }
 }
 
 // --------------------------------------------------------------------------- //
@@ -1184,10 +1243,15 @@ function updateCropNavButtons() {
     b.title = n ? `${NAV_LABEL[dir]} → ${n.id}` : '';
   }
 }
-/** Unsaved-marks test: an explicit edit, or a polyline still being drawn. */
+/** Unsaved-marks test: an explicit edit, a polyline still being drawn, or a
+ *  pending (unsaved) superuser delete of someone else's mark. */
 function cropIsDirty() {
   if (!S.crop) return false;
-  return S.crop.dirty === true || (S.crop.inProgress && S.crop.inProgress.length > 0);
+  return cropDirtyState({
+    dirty: S.crop.dirty,
+    inProgressLen: S.crop.inProgress ? S.crop.inProgress.length : 0,
+    pendingOthers: S.crop.pendingOthersDeletes ? S.crop.pendingOthersDeletes.size : 0,
+  });
 }
 /** Per-action wording for the unsaved-marks prompt. 'nav' matches the static
  *  HTML defaults; 'close' rewords the message and the save/discard buttons.
@@ -1311,9 +1375,16 @@ async function openCrop(cid) {
     marks: { points: [], lines: [] },      // MY editable marks ({px|pts, ac} objects)
     others: { points: [], lines: [] },     // OTHERS' read-only marks (bare pixel coords)
     inProgress: [],
-    selected: { points: new Set(), lines: new Set() },  // indices of own marks currently selected
+    // indices of currently-selected marks. points/lines = OWN marks; oPoints/
+    // oLines = OTHERS' marks (only ever populated while "Edit others" is on).
+    selected: { points: new Set(), lines: new Set(), oPoints: new Set(), oLines: new Set() },
     selectBox: null,       // [c0, r0, c1, r1] in 1024² coords while rubber-band-dragging
     dirty: false,          // unsaved mark edits (drives the unsaved-marks prompt on nav AND close)
+    // superuser cross-labeler edits pending commit: row ids of OTHERS' marks
+    // deleted in this crop but not yet saved. Committed by commitCrop via
+    // rpc_delete_marks (explicitly — the own-marks reconcile never touches
+    // them); counted by cropIsDirty so the unsaved prompt guards them too.
+    pendingOthersDeletes: new Set(),
   };
   loadCropMarksFor(cell);
   $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}   (${cell.gt_points.length} GT shafts)`;
@@ -1346,15 +1417,21 @@ function loadCropMarksFor(cell) {
   for (const m of S.shaftMarks) if (m.cropId === cid) {
     const px = worldToPixel(m.world[0], m.world[1], cell.world_bbox);
     if (m.labeler === S.me) mine.points.push({ px, ac: m.autocontrast ?? null, created: m.created || null, dbId: m.dbId ?? null });
-    else others.points.push({ px, labeler: m.labeler || '' });
+    else others.points.push({ px, labeler: m.labeler || '', dbId: m.dbId ?? null, editedBy: m.editedBy || null });
   }
   for (const m of S.lineMarks) if (m.cropId === cid) {
     const ln = m.world.map(([x, y]) => worldToPixel(x, y, cell.world_bbox));
     if (m.labeler === S.me) mine.lines.push({ pts: ln, ac: m.autocontrast ?? null, created: m.created || null, dbId: m.dbId ?? null });
-    else others.lines.push({ pts: ln, labeler: m.labeler || '' });
+    else others.lines.push({ pts: ln, labeler: m.labeler || '', dbId: m.dbId ?? null, editedBy: m.editedBy || null });
   }
   S.crop.marks = mine;
-  S.crop.others = others;
+  // a mid-session refresh re-pulls the pool where still-unsaved others-deletes
+  // still exist as rows — prune them so they can't visually resurrect.
+  const pending = S.crop.pendingOthersDeletes || new Set();
+  S.crop.others = {
+    points: pruneOthers(others.points, pending),
+    lines: pruneOthers(others.lines, pending),
+  };
 }
 // after a refresh while the modal is open: reload others' marks (and any of mine
 // not currently being edited) without clobbering in-progress drawing/selection.
@@ -1374,12 +1451,27 @@ function closeCrop(save) {
   hideCropHoverTip();  // never leave a hover name up over a closed/reopened crop
   $('crop-modal').hidden = true;
 }
-// ---- selection helpers (S.crop.selected = {points:Set<idx>, lines:Set<idx>}) ----
-function selClear() { if (S.crop) { S.crop.selected.points.clear(); S.crop.selected.lines.clear(); } }
-function selCount() { return S.crop ? S.crop.selected.points.size + S.crop.selected.lines.size : 0; }
+// ---- selection helpers ------------------------------------------------------
+// S.crop.selected = {points, lines, oPoints, oLines} (Sets of indices).
+// points/lines index into S.crop.marks (own); oPoints/oLines into S.crop.others
+// and are only ever populated while the superuser "Edit others" toggle is on.
+const SEL_KIND = {
+  point: (sel) => sel.points, line: (sel) => sel.lines,
+  opoint: (sel) => sel.oPoints, oline: (sel) => sel.oLines,
+};
+function selClear() {
+  if (!S.crop) return;
+  S.crop.selected.points.clear(); S.crop.selected.lines.clear();
+  S.crop.selected.oPoints.clear(); S.crop.selected.oLines.clear();
+}
+function selCount() {
+  if (!S.crop) return 0;
+  const s = S.crop.selected;
+  return s.points.size + s.lines.size + s.oPoints.size + s.oLines.size;
+}
 function selSet(kind, idx, additive) {
   if (!additive) selClear();
-  (kind === 'point' ? S.crop.selected.points : S.crop.selected.lines).add(idx);
+  SEL_KIND[kind](S.crop.selected).add(idx);
 }
 function boxNorm(b) { return [Math.min(b[0], b[2]), Math.min(b[1], b[3]), Math.max(b[0], b[2]), Math.max(b[1], b[3])]; }
 function pointInBox([c, r], b) { const [a0, a1, a2, a3] = boxNorm(b); return c >= a0 && c <= a2 && r >= a1 && r <= a3; }
@@ -1387,6 +1479,11 @@ function selectFromBox(box, additive) {
   if (!additive) selClear();
   S.crop.marks.points.forEach((p, i) => { if (pointInBox(p.px, box)) S.crop.selected.points.add(i); });
   S.crop.marks.lines.forEach((ln, i) => { if (ln.pts.some((v) => pointInBox(v, box))) S.crop.selected.lines.add(i); });
+  // with "Edit others" on, the SAME box-select also takes others' marks
+  if (suEditOn()) {
+    S.crop.others.points.forEach((p, i) => { if (pointInBox(p.px, box)) S.crop.selected.oPoints.add(i); });
+    S.crop.others.lines.forEach((ln, i) => { if (ln.pts.some((v) => pointInBox(v, box))) S.crop.selected.oLines.add(i); });
+  }
 }
 function deleteSelected() {
   if (!S.crop || selCount() === 0) return;
@@ -1394,8 +1491,18 @@ function deleteSelected() {
   for (const i of pi) S.crop.marks.points.splice(i, 1);
   const li = [...S.crop.selected.lines].sort((a, b) => b - a);
   for (const i of li) S.crop.marks.lines.splice(i, 1);
+  if (pi.length || li.length) S.crop.dirty = true;
+  // others' marks: remove from the crop view NOW, but the DB rows only go on
+  // save — their ids enter the pending set that commitCrop turns into an
+  // explicit rpc_delete_marks call. (oPoints/oLines can only be non-empty
+  // while "Edit others" is on — see the selection paths.)
+  const removedOthers = [];
+  const opi = [...S.crop.selected.oPoints].sort((a, b) => b - a);
+  for (const i of opi) removedOthers.push(...S.crop.others.points.splice(i, 1));
+  const oli = [...S.crop.selected.oLines].sort((a, b) => b - a);
+  for (const i of oli) removedOthers.push(...S.crop.others.lines.splice(i, 1));
+  for (const id of othersDeleteIds(removedOthers)) S.crop.pendingOthersDeletes.add(id);
   selClear();
-  S.crop.dirty = true;
   redrawCrop();
 }
 function fitCrop() {
@@ -1492,14 +1599,24 @@ function drawCropOverlay() {
   if (S.crop.others && (S.crop.others.points.length || S.crop.others.lines.length)) {
     ctx.save();
     ctx.strokeStyle = '#ff9500'; ctx.fillStyle = '#ff9500'; ctx.lineWidth = 2; ctx.globalAlpha = 0.95;
-    for (const { pts: ln } of S.crop.others.lines) {
-      if (ln.length < 1) continue;
+    // selected others (Edit-others mode) get the same magenta halo as own marks
+    const OSEL = '#ff00ff';
+    S.crop.others.lines.forEach(({ pts: ln }, idx) => {
+      if (ln.length < 1) return;
       ctx.beginPath();
       ln.forEach(([c, r], i) => { if (i === 0) ctx.moveTo(SX(c), SY(r)); else ctx.lineTo(SX(c), SY(r)); });
       ctx.stroke();
+      if (S.crop.selected.oLines.has(idx)) {
+        ctx.save(); ctx.strokeStyle = OSEL; ctx.lineWidth = 3.5; ctx.stroke(); ctx.restore();
+      }
       for (const [c, r] of ln) { ctx.beginPath(); ctx.arc(SX(c), SY(r), 2.5, 0, 2 * Math.PI); ctx.fill(); }
-    }
-    for (const { px: [c, r] } of S.crop.others.points) { ctx.beginPath(); ctx.arc(SX(c), SY(r), 4, 0, 2 * Math.PI); ctx.fill(); }
+    });
+    S.crop.others.points.forEach(({ px: [c, r] }, idx) => {
+      ctx.beginPath(); ctx.arc(SX(c), SY(r), 4, 0, 2 * Math.PI); ctx.fill();
+      if (S.crop.selected.oPoints.has(idx)) {
+        ctx.save(); ctx.strokeStyle = OSEL; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(SX(c), SY(r), 7.5, 0, 2 * Math.PI); ctx.stroke(); ctx.restore();
+      }
+    });
     ctx.restore();
   }
   // my marks (lime); selected ones get a magenta halo
@@ -1569,6 +1686,21 @@ function hitTestOwn([col, row]) {
   for (let i = 0; i < S.crop.marks.lines.length; i++) {
     for (const [c, r] of S.crop.marks.lines[i].pts) {
       if ((c - col) ** 2 + (r - row) ** 2 <= tol * tol) return { kind: 'line', idx: i };
+    }
+  }
+  return null;
+}
+// same tolerance/order convention as hitTestOwn, over OTHERS' marks. Only
+// consulted while "Edit others" is on (callers gate on suEditOn()).
+function hitTestOthers([col, row]) {
+  const tol = CROP_MARK_TOL_SCREEN_PX / Math.max(0.01, S.crop.view.scale);
+  for (let i = 0; i < S.crop.others.points.length; i++) {
+    const [c, r] = S.crop.others.points[i].px;
+    if ((c - col) ** 2 + (r - row) ** 2 <= tol * tol) return { kind: 'opoint', idx: i };
+  }
+  for (let i = 0; i < S.crop.others.lines.length; i++) {
+    for (const [c, r] of S.crop.others.lines[i].pts) {
+      if ((c - col) ** 2 + (r - row) ** 2 <= tol * tol) return { kind: 'oline', idx: i };
     }
   }
   return null;
@@ -1658,7 +1790,9 @@ function setupCropInteractions() {
         redrawCrop();
       } else {
         S.crop.selectBox = null;
-        const hit = hitTestOwn(pressPx);
+        // own marks first (they draw on top), then — with "Edit others" on —
+        // others' marks become clickable/selectable through the same gesture.
+        const hit = hitTestOwn(pressPx) || (suEditOn() ? hitTestOthers(pressPx) : null);
         if (hit) { selSet(hit.kind, hit.idx, pressAdditive); redrawCrop(); return; }
         if (!pressAdditive) selClear();
         // new point: stamped with the toggle state at the moment it is added.
@@ -1698,9 +1832,11 @@ function setupCropInteractions() {
       S.crop.others.lines.map((l) => l.pts),
       col, row, tol,
     );
-    const who = hit && (hit.kind === 'point'
+    const m = hit && (hit.kind === 'point'
       ? S.crop.others.points[hit.idx]
-      : S.crop.others.lines[hit.idx]).labeler;
+      : S.crop.others.lines[hit.idx]);
+    // dual attribution when a superuser has edited the mark: "Alice · edited by Bob"
+    const who = m ? attribution(m.labeler, m.editedBy) : '';
     if (!who) { hideCropHoverTip(); return; }
     const rect = stage.getBoundingClientRect();
     showCropHoverTip(who, e.clientX - rect.left, e.clientY - rect.top);
@@ -1831,6 +1967,9 @@ async function commitCrop() {
     S.crop.marks.lines.push({ pts: S.crop.inProgress.slice(), ac: $('crop-autocontrast').checked });
   }
   S.crop.inProgress = [];
+  // Snapshot the pending superuser others-deletes NOW: S.crop can be nulled or
+  // replaced while the awaits below are in flight (closeCrop / navigation).
+  const pendingOthers = new Set(S.crop.pendingOthersDeletes || []);
   // drop ONLY MY old marks for this cell; never touch others' marks.
   S.shaftMarks = S.shaftMarks.filter((m) => !(m.cropId === cell.id && m.labeler === S.me));
   S.lineMarks = S.lineMarks.filter((m) => !(m.cropId === cell.id && m.labeler === S.me));
@@ -1914,6 +2053,15 @@ async function commitCrop() {
         const m = byGeom.get(ins.geom);
         if (m) { m.dbId = ins.id; m.created = ins.created_at || m.created; }
       }
+      // superuser cross-labeler deletes ("Edit others"): committed as an
+      // EXPLICIT rpc_delete_marks call — the own-marks reconcile above is
+      // scoped to S.me and never touches others' rows. Pool rows are dropped
+      // only after the server confirms, so a rejected RPC keeps the ids
+      // pending (and the crop dirty) instead of silently losing the intent.
+      if (pendingOthers.size) {
+        await deleteMarksByIds(SUPABASE, S.board, S.me, cell.id, [...pendingOthers], S.project, auth);
+        applyOthersDeletes(cell, pendingOthers);
+      }
       S.unsynced = false;
       setSyncStatus('saved', 'ok');
     } catch (e) {
@@ -1924,12 +2072,29 @@ async function commitCrop() {
       const why = e && e.rpcMessage ? ` (${e.rpcMessage})` : '';
       setSyncStatus(`unsynced — kept locally${why}`, 'unsynced');
     }
+  } else if (pendingOthers.size) {
+    // localStorage-only mode: no server to confirm — apply the deletes locally.
+    applyOthersDeletes(cell, pendingOthers);
   }
   persist();
   // everything the user drew is now in the pool (and, when configured, the DB) —
   // guard on the cell because closeCrop(true) can null/replace S.crop meanwhile.
   if (S.crop && S.crop.cell === cell) S.crop.dirty = false;
   redrawCrop();
+}
+/** Confirmed cross-labeler deletes: drop the rows from the pool, clear them
+ *  from the crop's pending set, and repaint everything the pool drives. */
+function applyOthersDeletes(cell, ids) {
+  S.shaftMarks = dropPoolMarksByDbId(S.shaftMarks, ids);
+  S.lineMarks = dropPoolMarksByDbId(S.lineMarks, ids);
+  if (S.crop && S.crop.cell === cell && S.crop.pendingOthersDeletes) {
+    for (const id of ids) S.crop.pendingOthersDeletes.delete(id);
+  }
+  recomputeDone();
+  refreshFilterUI();
+  refreshDoneMarks();
+  rebuildMineLayer();
+  applyLayerToggles();
 }
 
 // --------------------------------------------------------------------------- //
