@@ -538,10 +538,35 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
 }
 .help-actions button:hover { filter: brightness(1.2); }
 /* the two "?" openers (topbar + crop toolbar): compact round badge, quieter
-   than the action buttons around them */
-button.btn-help {
-  width: 26px; height: 26px; padding: 0; border-radius: 50%;
+   than the action buttons around them.
+   KEEP THE SELECTORS PARENT-QUALIFIED — do NOT "simplify" this back to a bare
+   `button.btn-help`. The generic `#topbar button` rule above (blue pill, 6px
+   12px padding, 5px radius, no border) is an id+type selector (1,0,1) and
+   outranks a class+type `button.btn-help` (0,1,1), so an unqualified rule
+   loses in the topbar: #btn-help then renders as a squashed blue rectangle
+   while its crop-toolbar twin #crop-help (whose only competition,
+   `.modal-tools button`, is merely class+type) renders as the intended circle
+   — i.e. the two openers of the SAME dialog look different. Qualifying both
+   places (1,1,1) and (0,2,1) makes the quiet circle win in both. */
+#topbar button.btn-help,
+.modal-tools button.btn-help {
+  flex: 0 0 auto; width: 26px; height: 26px; padding: 0; border-radius: 50%;
+  /* flex-centred like .crop-nav — the "?" sits optically dead-centre in the
+     circle without depending on UA button content-centring quirks */
+  display: inline-flex; align-items: center; justify-content: center;
   background: #333a48; color: #cfd3db; border: 1px solid #4a5468;
   font-weight: 700; font-size: 13px; line-height: 1; cursor: pointer;
 }
-button.btn-help:hover { background: #3d4657; color: #fff; }
+/* `filter: none` cancels `.modal-tools button:hover`'s brightness(1.2) (a
+   different property, so it survives on its own) — without it the crop
+   opener's hover would read lighter than the topbar one's. */
+#topbar button.btn-help:hover,
+.modal-tools button.btn-help:hover { background: #3d4657; color: #fff; filter: none; }
+/* focus ring in the same idiom as #tg-editothers: a 2px gap in the local
+   backdrop colour (topbar #20242c / .modal-box #1b1e25), then the 2px blue */
+#topbar button.btn-help:focus-visible {
+  outline: none; box-shadow: 0 0 0 2px #20242c, 0 0 0 4px #2a6df0;
+}
+.modal-tools button.btn-help:focus-visible {
+  outline: none; box-shadow: 0 0 0 2px #1b1e25, 0 0 0 4px #2a6df0;
+}
