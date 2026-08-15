@@ -489,3 +489,59 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
 .snap-n { color: #f6c453; font-variant-numeric: tabular-nums; }
 .snap-empty { padding: 10px; color: #8b93a3; font-style: italic; }
 .snap-actions { display: flex; justify-content: flex-end; margin-top: 12px; }
+
+/* ---------- help panel (both roles) ----------
+   Same overlay family as .dl-modal/.snap-modal (fixed, centred, Esc + backdrop
+   close) but z-index 90: Help opens from INSIDE the crop view (50) and must
+   also beat the dl/snap band (80), so it is unconditionally topmost. */
+.help-modal { z-index: 90; }
+.help-box {
+  background: #1b1e25; color: #e6e8ec; border: 1px solid #3a4152; border-radius: 8px;
+  padding: 18px 22px; width: min(760px, 94vw); max-height: 90vh; overflow-y: auto;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .55); outline: none;
+}
+.help-title { font-weight: 700; font-size: 15px; margin-bottom: 12px; }
+.help-sec { border-top: 1px solid #2c313c; padding: 10px 0 8px; }
+.help-sec:first-of-type { border-top: none; padding-top: 0; }
+.help-sec-title { font-size: 13px; font-weight: 700; margin-bottom: 4px; }
+/* §5's disclosure heading — same caret affordance as the sidebar Filters
+   toggle, restyled to sit flush with the static section titles */
+.help-sec-toggle {
+  display: flex; align-items: center; gap: 6px; width: 100%; padding: 0; margin: 0 0 4px;
+  background: none; border: none; text-align: left; cursor: pointer;
+  font: inherit; font-size: 13px; font-weight: 700; color: #e6e8ec;
+}
+.help-sec-toggle:hover { color: #fff; }
+.help-caret { flex: 0 0 auto; font-size: 9px; opacity: .8; }
+.help-sec-body { font-size: 13px; line-height: 1.55; color: #cfd3db; }
+.help-sec-body p { margin: 6px 0; }
+.help-sec-body ul { margin: 6px 0; padding-left: 20px; }
+.help-sec-body li { margin: 4px 0; }
+.help-sec-body b { color: #e6e8ec; }
+.help-subhead { font-size: 12px; font-weight: 700; color: #b9c0cd; margin-top: 10px; }
+.help-note { font-size: 12px; color: #8b93a3; }
+/* keyboard/mouse reference — wide content scrolls inside its own wrapper,
+   never the panel sideways */
+.help-table-wrap { overflow-x: auto; margin: 6px 0; }
+.help-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.help-table th, .help-table td {
+  border: 1px solid #2c313c; padding: 4px 9px; text-align: left; vertical-align: top;
+}
+.help-table th {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+  color: #8b93a3; background: #20242c; font-weight: 600;
+}
+.help-actions { display: flex; justify-content: flex-end; margin-top: 12px; }
+.help-actions button {
+  padding: 6px 12px; border-radius: 5px; border: none; background: #333a48; color: #eee;
+  cursor: pointer; font-size: 12px;
+}
+.help-actions button:hover { filter: brightness(1.2); }
+/* the two "?" openers (topbar + crop toolbar): compact round badge, quieter
+   than the action buttons around them */
+button.btn-help {
+  width: 26px; height: 26px; padding: 0; border-radius: 50%;
+  background: #333a48; color: #cfd3db; border: 1px solid #4a5468;
+  font-weight: 700; font-size: 13px; line-height: 1; cursor: pointer;
+}
+button.btn-help:hover { background: #3d4657; color: #fff; }

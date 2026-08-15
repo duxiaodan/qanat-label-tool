@@ -31,6 +31,7 @@ import {
 import {
   selectMarks, scopeSlug, scopeProblem, countOrphans, buildExportScope,
 } from './exportscope.js';
+import { HELP_SECTIONS, sectionOpenByDefault } from './helpcontent.js';
 import { SUPABASE } from './site_config.js';
 
 // --------------------------------------------------------------------------- //
@@ -816,8 +817,11 @@ function setupSnapshotsDialog() {
   $('snap-label').addEventListener('keydown', (e) => { if (e.key === 'Enter') snapCreate(); });
   // Esc closes. The crop modal's keydown bails out while this dialog is open
   // (see setupCropInteractions), so exactly one modal ever owns the keyboard.
+  // Help (z 90) stands above this dialog (z 80): if it were ever open on top,
+  // Esc belongs to it — same belt-and-braces guard as the download dialog.
   document.addEventListener('keydown', (e) => {
     if ($('snap-modal').hidden) return;
+    if (!$('help-modal').hidden) return;
     if (e.key === 'Escape') { e.preventDefault(); snapClose(); }
   });
 }
@@ -2505,11 +2509,12 @@ function setupCropInteractions() {
   }));
   document.addEventListener('keydown', (e) => {
     if (!S.crop || $('crop-modal').hidden) return;
-    // the download / snapshots dialogs stack above everything: while one is
-    // open it owns the keyboard (Esc closes IT), so the crop's Esc/arrow
-    // duties stand down.
+    // the download / snapshots / help dialogs stack above everything: while
+    // one is open it owns the keyboard (Esc closes IT), so the crop's
+    // Esc/arrow duties stand down.
     if (!$('dl-modal').hidden) return;
     if (!$('snap-modal').hidden) return;
+    if (!$('help-modal').hidden) return;
     // the history panel owns the keyboard while open: Esc closes it, every
     // other crop key (arrows, Delete, …) stands down.
     if (!$('hist-panel').hidden) {
@@ -3014,10 +3019,148 @@ function setupDownloadDialog() {
     dlRefresh();
   });
   // Esc closes. The crop modal's keydown handler bails out while this dialog is
-  // open (see setupCropInteractions), so exactly one modal ever reacts.
+  // open (see setupCropInteractions), so exactly one modal ever reacts. Help
+  // sits ABOVE this dialog in the z-ladder, so it takes Esc first when open
+  // (unreachable in practice — no Help opener is clickable under this overlay —
+  // but the guard keeps "topmost owns the keyboard" unconditional).
   document.addEventListener('keydown', (e) => {
     if ($('dl-modal').hidden) return;
+    if (!$('help-modal').hidden) return;
     if (e.key === 'Escape') { e.preventDefault(); dlClose(); }
+  });
+}
+
+// --------------------------------------------------------------------------- //
+// help panel (both roles) — renders the user guide from helpcontent.js into
+// the static #help-modal shell. Openers: #btn-help (topbar) and #crop-help
+// (crop toolbar, because the crop modal covers the topbar). Modal conventions
+// mirror #dl-modal (fixed overlay, backdrop click + Esc close, the crop
+// modal's keydown stands down while open) at z-index 90 — above the crop
+// modal (50) AND the dl/snap band (80), so Help is unambiguously topmost.
+// §5 "Superuser tools" is the one collapsible section: its default follows
+// the session role (sectionOpenByDefault — collapsed unless S.su), so the
+// body is (re)rendered on open whenever the role it was built for changed.
+// Within a session, heading clicks toggle it and the choice sticks across
+// re-opens (only a re-render resets to the default).
+// --------------------------------------------------------------------------- //
+let _helpBuiltForSu = null; // S.su the panel body was last rendered for (null = never)
+
+function helpBlockEl(b) {
+  if (b.t === 'ul') {
+    const ul = document.createElement('ul');
+    for (const it of b.items) {
+      const li = document.createElement('li');
+      li.innerHTML = it;
+      ul.appendChild(li);
+    }
+    return ul;
+  }
+  if (b.t === 'table') {
+    // wrapped so a narrow window scrolls the TABLE, never the whole page/panel
+    const wrap = document.createElement('div');
+    wrap.className = 'help-table-wrap';
+    const tbl = document.createElement('table');
+    tbl.className = 'help-table';
+    const thead = document.createElement('thead');
+    const hr = document.createElement('tr');
+    for (const h of b.head) {
+      const th = document.createElement('th');
+      th.textContent = h;
+      hr.appendChild(th);
+    }
+    thead.appendChild(hr);
+    tbl.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    for (const row of b.rows) {
+      const tr = document.createElement('tr');
+      for (const cell of row) {
+        const td = document.createElement('td');
+        td.textContent = cell;
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    }
+    tbl.appendChild(tbody);
+    wrap.appendChild(tbl);
+    return wrap;
+  }
+  if (b.t === 'h3') {
+    const h = document.createElement('div');
+    h.className = 'help-subhead';
+    h.innerHTML = b.html;
+    return h;
+  }
+  const p = document.createElement('p');           // 'p' and 'note'
+  if (b.t === 'note') p.className = 'help-note';
+  p.innerHTML = b.html;
+  return p;
+}
+
+function helpRender() {
+  const body = $('help-body');
+  body.innerHTML = '';
+  for (const sec of HELP_SECTIONS) {
+    const secEl = document.createElement('section');
+    secEl.className = 'help-sec';
+    const bodyEl = document.createElement('div');
+    bodyEl.className = 'help-sec-body';
+    bodyEl.id = 'help-sec-' + sec.id;
+    if (sec.collapsible) {
+      // disclosure heading, same affordance family as the Filters caret
+      const open = sectionOpenByDefault(sec, S.su);
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'help-sec-toggle';
+      btn.setAttribute('aria-controls', bodyEl.id);
+      const caret = document.createElement('span');
+      caret.className = 'help-caret';
+      const title = document.createElement('span');
+      title.textContent = sec.title;
+      btn.appendChild(caret);
+      btn.appendChild(title);
+      const setOpen = (o) => {
+        bodyEl.hidden = !o;
+        btn.setAttribute('aria-expanded', o ? 'true' : 'false');
+        caret.textContent = o ? '▾' : '▸';
+      };
+      btn.addEventListener('click', () => setOpen(bodyEl.hidden));
+      setOpen(open);
+      secEl.appendChild(btn);
+    } else {
+      const h = document.createElement('div');
+      h.className = 'help-sec-title';
+      h.textContent = sec.title;
+      secEl.appendChild(h);
+    }
+    for (const b of sec.blocks) bodyEl.appendChild(helpBlockEl(b));
+    secEl.appendChild(bodyEl);
+    body.appendChild(secEl);
+  }
+}
+
+function helpOpen() {
+  if (_helpBuiltForSu !== S.su) { helpRender(); _helpBuiltForSu = S.su; }
+  $('help-modal').hidden = false;
+  // focus the box so PageUp/Down + arrows scroll the PANEL (the crop keydown
+  // stands down while Help is open, so arrows never jump crops underneath)
+  $('help-modal').querySelector('.help-box').focus();
+}
+function helpClose() { $('help-modal').hidden = true; }
+
+function setupHelpDialog() {
+  const modal = $('help-modal');
+  modal.addEventListener('click', (e) => { if (e.target === modal) helpClose(); });
+  $('help-close').addEventListener('click', helpClose);
+  $('btn-help').addEventListener('click', helpOpen);
+  // stopPropagation so the crop toolbar/stage never reads the press as a
+  // draw/pan gesture (same idiom as the crop nav arrows)
+  $('crop-help').addEventListener('mousedown', (e) => e.stopPropagation());
+  $('crop-help').addEventListener('click', (e) => { e.stopPropagation(); helpOpen(); });
+  // Esc closes. Topmost modal owns the keyboard: the crop / download /
+  // snapshots handlers all bail out while #help-modal is open.
+  document.addEventListener('keydown', (e) => {
+    if ($('help-modal').hidden) return;
+    if (e.key === 'Escape') { e.preventDefault(); helpClose(); }
   });
 }
 
@@ -3043,6 +3186,7 @@ function boot() {
   $('gate-project').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('passcode').focus(); });
   $('btn-download').addEventListener('click', dlOpen);
   setupDownloadDialog();
+  setupHelpDialog();      // both roles; content renders on first open (needs S.su)
   setupSnapshotsDialog(); // inert until a superuser session builds its opener
   setupHistoryPanel();    // likewise
   $('btn-refresh').addEventListener('click', () => { refreshMarks(); });

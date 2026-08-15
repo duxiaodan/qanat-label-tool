@@ -57,6 +57,11 @@
       <!-- GT review mode (hidden unless the URL has ?gtreview=1) -->
       <span id="gt-review-counter" class="gt-review-counter" hidden></span>
       <button id="btn-gt-review-dl" hidden disabled>Download review JSON</button>
+      <!-- Help: far right of the button cluster, visible to BOTH roles (static
+           markup, unlike the superuser-only openers built at unlock). Opens
+           #help-modal; a twin opener (#crop-help) lives in the crop toolbar. -->
+      <button id="btn-help" class="btn-help" type="button" title="Help"
+              aria-label="Help" aria-haspopup="dialog">?</button>
       <span id="sync-status" class="sync-status"></span>
       <span id="status" class="status"></span>
     </header>
@@ -140,6 +145,10 @@
           <button id="crop-clear">Clear this crop</button>
           <button id="crop-save">Save work</button>
           <button id="crop-close">Close</button>
+          <!-- Help must be reachable from inside the crop view too (the crop
+               modal covers the topbar opener). Same dialog, layered above. -->
+          <button id="crop-help" class="btn-help" type="button" title="Help"
+                  aria-label="Help" aria-haspopup="dialog">?</button>
         </span>
       </div>
       <div id="crop-stage">
@@ -282,6 +291,23 @@
 
       <div class="snap-actions">
         <button id="snap-close" type="button">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- help panel (both roles). Same modal conventions as #dl-modal/#snap-modal
+       (fixed overlay, backdrop click + Esc close, the crop modal's keydown
+       stands down while open) but stacked ABOVE them (z-index 90 vs 80): Help
+       is openable from inside the crop view and must always sit on top. The
+       shell is static; #help-body is rendered from helpcontent.js on open, so
+       the §5 collapsed/expanded default can follow the session role (S.su). -->
+  <div id="help-modal" class="modal help-modal" hidden role="dialog" aria-modal="true"
+       aria-labelledby="help-title">
+    <div class="help-box" tabindex="-1">
+      <div class="help-title" id="help-title">Qanat Label Tool — User Guide</div>
+      <div id="help-body" class="help-body"></div>
+      <div class="help-actions">
+        <button id="help-close" type="button">Close</button>
       </div>
     </div>
   </div>
