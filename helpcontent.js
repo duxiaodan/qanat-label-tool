@@ -59,7 +59,7 @@ export const HELP_SECTIONS = [
       { t: 'p', html: 'Working with your own marks:' },
       { t: 'ul', items: [
         '<b>Select</b> one by clicking it, or <b>box-select</b> several with a left-drag.',
-        '<b>Delete</b> removes the selected marks.',
+        '<b>Delete</b> (or <b>Backspace</b>) removes the selected marks.',
         '<b>Move</b>: click a mark to select it, then press and drag it. On a polyline, grabbing a vertex moves that vertex; grabbing the line between vertices moves the whole line. <b>Esc during a drag</b> puts it back.',
         '<b>Undo last</b> removes your most recent mark; <b>Clear this crop</b> removes all of your marks in the crop.',
         '<b>Save work</b> uploads your changes. Until you save, changes exist only in your browser.',
@@ -113,7 +113,7 @@ export const HELP_SECTIONS = [
           ['Crop view', 'double-click / Enter', 'finish polyline'],
           ['Crop view', 'left-drag', 'box-select your marks'],
           ['Crop view', 'press + drag a selected mark', 'move it'],
-          ['Crop view', 'Delete', 'delete selected marks'],
+          ['Crop view', 'Delete / Backspace', 'delete selected marks'],
           ['Crop view', 'right-drag / middle-drag', 'pan'],
           ['Crop view', 'wheel', 'zoom'],
           ['Crop view', 'arrow keys', 'jump to adjacent crop'],
