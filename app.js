@@ -16,7 +16,7 @@ import { deriveKey, decryptBlob, encryptBlob, verifyPasscode, openSuEnvelope, de
 import {
   fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks, updateMark,
   createSnapshot, listSnapshots, restoreSnapshot,
-  fetchMarkHistory, restoreMarkVersion,
+  fetchMarkHistory, restoreMarkVersion, fetchWorkflowStates, fetchCropView, cropCommand, fetchCropHistory,
 } from './sync.js';
 import {
   attribution, othersDeleteIds, pruneOthers, dropPoolMarksByDbId, cropDirtyState,
@@ -33,6 +33,29 @@ import {
 } from './exportscope.js';
 import { HELP_SECTIONS, sectionOpenByDefault } from './helpcontent.js';
 import { SUPABASE } from './site_config.js';
+import { OverviewTiles, overviewMaxScale } from './overviewtiles.js';
+import { workflowPermissions, statusPasses, workflowSummary, workflowBadge } from './workflow.js';
+
+let overviewTiles = null;
+
+async function loadOverviewTile(file, signal) {
+  let url;
+  try {
+    const response = await fetch('overview/' + file, { signal });
+    if (!response.ok) throw new Error('overview tile unavailable');
+    const bytes = await decryptBlob(S.key, new Uint8Array(await response.arrayBuffer()));
+    signal.throwIfAborted();
+    url = URL.createObjectURL(new Blob([bytes], { type: 'image/jpeg' }));
+    const img = new Image();
+    img.alt = ''; img.draggable = false; img.src = url;
+    await img.decode();
+    signal.throwIfAborted();
+    return { img, url };
+  } catch (error) {
+    if (url) URL.revokeObjectURL(url);
+    throw error;
+  }
+}
 
 // --------------------------------------------------------------------------- //
 // state
@@ -59,6 +82,8 @@ const S = {
   // per-session marks (each mark carries `labeler` owner + optional `dbId`)
   shaftMarks: [],       // {cropId, pPos, world:[x,y], created, labeler, dbId?}
   lineMarks: [],        // {cropId, pPos, world:[[x,y],...], created, labeler, dbId?}
+  workflow: { enabled:false, available:false, busy:false, states:new Map(), pending:null, error:'',
+    finished:{mode:'all',people:new Set()}, approved:{mode:'all',people:new Set()} },
   done: new Set(),      // cell ids with >=1 saved mark (from anyone)
   unsynced: false,      // true when a save couldn't reach the backend
   // cell filter — ONE state object drives the sidebar list AND the map spotlight.
@@ -200,6 +225,7 @@ function restore() {
 }
 // recompute `done` from the merged pool: a cell is ✓ if anyone has a mark there.
 function recomputeDone() {
+  if (S.workflow.enabled) { S.done = new Set([...S.workflow.states].filter(([,s]) => s.finished_by).map(([id])=>id)); return; }
   S.done = new Set();
   for (const m of S.shaftMarks) S.done.add(m.cropId);
   for (const m of S.lineMarks) if (m.world && m.world.length >= 2) S.done.add(m.cropId);
@@ -247,23 +273,267 @@ const KIND_CHANNEL = 'channel';
  * but preserve my locally-unsynced marks (so a failed save isn't lost on refresh).
  * Falls back to the local cache when no backend is configured.
  */
-async function pullAllMarks() {
-  if (!backendOn()) { restore(); recomputeDone(); setSyncStatus('local-only', ''); return; }
-  setSyncStatus('syncing…', '');
-  // load the local cache first so any prior-session unsynced marks of mine survive
-  // the merge below (they have no dbId; synced ones picked up dbIds on save).
-  if (!S.shaftMarks.length && !S.lineMarks.length) restore();
-  let rows;
-  try {
-    rows = await fetchAllMarks(SUPABASE, S.board, S.project);
-  } catch (e) {
-    // can't reach backend — fall back to whatever we have locally.
-    restore();
-    recomputeDone();
-    S.unsynced = true;
-    setSyncStatus('offline — using local cache', 'unsynced');
-    return;
+// Workflow state never derives from the existence of marks. It is authoritative
+// only after a server read/command; failed reads disable editing and transitions.
+function workflowAuth() { return {token:S.writeToken,actor:S.me}; }
+function currentWorkflow() { return S.workflow.states.get(S.crop?.cell.id) || {}; }
+function workflowRole() { return S.su?'superuser':'normal'; }
+function pendingWorkflowKey() { return `qanat-workflow-pending:${S.board}:${S.project}:${S.me}`; }
+function storedWorkflowJob() { try { return JSON.parse(localStorage.getItem(pendingWorkflowKey()) || 'null'); } catch { return null; } }
+function workflowDraftKey(cid) { return `qanat-workflow-draft:${S.board}:${S.project}:${S.me}:${cid}`; }
+function storedWorkflowDraft(cid) { try { return JSON.parse(localStorage.getItem(workflowDraftKey(cid)) || 'null'); } catch { return null; } }
+function archivedWorkflowDrafts(cid) {
+  try { return JSON.parse(localStorage.getItem(workflowDraftKey(cid)+':archive') || '[]'); } catch { return []; }
+}
+function archiveWorkflowDraft(cid,draft) {
+  const archives=archivedWorkflowDrafts(cid), raw=JSON.stringify(draft);
+  if(!archives.some(d=>JSON.stringify(d)===raw)) {
+    archives.push(draft); localStorage.setItem(workflowDraftKey(cid)+':archive',JSON.stringify(archives));
   }
+}
+function stashWorkflowDraft() {
+  if(!S.workflow.enabled || !S.crop || !cropIsDirty()) return true;
+  const c=S.crop;
+  try {
+    const prior=storedWorkflowDraft(c.cell.id);
+    if(prior && prior.revision!==c.revision) archiveWorkflowDraft(c.cell.id,prior);
+    localStorage.setItem(workflowDraftKey(c.cell.id),JSON.stringify({cell_id:c.cell.id,world_bbox:c.cell.world_bbox,
+    revision:c.revision,marks:c.marks,inProgress:c.inProgress,
+    pendingOthersDeletes:[...c.pendingOthersDeletes],pendingOthersMoves:[...c.pendingOthersMoves],pendingOwnMoves:[...c.pendingOwnMoves]})); return true; }
+  catch { S.workflow.error='Could not store the local draft. Keep this page open until saved.'; return false; }
+}
+function restoreWorkflowDraft() {
+  if(!S.workflow.enabled || !S.crop || !S.workflow.available) return;
+  const draft=storedWorkflowDraft(S.crop.cell.id); if(!draft)return;
+  if(draft.revision===S.crop.revision && !currentWorkflow().finished_by) {
+    S.crop.marks=draft.marks;S.crop.inProgress=draft.inProgress;S.crop.dirty=true;
+    S.crop.pendingOthersDeletes=new Set(draft.pendingOthersDeletes);
+    S.crop.pendingOthersMoves=new Map(draft.pendingOthersMoves);S.crop.pendingOwnMoves=new Map(draft.pendingOwnMoves);
+    loadCropMarksFor(S.crop.cell); S.crop.marks=draft.marks;
+    S.workflow.error='Unsaved local draft restored. Review it before saving.';
+  } else {
+    try {
+      archiveWorkflowDraft(S.crop.cell.id,draft);
+      localStorage.removeItem(workflowDraftKey(S.crop.cell.id));
+      S.workflow.error='This crop changed while you had unsaved edits. The old draft is kept locally and can be downloaded.';
+    } catch {
+      S.workflow.available=false;
+      S.workflow.error='Could not archive the conflicting draft. Download it before editing.';
+    }
+  }
+}
+function downloadWorkflowDraft() {
+  if(!S.crop)return;
+  const current=storedWorkflowDraft(S.crop.cell.id), archived=archivedWorkflowDrafts(S.crop.cell.id);
+  if(!current && !archived.length)return;
+  const draft=archived.length?{current,archived}:current;
+  const a=document.createElement('a');const url=URL.createObjectURL(new Blob([JSON.stringify(draft,null,2)],{type:'application/json'}));
+  a.href=url;a.download=`qanat_local_draft_${S.crop.cell.id}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+function workflowLocked() {
+  return S.workflow.enabled && (!S.workflow.available || S.workflow.busy || !!S.workflow.pending || !!currentWorkflow().finished_by);
+}
+function acceptWorkflowState(state) {
+  S.workflow.states.set(state.cell_id,state); S.workflow.available=true;
+  if(S.crop?.cell.id===state.cell_id) S.crop.revision=state.revision;
+  recomputeDone(); refreshFilterUI(); refreshDoneMarks(); updateWorkflowUI();
+}
+async function pullWorkflow() {
+  try {
+    const states=await fetchWorkflowStates(SUPABASE,S.board,S.project);
+    S.workflow.states=new Map(states.map(s=>[s.cell_id,s])); S.workflow.available=true;
+  } catch(e) {
+    S.workflow.available=false; S.workflow.error='Status unavailable. Refresh before editing: '+(e.rpcMessage||e.message);
+  }
+  recomputeDone();
+}
+function workflowRequestRejected(error) {
+  // Timeouts/network/5xx outcomes remain uncertain and must keep their receipt.
+  return [400,401,403,404,409,422].includes(error.status);
+}
+async function submitWorkflowJob(job) {
+  // Check before the request/catch: changing roles must never execute or clear
+  // another session's pending command. Roleless legacy jobs require SU recovery.
+  if(job.role && job.role!==workflowRole()) {
+    throw new Error(`This pending save belongs to the ${job.role} role. Sign in with that role to recover it.`);
+  }
+  if(!job.role && !S.su) throw new Error('This older pending save has no recorded role. Use a superuser session to recover it; the local draft is kept.');
+  try { return await cropCommand(SUPABASE,job.command,job.id,workflowAuth()); }
+  catch(error) {
+    if(workflowRequestRejected(error)) {
+      localStorage.removeItem(pendingWorkflowKey()); S.workflow.pending=null;
+    }
+    throw error;
+  }
+}
+async function loadWorkflowCrop(cid,{confirmedJob=null}={}) {
+  try {
+    // An uncertain save survives reload. Replay the exact idempotent command
+    // before accepting the server's crop; never silently duplicate its inserts.
+    const pending=storedWorkflowJob();
+    let confirmed=null;
+    if(pending?.command.cell_id===cid) {
+      try {
+        if(confirmedJob?.id!==pending.id) await submitWorkflowJob(pending);
+        confirmed=pending;
+      } catch(error) {
+        if(!workflowRequestRejected(error)) throw error;
+        // The server rejected this command. Keep its draft and read the latest
+        // crop so the user can recover and continue with a fresh revision.
+      }
+    }
+    const result=await fetchCropView(SUPABASE,S.board,S.project,cid,workflowAuth());
+    const decoded=await decodeMarkRows(result.marks);
+    // A receipt describes the original command; the read above supplies the
+    // current state. Retain recovery records until both have been confirmed.
+    if(confirmed) {
+      localStorage.removeItem(pendingWorkflowKey()); localStorage.removeItem(workflowDraftKey(cid)); S.workflow.pending=null;
+    }
+    S.shaftMarks=[...S.shaftMarks.filter(m=>m.cropId!==cid),...decoded.shafts];
+    S.lineMarks=[...S.lineMarks.filter(m=>m.cropId!==cid),...decoded.lines];
+    S.workflow.states.set(cid,result.state); S.workflow.available=true; S.workflow.error='';
+    if(S.crop?.cell.id===cid) S.crop.revision=result.state.revision;
+    recomputeDone(); persist(); refreshFilterUI(); refreshDoneMarks(); rebuildMineLayer(); applyLayerToggles();
+    return true;
+  } catch(e) {
+    S.workflow.available=false; S.workflow.error='Could not confirm crop state. Local changes kept. '+(e.rpcMessage||e.message);
+    return false;
+  }
+}
+// Refresh the open crop and its revision together. Matching drafts resume;
+// conflicting drafts are archived before further editing can replace them.
+async function reloadWorkflowCrop(confirmedJob=null) {
+  const crop=S.crop;
+  if(!crop || !stashWorkflowDraft()) return false;
+  if(!await loadWorkflowCrop(crop.cell.id,{confirmedJob}) || S.crop!==crop) return false;
+  crop.dirty=false; crop.inProgress=[];
+  crop.pendingOthersDeletes=new Set(); crop.pendingOthersMoves=new Map(); crop.pendingOwnMoves=new Map();
+  loadCropMarksFor(crop.cell); selClear(); crop.selectBox=null; hideCropHoverTip();
+  restoreWorkflowDraft(); redrawCrop(); updateWorkflowUI();
+  return S.workflow.available;
+}
+function updateWorkflowUI() {
+  if(!S.workflow.enabled || !S.crop) return;
+  const state=currentWorkflow(), perm=workflowPermissions(state,S.me,S.su);
+  $('crop-state').textContent=workflowSummary(state);
+  $('crop-workflow-msg').textContent=S.workflow.error || (state.finished_by ? 'Read-only. Reopen this crop before changing its marks.' : '');
+  const busy=S.workflow.busy, offline=!S.workflow.available;
+  for(const [action,allowed] of Object.entries({finish:perm.finish,unfinish:perm.reopen,approve:perm.approve,unapprove:perm.unapprove})) {
+    const button=$('crop-'+action); button.hidden=!allowed;
+    button.disabled=busy||offline||!!S.workflow.pending||(action!=='finish'&&cropIsDirty());
+  }
+  $('crop-finish').textContent=cropIsDirty()?'Save & mark finished':'Mark finished';
+  for(const id of ['crop-undo','crop-clear']) $(id).disabled=workflowLocked();
+  $('crop-save').disabled=busy||((offline||!!state.finished_by)&&!S.workflow.pending);
+  $('crop-save').textContent=S.workflow.pending?'Retry save':'Save work';
+  $('crop-state-history').disabled=busy;
+  $('crop-draft-download').hidden=!storedWorkflowDraft(S.crop.cell.id)&&!archivedWorkflowDrafts(S.crop.cell.id).length;
+}
+async function sendWorkflowSave(job,retry=false) {
+  if(retry) {
+    if(S.crop?.cell.id!==job.command.cell_id) throw new Error('Reload and open the crop with the pending save to recover it.');
+    await submitWorkflowJob(job);
+    if(!await reloadWorkflowCrop(job)) throw new Error(S.workflow.error || 'Could not confirm crop state');
+    S.unsynced=false; persist(); setSyncStatus('saved','ok'); return;
+  }
+  const result=await submitWorkflowJob(job);
+  job.apply(result);
+  localStorage.removeItem(workflowDraftKey(job.command.cell_id));
+  S.workflow.pending=null; localStorage.removeItem(pendingWorkflowKey());
+  if(S.crop?.cell.id===job.command.cell_id) S.crop.dirty=false;
+  S.unsynced=false; S.workflow.error=''; persist();
+  setSyncStatus(job.command.action==='finish'?'saved and finished':'saved','ok');
+}
+async function saveWork(finish=false) {
+  if(!S.crop || S.workflow.busy) return false;
+  if(!S.workflow.enabled) { const ok=await commitCrop(); if(ok) setStatus('saved '+S.crop.cell.id); return ok; }
+  if((!S.workflow.available || currentWorkflow().finished_by) && !S.workflow.pending) { updateWorkflowUI(); return false; }
+  if(S.crop.inProgress.length===1) { S.workflow.error='Add another polyline vertex or cancel the unfinished line before saving.'; updateWorkflowUI(); return false; }
+  const stored=storedWorkflowJob();
+  if(stored && !S.workflow.pending) {
+    S.workflow.error=`A previous save for ${stored.command.cell_id} needs confirmation. Reopen that crop to retry it.`;
+    updateWorkflowUI(); return false;
+  }
+  if(finish && !S.workflow.pending && !confirm(
+    'Mark this crop as finished?\n\n' +
+    'Only confirm after checking the entire crop: all qanats are labeled, or no qanats are present.\n\n' +
+    (cropIsDirty() ? 'Your unsaved labels will be saved. ' : '') +
+    'The crop will be marked finished for everyone and become read-only. It must be reopened before further edits.\n\n' +
+    'Choose Cancel to keep editing. Save work saves labels without marking the crop finished.'
+  )) return false;
+  S.workflow.busy=true; S.workflow.error=''; updateWorkflowUI();
+  try {
+    if(S.workflow.pending) { await sendWorkflowSave(S.workflow.pending,true); redrawCrop(); return true; }
+    return await commitCrop(finish);
+  } catch(e) {
+    if(workflowRequestRejected(e)) { await pullWorkflow(); refreshFilterUI(); refreshDoneMarks(); }
+    S.workflow.error='Save not confirmed; local changes kept. '+(e.rpcMessage||e.message);
+    return false;
+  } finally { S.workflow.busy=false; updateWorkflowUI(); }
+}
+async function workflowAction(action) {
+  if(!S.crop || S.workflow.busy || !S.workflow.available) return;
+  if(action==='finish') { await saveWork(true); return; }
+  const perm=workflowPermissions(currentWorkflow(),S.me,S.su);
+  if(!({unfinish:perm.reopen,approve:perm.approve,unapprove:perm.unapprove})[action] || cropIsDirty()) return;
+  const cid=S.crop.cell.id;
+  S.workflow.busy=true; S.workflow.error=''; updateWorkflowUI();
+  try {
+    const command={board:S.board,project:S.project,cell_id:cid,revision:S.crop.revision,action};
+    const result=await cropCommand(SUPABASE,command,crypto.randomUUID(),workflowAuth());
+    acceptWorkflowState(result.state);
+    if(!$('crop-workflow-history').hidden) await showWorkflowHistory();
+  } catch(e) {
+    const message=e.rpcMessage||e.message;
+    await reloadWorkflowCrop();
+    S.workflow.error=message;
+  }
+  finally { S.workflow.busy=false; updateWorkflowUI(); }
+}
+async function showWorkflowHistory() {
+  if(!S.crop) return;
+  const cid=S.crop.cell.id, panel=$('crop-workflow-history');
+  panel.hidden=false; panel.textContent='Loading status history…';
+  try {
+    const rows=await fetchCropHistory(SUPABASE,S.board,S.project,cid,workflowAuth());
+    if(S.crop?.cell.id!==cid) return;
+    panel.replaceChildren();
+    if(!rows.length) panel.textContent='No status changes yet.';
+    const names={finish:'Marked finished',unfinish:'Removed finished',approve:'Approved',unapprove:'Cancelled approval'};
+    for(const row of rows) {
+      const p=document.createElement('p');
+      p.textContent=`${new Date(row.changed_at).toLocaleString()} · ${row.actor} · ${names[row.action]}${row.via.includes('restore')?' · '+row.via.replaceAll('_',' '):''}`;
+      panel.append(p);
+    }
+  } catch(e) { panel.textContent='Could not load history: '+(e.rpcMessage||e.message); }
+}
+function rebuildWorkflowFilters() {
+  if(!S.workflow.enabled) return;
+  for(const name of ['finished','approved']) {
+    const root=$('filter-'+name), filter=S.workflow[name], field=name+'_by';
+    const names=labelerOrder(new Set([...S.workflow.states.values()].map(s=>s[field]).filter(Boolean).concat([...filter.people])),S.me);
+    const scroll=root.scrollTop; root.replaceChildren();
+    const row=(text,mode,who)=>{
+      const label=document.createElement('label');label.className='filter-chk';
+      const input=document.createElement('input');input.type='checkbox';input.dataset.mode=mode;if(who)input.dataset.who=who;
+      input.checked=filter.mode===mode&&(mode!=='people'||filter.people.has(who));
+      input.addEventListener('change',()=>{
+        if(mode==='people') {
+          if(filter.mode!=='people')filter.people=new Set();
+          if(input.checked)filter.people.add(who);else filter.people.delete(who);
+          filter.mode=filter.people.size?'people':'all';
+        } else {filter.mode=input.checked?mode:'all';filter.people=new Set();}
+        rebuildWorkflowFilters();scheduleFilterRender();
+      });
+      const span=document.createElement('span');span.textContent=text;label.append(input,span);root.append(label);
+    };
+    row('(no restriction)','all');row('(anyone)','any');row(name==='finished'?'(unfinished)':'(unapproved)','none');
+    for(const who of names)row(labelerLabel(who),'people',who);
+    root.scrollTop=scroll;
+  }
+}
+
+async function decodeMarkRows(rows) {
   const shafts = [];
   const lines = [];
   for (const row of rows || []) {
@@ -299,6 +569,28 @@ async function pullAllMarks() {
       lines.push({ cropId, pPos, world, created, labeler: owner, dbId: row.id, ...prov });
     }
   }
+  return {shafts, lines};
+}
+
+async function pullAllMarks() {
+  if (S.workflow.enabled) await pullWorkflow();
+  if (!backendOn()) { restore(); recomputeDone(); setSyncStatus('local-only', ''); return; }
+  setSyncStatus('syncing…', '');
+  // load the local cache first so any prior-session unsynced marks of mine survive
+  // the merge below (they have no dbId; synced ones picked up dbIds on save).
+  if (!S.shaftMarks.length && !S.lineMarks.length) restore();
+  let rows;
+  try {
+    rows = await fetchAllMarks(SUPABASE, S.board, S.project);
+  } catch (e) {
+    // can't reach backend — fall back to whatever we have locally.
+    restore();
+    recomputeDone();
+    S.unsynced = true;
+    setSyncStatus('offline — using local cache', 'unsynced');
+    return;
+  }
+  const {shafts, lines} = await decodeMarkRows(rows);
   // merge my locally-unsynced marks (those without a dbId) so a pending save survives.
   for (const m of S.shaftMarks) if (m.labeler === S.me && !m.dbId) shafts.push(m);
   for (const m of S.lineMarks) if (m.labeler === S.me && !m.dbId) lines.push(m);
@@ -317,12 +609,18 @@ function cellPPos(cropId) {
 
 /** Re-pull the pool + redraw everything (Refresh button + post-save consistency). */
 async function refreshMarks() {
-  await pullAllMarks();
-  refreshFilterUI(); // labeler sets + dropdown options + filtered sidebar + tint
-  refreshDoneMarks();
-  rebuildMineLayer();
-  applyLayerToggles();
-  if (S.crop) reloadCropMarks();
+  if (S.workflow.busy) return;
+  if(S.workflow.enabled) { S.workflow.busy=true; updateWorkflowUI(); }
+  try {
+    await pullAllMarks();
+    refreshFilterUI(); refreshDoneMarks(); rebuildMineLayer(); applyLayerToggles();
+    if (S.crop) {
+      if (S.workflow.enabled) await reloadWorkflowCrop();
+      else reloadCropMarks();
+    }
+  } finally {
+    if(S.workflow.enabled) { S.workflow.busy=false; updateWorkflowUI(); }
+  }
 }
 
 // --------------------------------------------------------------------------- //
@@ -500,6 +798,8 @@ async function unlock() {
     // manifest
     const manBytes = await decryptBlob(S.key, await fetchBytes('manifest.enc'));
     S.manifest = JSON.parse(new TextDecoder().decode(manBytes));
+    S.workflow.enabled = S.manifest.features?.crop_workflow === 1;
+    document.querySelectorAll('[data-workflow]').forEach(e=>e.hidden=!S.workflow.enabled);
     S.cells = (S.manifest.cells || []).slice().sort((a, b) => b.p_pos - a.p_pos);
     S.cellRank = new Map();
     S.cells.forEach((c, i) => { S.cellById.set(c.id, c); S.cellRank.set(c.id, i); });
@@ -533,6 +833,7 @@ async function unlock() {
   computeLabelerCells();   // before buildSideList: the per-labeler cell sets
   initRankSlider();        // rank bounds now that S.cells is known (full range)
   rebuildLabelerChecks();  // needs the freshly pulled pool and S.meDisplay
+  rebuildWorkflowFilters();
   updateFilterSummary();
   buildSideList();
   buildSwathLayers();
@@ -988,10 +1289,12 @@ function filterOpts() {
 }
 function maxRank() { return S.cells.length ? S.cells.length - 1 : 0; }
 /** True when at least one condition narrows the set (drives the veil + summary). */
-function filterActive() { return filterIsActive(filterOpts(), maxRank()); }
+function filterActive() { return filterIsActive(filterOpts(), maxRank()) || (S.workflow.enabled && [S.workflow.finished,S.workflow.approved].some(f=>f.mode!=='all')); }
 function cellMatchesFilter(cid) {
   const r = S.cellRank.has(cid) ? S.cellRank.get(cid) : -1;
-  return cellPasses(cid, r, filterOpts());
+  return cellPasses(cid, r, filterOpts()) && (!S.workflow.enabled || (
+    statusPasses(S.workflow.states.get(cid), 'finished_by', S.workflow.finished) &&
+    statusPasses(S.workflow.states.get(cid), 'approved_by', S.workflow.approved)));
 }
 function countMatches() {
   let n = 0;
@@ -1176,12 +1479,18 @@ function updateFilterSummary() {
     me: S.me,
     meLabel: 'me',
   });
+  if (S.workflow.enabled) {
+    const active = ['finished','approved'].filter(k=>S.workflow[k].mode!=='all');
+    if(active.length) el.textContent += ' · ' + active.join(' + ') + ` · ${countMatches()} crops`;
+  }
   const btn = $('filter-toggle');
   if (btn) btn.classList.toggle('is-active', filterActive());
   const reset = $('filter-reset');
   if (reset) reset.disabled = !filterActive();
 }
 function resetFilter() {
+  for(const k of ['finished','approved']) S.workflow[k]={mode:'all',people:new Set()};
+  rebuildWorkflowFilters();
   S.filter.checked = new Set();
   S.filter.unlabeled = false;
   setRankRange(0, maxRank());
@@ -1274,6 +1583,7 @@ function applyFilterClip(clipD) {
 }
 /** Full refresh of everything the filter drives (call after pool changes). */
 function refreshFilterUI() {
+  rebuildWorkflowFilters();
   computeLabelerCells();
   rebuildLabelerChecks(); // keeps the selection for labelers that still exist
   updateFilterSummary();
@@ -1292,11 +1602,12 @@ function buildSideList() {
     if (!cellMatchesFilter(c.id)) continue; // active filter -> matching cells only
     const li = document.createElement('li');
     li.dataset.cid = c.id;
-    li.innerHTML = `<span class="done">${S.done.has(c.id) ? '✓' : ''}</span>` +
+    li.innerHTML = `<span class="done">${S.workflow.enabled ? workflowBadge(S.workflow.states.get(c.id)) : S.done.has(c.id) ? '✓' : ''}</span>` +
       // review-mode badge slot (content painted by reviewRefreshUI); the added
       // string is '' in normal mode, so the markup is unchanged there.
       (S.review.on && S.review.eligible.has(c.id) ? '<span class="gtr-badge"></span>' : '') +
       `<span class="cid">${c.id}</span><span class="pp">${fmtP(c.p_pos)}</span>`;
+    if (S.workflow.enabled) li.querySelector('.done').title=workflowSummary(S.workflow.states.get(c.id));
     li.addEventListener('click', () => openCrop(c.id));
     li.addEventListener('mouseenter', () => highlightCell(c.id, true, true));
     li.addEventListener('mouseleave', () => highlightCell(c.id, false, true));
@@ -1306,7 +1617,8 @@ function buildSideList() {
 function refreshDoneMarks() {
   for (const li of $('cell-list').children) {
     const cid = li.dataset.cid;
-    li.querySelector('.done').textContent = S.done.has(cid) ? '✓' : '';
+    if(S.workflow.enabled) { li.querySelector('.done').innerHTML=workflowBadge(S.workflow.states.get(cid)); li.querySelector('.done').title=workflowSummary(S.workflow.states.get(cid)); }
+    else li.querySelector('.done').textContent = S.done.has(cid) ? '✓' : '';
   }
   document.querySelectorAll('#swath-svg .cell-rect').forEach((r) => {
     r.classList.toggle('done', S.done.has(r.dataset.cid));
@@ -1387,6 +1699,13 @@ function svgEl(name, attrs) {
 }
 function buildSwathLayers() {
   const img = $('swath-img'); const heat = $('heat-img'); const svg = $('swath-svg');
+  overviewTiles?.dispose();
+  const tileLayer = $('overview-tiles');
+  tileLayer.style.width = `${S.swathW}px`; tileLayer.style.height = `${S.swathH}px`;
+  overviewTiles = S.manifest.swath.pyramid ? new OverviewTiles(
+    tileLayer, S.manifest.swath, loadOverviewTile,
+    message => { $('overview-status').textContent = message; }) : null;
+  svg.classList.toggle('has-overview-detail', !!overviewTiles);
   img.width = S.swathW; img.height = S.swathH;
   heat.width = S.swathW; heat.height = S.swathH;
   svg.setAttribute('width', S.swathW); svg.setAttribute('height', S.swathH);
@@ -1496,8 +1815,11 @@ function applyLayerToggles() {
 function applySwathTransform() {
   const { x, y, scale } = S.view;
   $('swath-stage').style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+  $('swath-svg').style.setProperty('--overview-scale', scale);
   updateHlStrokeWidths(); // keep the hover-casing outline constant in screen px
   updateScaleBar();
+  const wrap = $('swath-wrap');
+  overviewTiles?.schedule({ ...S.view }, wrap.clientWidth, wrap.clientHeight, window.devicePixelRatio);
 }
 // "nice" round distances (m) for the dynamic scale bar (1/2/5 x 10^n)
 const SCALE_NICE_M = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3,
@@ -1519,7 +1841,9 @@ function updateScaleBar() {
 function fitSwath() {
   const wrap = $('swath-wrap');
   const sx = wrap.clientWidth / S.swathW, sy = wrap.clientHeight / S.swathH;
-  S.view.scale = Math.min(sx, sy) * 0.98;
+  const fitScale = Math.min(sx, sy) * 0.98;
+  S.view.scale = S.manifest.swath.pyramid
+    ? Math.min(fitScale, overviewMaxScale(S.manifest.swath)) : fitScale;
   S.view.x = (wrap.clientWidth - S.swathW * S.view.scale) / 2;
   S.view.y = (wrap.clientHeight - S.swathH * S.view.scale) / 2;
   applySwathTransform();
@@ -1553,7 +1877,7 @@ function setupSwathPanZoom() {
     const rect = wrap.getBoundingClientRect();
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
     const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-    const ns = Math.max(0.05, Math.min(40, S.view.scale * factor));
+    const ns = Math.max(0.05, Math.min(overviewMaxScale(S.manifest.swath), S.view.scale * factor));
     // keep the point under the cursor fixed
     S.view.x = mx - (mx - S.view.x) * (ns / S.view.scale);
     S.view.y = my - (my - S.view.y) * (ns / S.view.scale);
@@ -1670,7 +1994,8 @@ function closeNavDialog(choice) { if (S.navDialog) S.navDialog(choice); }
  * Zoom is deliberately not preserved — openCrop's fitCrop() resets it.
  */
 async function navigateCrop(dir) {
-  if (S.navBusy) return;                       // a jump/prompt is already running
+  if (S.navBusy || S.workflow.busy) return;
+  if (S.workflow.pending) { S.workflow.error='Save result unknown. Retry save before leaving this crop.'; updateWorkflowUI(); return; }                       // a jump/prompt is already running
   if (!S.crop || $('crop-modal').hidden) return;
   const target = neighbourCell(S.crop.cell, dir);
   if (!target) return;                          // no such neighbour -> nothing to do
@@ -1682,9 +2007,10 @@ async function navigateCrop(dir) {
       if (!S.crop) return;                      // modal closed while the prompt was up
       if (choice === 'save') {
         const savedId = S.crop.cell.id;
-        await commitCrop();                     // MUST finish before openCrop replaces S.crop
+        if (!await saveWork()) return;                     // MUST finish before openCrop replaces S.crop
         setStatus('saved ' + savedId);
       }
+      if(choice==='discard' && S.workflow.enabled) localStorage.removeItem(workflowDraftKey(S.crop.cell.id));
       // 'discard': openCrop below rebuilds the marks from the pool, so the
       // uncommitted edits simply never leave S.crop.
     }
@@ -1701,7 +2027,8 @@ async function navigateCrop(dir) {
  * Shares S.navBusy so a close request can't race a pending nav prompt/jump.
  */
 async function requestCloseCrop() {
-  if (S.navBusy) return;                       // a jump/prompt is already running
+  if (S.navBusy || S.workflow.busy) return;
+  if (S.workflow.pending) { S.workflow.error='Save result unknown. Retry save before leaving this crop.'; updateWorkflowUI(); return; }                       // a jump/prompt is already running
   if (!S.crop || $('crop-modal').hidden) return;
   if (!cropIsDirty()) { closeCrop(false); return; }
   S.navBusy = true;
@@ -1711,9 +2038,10 @@ async function requestCloseCrop() {
     if (!S.crop) return;                       // modal closed while the prompt was up
     if (choice === 'save') {
       const savedId = S.crop.cell.id;
-      await commitCrop();                      // fully awaited BEFORE the close, like navigateCrop
+      if (!await saveWork()) return;                      // fully awaited BEFORE the close, like navigateCrop
       setStatus('saved ' + savedId);
     }
+    if(choice==='discard' && S.workflow.enabled) localStorage.removeItem(workflowDraftKey(S.crop.cell.id));
     // 'discard': closeCrop nulls S.crop, so the uncommitted edits never reach
     // the pool — the next openCrop rebuilds marks from the saved pool.
     closeCrop(false);
@@ -1726,71 +2054,80 @@ async function requestCloseCrop() {
 // crop popup
 // --------------------------------------------------------------------------- //
 async function openCrop(cid) {
-  const cell = S.cellById.get(cid);
-  if (!cell) return;
-  setStatus(`loading crop ${cid}…`);
-  let img;
+  if(S.workflow.busy) return;
+  if(S.workflow.pending) { S.workflow.error='Save result unknown. Retry save before leaving this crop.'; updateWorkflowUI(); return; }
+  S.workflow.busy=true; updateWorkflowUI();
   try {
-    const url = await decryptToBlobUrl('crops/' + cell.crop, 'image/jpeg');
-    img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
-  } catch (e) { setStatus('crop load failed: ' + e.message); return; }
-  setStatus('');
-  const canvas = $('crop-canvas');
-  canvas.width = 1024; canvas.height = 1024;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(img, 0, 0, 1024, 1024);
-  const raw = ctx.getImageData(0, 0, 1024, 1024);
+    if(S.workflow.enabled) await loadWorkflowCrop(cid);
+    const cell = S.cellById.get(cid);
+    if (!cell) return;
+    setStatus(`loading crop ${cid}…`);
+    let img;
+    try {
+      const url = await decryptToBlobUrl('crops/' + cell.crop, 'image/jpeg');
+      img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
+    } catch (e) { setStatus('crop load failed: ' + e.message); return; }
+    setStatus('');
+    const canvas = $('crop-canvas');
+    canvas.width = 1024; canvas.height = 1024;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0, 1024, 1024);
+    const raw = ctx.getImageData(0, 0, 1024, 1024);
 
-  S.crop = {
-    cell, raw, ctx, img,
-    view: { x: 0, y: 0, scale: 1 },
-    marks: { points: [], lines: [] },      // MY editable marks ({px|pts, ac} objects)
-    others: { points: [], lines: [] },     // OTHERS' read-only marks (bare pixel coords)
-    inProgress: [],
-    // indices of currently-selected marks. points/lines = OWN marks; oPoints/
-    // oLines = OTHERS' marks (only ever populated while "Edit others" is on).
-    selected: { points: new Set(), lines: new Set(), oPoints: new Set(), oLines: new Set() },
-    selectBox: null,       // [c0, r0, c1, r1] in 1024² coords while rubber-band-dragging
-    dirty: false,          // unsaved mark edits (drives the unsaved-marks prompt on nav AND close)
-    // superuser cross-labeler edits pending commit: row ids of OTHERS' marks
-    // deleted in this crop but not yet saved. Committed by commitCrop via
-    // rpc_delete_marks (explicitly — the own-marks reconcile never touches
-    // them); counted by cropIsDirty so the unsaved prompt guards them too.
-    pendingOthersDeletes: new Set(),
-    // …and drag-MOVES of others' marks pending commit: dbId -> {kind, px|pts}
-    // (crop-px geometry). Committed by commitCrop via rpc_update_mark (geom
-    // only — the server stamps edited_by, labeler never changes). Last move
-    // wins; a pending delete of the same mark drops its move. Counted by
-    // cropIsDirty exactly like the pending deletes.
-    pendingOthersMoves: new Map(),
-    // …and drag-MOVES of OWN already-saved marks (same dbId -> {kind, px|pts}
-    // shape). A moved own mark KEEPS its dbId — the reconcile treats it as
-    // kept — and "Save work" commits the move as an identity-preserving
-    // rpc_update_mark {geom} on the same row (id, created_at and the history
-    // chain all survive; own-row updates never stamp edited_by). Last move
-    // wins; deleting the mark drops its move; counted by cropIsDirty;
-    // refresh-proof via applyPendingMoves in loadCropMarksFor.
-    pendingOwnMoves: new Map(),
-  };
-  loadCropMarksFor(cell);
-  $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}   (${cell.gt_points.length} GT shafts)`;
-  // GT-review verdict buttons: only in review mode AND for eligible cells
-  // (in normal mode `show` is false and the span stays hidden, as shipped).
-  const revBtns = $('gt-review-btns');
-  if (revBtns) {
-    const show = S.review.on && S.review.eligible.has(cell.id);
-    revBtns.hidden = !show;
-    if (show) reviewSyncCropButtons();
-  }
-  $('crop-autocontrast').checked = false;
-  $('crop-gt').checked = true;
-  document.querySelector('input[name="drawmode"][value="point"]').checked = true;
-  $('crop-modal').hidden = false;
-  updateCropNavButtons(); // edge arrows for whichever neighbours this cell has
-  resizeCropOverlay();   // stage has a layout size only now that the modal is shown
-  fitCrop();
-  redrawCrop();
+    S.crop = {
+      cell, raw, ctx, img, revision:S.workflow.states.get(cid)?.revision ?? 0,
+      view: { x: 0, y: 0, scale: 1 },
+      marks: { points: [], lines: [] },      // MY editable marks ({px|pts, ac} objects)
+      others: { points: [], lines: [] },     // OTHERS' read-only marks (bare pixel coords)
+      inProgress: [],
+      // indices of currently-selected marks. points/lines = OWN marks; oPoints/
+      // oLines = OTHERS' marks (only ever populated while "Edit others" is on).
+      selected: { points: new Set(), lines: new Set(), oPoints: new Set(), oLines: new Set() },
+      selectBox: null,       // [c0, r0, c1, r1] in 1024² coords while rubber-band-dragging
+      dirty: false,          // unsaved mark edits (drives the unsaved-marks prompt on nav AND close)
+      // superuser cross-labeler edits pending commit: row ids of OTHERS' marks
+      // deleted in this crop but not yet saved. Committed by commitCrop via
+      // rpc_delete_marks (explicitly — the own-marks reconcile never touches
+      // them); counted by cropIsDirty so the unsaved prompt guards them too.
+      pendingOthersDeletes: new Set(),
+      // …and drag-MOVES of others' marks pending commit: dbId -> {kind, px|pts}
+      // (crop-px geometry). Committed by commitCrop via rpc_update_mark (geom
+      // only — the server stamps edited_by, labeler never changes). Last move
+      // wins; a pending delete of the same mark drops its move. Counted by
+      // cropIsDirty exactly like the pending deletes.
+      pendingOthersMoves: new Map(),
+      // …and drag-MOVES of OWN already-saved marks (same dbId -> {kind, px|pts}
+      // shape). A moved own mark KEEPS its dbId — the reconcile treats it as
+      // kept — and "Save work" commits the move as an identity-preserving
+      // rpc_update_mark {geom} on the same row (id, created_at and the history
+      // chain all survive; own-row updates never stamp edited_by). Last move
+      // wins; deleting the mark drops its move; counted by cropIsDirty;
+      // refresh-proof via applyPendingMoves in loadCropMarksFor.
+      pendingOwnMoves: new Map(),
+    };
+    loadCropMarksFor(cell);
+    $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}   (${cell.gt_points.length} GT shafts)`;
+    // GT-review verdict buttons: only in review mode AND for eligible cells
+    // (in normal mode `show` is false and the span stays hidden, as shipped).
+    const revBtns = $('gt-review-btns');
+    if (revBtns) {
+      const show = S.review.on && S.review.eligible.has(cell.id);
+      revBtns.hidden = !show;
+      if (show) reviewSyncCropButtons();
+    }
+    $('crop-autocontrast').checked = false;
+    $('crop-gt').checked = true;
+    document.querySelector('input[name="drawmode"][value="point"]').checked = true;
+    restoreWorkflowDraft();
+    $('crop-workflow-history').hidden=true;
+    $('crop-modal').hidden = false;
+    updateCropNavButtons(); // edge arrows for whichever neighbours this cell has
+    resizeCropOverlay();   // stage has a layout size only now that the modal is shown
+    fitCrop();
+    redrawCrop();
+  } finally { S.workflow.busy=false; updateWorkflowUI(); }
 }
+
 // (re)derive the crop's mine/others pixel marks from the merged S.*Marks pool.
 function loadCropMarksFor(cell) {
   const cid = cell.id;
@@ -1884,6 +2221,7 @@ function selectFromBox(box, additive) {
   }
 }
 function deleteSelected() {
+  if(workflowLocked()) return;
   if (!S.crop || selCount() === 0) return;
   const removedOwn = [];
   const pi = [...S.crop.selected.points].sort((a, b) => b - a);
@@ -2068,6 +2406,8 @@ function drawCropOverlay() {
 }
 // "repaint everything" entry point (kept so all existing call sites stay valid)
 function redrawCrop() {
+  stashWorkflowDraft();
+  updateWorkflowUI();
   if (!S.crop) return;
   redrawCropImage();
   drawCropOverlay();
@@ -2191,6 +2531,7 @@ function showCropHoverTip(name, sx, sy) {
   tip.style.top = Math.max(pad, top) + 'px';
 }
 function finishInProgressLine() {
+  if(workflowLocked()) return;
   // provenance: the line is stamped with the toggle state at COMPLETION time
   // (dblclick/Enter/mode-switch/commit flush), one `ac` flag per line.
   if (S.crop.inProgress.length >= 2) {
@@ -2280,7 +2621,7 @@ function setupCropInteractions() {
     const additive = e.shiftKey || e.ctrlKey || e.metaKey;
     // a plain press on an already-selected mark grabs it for a drag-move;
     // additive (shift/ctrl/meta) presses keep their selection semantics.
-    if (!additive) {
+    if (!additive && !workflowLocked()) {
       const t = findCropDragTarget(px);
       if (t) {
         const m = dragTargetMark(t);
@@ -2377,6 +2718,7 @@ function setupCropInteractions() {
         const hit = hitTestOwn(pressPx) || (suEditOn() ? hitTestOthers(pressPx) : null);
         if (hit) { selSet(hit.kind, hit.idx, pressAdditive); redrawCrop(); return; }
         if (!pressAdditive) selClear();
+        if(workflowLocked()) { redrawCrop(); return; }
         // new point: stamped with the toggle state at the moment it is added.
         if (drawMode() === 'point') S.crop.marks.points.push({ px: pressPx, ac: $('crop-autocontrast').checked });
         else S.crop.inProgress.push(pressPx);
@@ -2442,7 +2784,7 @@ function setupCropInteractions() {
   $('crop-autocontrast').addEventListener('change', redrawCrop);
   $('crop-gt').addEventListener('change', redrawCrop);
   $('crop-undo').addEventListener('click', () => {
-    if (!S.crop) return;
+    if (!S.crop || workflowLocked()) return;
     if (S.crop.inProgress.length) { S.crop.inProgress.pop(); S.crop.dirty = true; }
     else if (S.crop.marks.points.length || S.crop.marks.lines.length) {
       // undo whichever was added last is ambiguous after reload; pop a point first, else a line
@@ -2457,14 +2799,18 @@ function setupCropInteractions() {
     redrawCrop();
   });
   $('crop-clear').addEventListener('click', () => {
-    if (!S.crop) return;
+    if (!S.crop || workflowLocked()) return;
     if (!confirm('Remove all your marks for this crop?')) return;
     S.crop.marks.points = []; S.crop.marks.lines = []; S.crop.inProgress = []; S.crop.selectBox = null; selClear();
     S.crop.pendingOwnMoves = new Map();   // every own row goes on save — no moves left to commit
     S.crop.dirty = true;
     redrawCrop();
   });
-  $('crop-save').addEventListener('click', () => { commitCrop(); setStatus('saved ' + S.crop.cell.id); });
+  $('crop-save').addEventListener('click', () => saveWork());
+  for(const action of ['finish','unfinish','approve','unapprove']) $('crop-'+action).addEventListener('click',()=>workflowAction(action));
+  $('crop-state-history').addEventListener('click',showWorkflowHistory);
+  $('crop-state-refresh').addEventListener('click',refreshMarks);
+  $('crop-draft-download').addEventListener('click',downloadWorkflowDraft);
   // guarded: prompts Save & close / Discard & close / Cancel on unsaved marks
   $('crop-close').addEventListener('click', () => requestCloseCrop());
   // ---- backdrop click closes the crop view (guarded exactly like Close) ----
@@ -2569,8 +2915,9 @@ function setupCropInteractions() {
     }
   });
 }
-async function commitCrop() {
-  if (!S.crop) return;
+async function commitCrop(finish = false) {
+  if (!S.crop) return false;
+  let saved = !backendOn();
   const cell = S.crop.cell;
   // flush any in-progress polyline (completing it now → stamp the current toggle)
   if (S.crop.inProgress.length >= 2) {
@@ -2669,6 +3016,27 @@ async function commitCrop() {
       }
       // writes go through the token-gated RPCs; actor = the gate name.
       const auth = { token: S.writeToken, actor: S.me };
+      if (S.workflow.enabled) {
+        const updates = [], movedOthers = new Map();
+        for(const [id,mv] of pendingOwn) if(keptIds.has(id)) updates.push({id,patch:{geom:await encryptGeom(moveWorld(mv))}});
+        for(const [id,mv] of pendingMoves) if(!pendingOthers.has(id)) {
+          const world=moveWorld(mv); updates.push({id,patch:{geom:await encryptGeom(world)}});
+          movedOthers.set(id,{world,editedBy:S.me});
+        }
+        const job = { id:crypto.randomUUID(), role:workflowRole(), command:{board:S.board,project:S.project,cell_id:cell.id,
+          revision:S.crop.revision,action:finish?'finish':'save',
+          delete_ids:[...new Set([...toDelete,...pendingOthers])], inserts:inserts.map(x=>x.row),updates},
+          apply:result=>{
+            backfillInsertedIds(inserts,result.inserted);
+            if(S.crop?.cell===cell) S.crop.pendingOwnMoves=new Map();
+            if(pendingOthers.size) applyOthersDeletes(cell,pendingOthers);
+            if(movedOthers.size) applyOthersMoves(cell,movedOthers);
+            acceptWorkflowState(result.state);
+          }};
+        localStorage.setItem(pendingWorkflowKey(),JSON.stringify({id:job.id,role:job.role,command:job.command}));
+        S.workflow.pending=job;
+        await sendWorkflowSave(job);
+      } else {
       await deleteMarksByIds(SUPABASE, S.board, S.me, cell.id, toDelete, S.project, auth);
       const inserted = await insertMarks(SUPABASE, S.board, S.me, cell.id, inserts.map((x) => x.row), S.project, auth);
       // tag freshly-inserted marks with their dbId (so the next save skips them)
@@ -2734,12 +3102,18 @@ async function commitCrop() {
           if (confirmed.size) applyOthersMoves(cell, confirmed);
         }
       }
+      }
+      saved = true;
       S.unsynced = false;
       setSyncStatus('saved', 'ok');
     } catch (e) {
       // keep local, flag unsynced, retry on next save/refresh. Surface the
       // server's rejection reason (e.g. "invalid write token") — a rejected
       // write must read clearly, not silently look like a network blip.
+      if(S.workflow.enabled) {
+        S.workflow.error=e.rpcMessage || e.message;
+        await pullWorkflow();
+      }
       S.unsynced = true;
       const why = e && e.rpcMessage ? ` (${e.rpcMessage})` : '';
       setSyncStatus(`unsynced — kept locally${why}`, 'unsynced');
@@ -2761,12 +3135,13 @@ async function commitCrop() {
   persist();
   // everything the user drew is now in the pool (and, when configured, the DB) —
   // guard on the cell because closeCrop(true) can null/replace S.crop meanwhile.
-  if (S.crop && S.crop.cell === cell) S.crop.dirty = false;
+  if (S.crop && S.crop.cell === cell) S.crop.dirty = !saved;
   redrawCrop();
   // a selected just-saved mark now HAS a dbId — flip its History… button from
   // "unsaved mark — save first" to enabled without requiring a selection
   // change. Safe on every path (no-op without the button / a closed crop).
   updateHistoryButton();
+  return saved;
 }
 /** Confirmed cross-labeler deletes: drop the rows from the pool, clear them
  *  from the crop's pending set, and repaint everything the pool drives. */
@@ -3160,7 +3535,12 @@ function setupHelpDialog() {
   // snapshots handlers all bail out while #help-modal is open.
   document.addEventListener('keydown', (e) => {
     if ($('help-modal').hidden) return;
-    if (e.key === 'Escape') { e.preventDefault(); helpClose(); }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      // Later document listeners must not reuse this key after Help is hidden.
+      e.stopImmediatePropagation();
+      helpClose();
+    }
   });
 }
 

@@ -204,6 +204,9 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
 #swath-stage { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
 #swath-stage img { position: absolute; left: 0; top: 0; user-select: none; -webkit-user-drag: none; image-rendering: pixelated; }
 #heat-img { pointer-events: none; }
+#overview-tiles { position: absolute; left: 0; top: 0; overflow: hidden; pointer-events: none; }
+#overview-status { position: absolute; top: 8px; left: 8px; background: #15171cdd; color: #ddd; padding: 4px 8px; font-size: 12px; pointer-events: none; }
+#overview-status:empty { display: none; }
 #swath-svg { position: absolute; left: 0; top: 0; overflow: visible; }
 #swath-svg .cell-rect { fill: transparent; stroke: rgba(255,255,255,.12); stroke-width: 0.6; cursor: pointer; }
 #swath-svg .cell-rect:hover, #swath-svg .cell-rect.hover { fill: rgba(120,170,255,.12); stroke: rgba(120,170,255,.7); }
@@ -233,6 +236,11 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
 #swath-svg .mine-line { fill: none; stroke: #39ff14; stroke-width: 1.2; }
 #swath-svg .others-dot { fill: #ff9500; opacity: .9; }      /* others' marks = orange, read-only */
 #swath-svg .others-line { fill: none; stroke: #ff9500; stroke-width: 1.2; opacity: .9; }
+/* Detail-enabled overviews cap marks at 3 screen px; crop marks are separate. */
+#swath-svg.has-overview-detail .gt-dot { r: min(1.2px, calc(3px / var(--overview-scale, 1))); }
+#swath-svg.has-overview-detail .mine-dot { r: min(1.6px, calc(3px / var(--overview-scale, 1))); }
+#swath-svg.has-overview-detail .others-dot { r: min(1.4px, calc(3px / var(--overview-scale, 1))); }
+#swath-svg.has-overview-detail .mine-line, #swath-svg.has-overview-detail .others-line { stroke-width: min(1.2px, calc(2px / var(--overview-scale, 1))); }
 #swath-hint {
   position: absolute; right: 8px; bottom: 8px; font-size: 11px; color: #889; background: rgba(0,0,0,.45);
   padding: 3px 7px; border-radius: 4px; pointer-events: none;
@@ -278,7 +286,7 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
 .modal-tools { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px; }
 .modal-tools label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
 .modal-tools .drawmode { display: flex; gap: 10px; padding: 0 8px; border-left: 1px solid #444; border-right: 1px solid #444; }
-.modal-tools button { padding: 5px 10px; border-radius: 5px; border: none; background: #333a48; color: #eee; cursor: pointer; font-size: 12px; }
+.modal-tools button, #crop-workflow button { padding: 5px 10px; border-radius: 5px; border: none; background: #333a48; color: #eee; cursor: pointer; font-size: 12px; }
 .modal-tools button#crop-save { background: #2a6df0; font-weight: 600; }
 .modal-tools button:hover { filter: brightness(1.2); }
 #crop-stage { flex: 1; overflow: hidden; background: #000; border-radius: 4px; position: relative; min-height: 60vh; }
@@ -570,3 +578,17 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
 .modal-tools button.btn-help:focus-visible {
   outline: none; box-shadow: 0 0 0 2px #1b1e25, 0 0 0 4px #2a6df0;
 }
+
+/* Crop completion and review: text and shape both identify the state. */
+.approved-badge { width:17px; height:19px; color:#469ce8; vertical-align:middle; }
+#cell-list .done { min-width:20px; }
+#crop-workflow { padding:8px 12px; display:flex; flex-wrap:wrap; align-items:center; gap:8px; background:#182330; border-bottom:1px solid #354354; }
+#crop-workflow[hidden] { display:none; }
+#crop-state { flex:1 1 280px; font-size:12px; }
+#crop-workflow-msg { flex-basis:100%; color:#f1be70; font-size:12px; }
+#crop-workflow-history { flex-basis:100%; max-height:180px; overflow:auto; font-size:12px; }
+#crop-workflow-history p { margin:5px 0; }
+
+#crop-workflow button:disabled, .modal-tools button:disabled { opacity:.45; cursor:default; }
+#crop-workflow #crop-approve { background:#2a6df0; }
+#crop-workflow #crop-finish { background:#237a42; font-weight:600; }

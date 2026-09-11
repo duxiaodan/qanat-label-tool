@@ -294,3 +294,34 @@ export async function deleteMyCellMarks(cfg, board, labeler, cellId, project, au
   const existing = await fetchMyCellMarks(cfg, board, labeler, cellId, project);
   return deleteMarksByIds(cfg, board, labeler, cellId, existing.map((r) => r.id), project, auth);
 }
+
+// Crop workflow is opt-in at the manifest; shared state remains server-confirmed.
+export async function fetchWorkflowStates(cfg, board, project) {
+  if (!cfg) throw new Error('workflow requires an online backend');
+  const url = `${_base(cfg)}/rest/v1/crop_workflow?board=eq.${encodeURIComponent(board)}&project=eq.${encodeURIComponent(project)}&select=*&order=cell_id.asc`;
+  const all = [];
+  for (let from=0;;from+=FETCH_PAGE) {
+    const r=await fetch(url,{headers:{..._headers(cfg),Range:`${from}-${from+FETCH_PAGE-1}`},cache:'no-store'});
+    await _check(r,'fetchWorkflowStates'); const rows=await r.json(); all.push(...rows);
+    if (rows.length<FETCH_PAGE) return all;
+  }
+}
+export async function fetchCropView(cfg, board, project, cellId, auth) {
+  if (!cfg) throw new Error('workflow requires an online backend');
+  const {token}=_auth(auth);
+  return _rpc(cfg,'rpc_crop_view',{token,board,project,cell_id:cellId});
+}
+export async function cropCommand(cfg, command, requestId, auth) {
+  if (!cfg) throw new Error('workflow requires an online backend');
+  const {token,actor}=_auth(auth);
+  return _rpc(cfg,'rpc_crop_command',{token,actor,request_id:requestId,command});
+}
+export async function fetchCropHistory(cfg, board, project, cellId, auth) {
+  if (!cfg) throw new Error('workflow requires an online backend');
+  const {token}=_auth(auth); const all=[]; let before_id=null;
+  for (;;) {
+    const rows=await _rpc(cfg,'rpc_crop_history',{token,board,project,cell_id:cellId,before_id});
+    all.push(...rows); if(rows.length<500) return all;
+    before_id=rows.at(-1).id;
+  }
+}
