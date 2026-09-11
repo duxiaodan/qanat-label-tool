@@ -101,6 +101,8 @@
               <!-- checkboxes are rebuilt from the pulled pool on every refresh -->
               <div id="filter-labelers" class="filter-labelers"></div>
             </div>
+            <div class="filter-sec" data-workflow hidden><div class="filter-sec-title">finished by</div><div id="filter-finished" class="filter-labelers"></div></div>
+            <div class="filter-sec" data-workflow hidden><div class="filter-sec-title">approved by</div><div id="filter-approved" class="filter-labelers"></div></div>
             <div class="filter-actions">
               <button id="filter-reset" class="filter-reset" type="button" disabled>reset</button>
             </div>
@@ -112,6 +114,7 @@
       <div id="swath-wrap">
         <div id="swath-stage">
           <img id="swath-img" alt="swath" draggable="false" />
+          <div id="overview-tiles" aria-hidden="true"></div>
           <img id="heat-img" alt="heatmap" draggable="false" />
           <svg id="swath-svg" xmlns="http://www.w3.org/2000/svg"></svg>
         </div>
@@ -120,6 +123,7 @@
           <div id="swath-scale-bar"></div>
         </div>
         <div id="swath-hint">drag with either mouse button to pan · wheel to zoom · click a cell to open its crop</div>
+        <div id="overview-status" role="status"></div>
       </div>
     </div>
   </div>
@@ -150,6 +154,18 @@
           <button id="crop-help" class="btn-help" type="button" title="Help"
                   aria-label="Help" aria-haspopup="dialog">?</button>
         </span>
+      </div>
+      <div id="crop-workflow" data-workflow hidden>
+        <span id="crop-state" role="status"></span>
+        <button id="crop-finish">Mark finished</button>
+        <button id="crop-unfinish">Reopen crop</button>
+        <button id="crop-approve">Approve</button>
+        <button id="crop-unapprove">Cancel approval</button>
+        <button id="crop-state-history">Status history</button>
+        <button id="crop-state-refresh">Refresh</button>
+        <button id="crop-draft-download" hidden>Download local draft</button>
+        <span id="crop-workflow-msg" role="status"></span>
+        <div id="crop-workflow-history" hidden></div>
       </div>
       <div id="crop-stage">
         <canvas id="crop-canvas" width="1024" height="1024"></canvas>
