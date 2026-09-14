@@ -42,8 +42,8 @@
       <input type="hidden" id="labeler" />
       <span class="toggles">
         <label><input type="checkbox" id="tg-heatmap" checked /> Heatmap</label>
-        <label><input type="checkbox" id="tg-gt" checked /> Existing GT</label>
-        <label><input type="checkbox" id="tg-mine" checked /> All marks</label>
+        <label><input type="checkbox" id="tg-gt" checked /> Original labels</label>
+        <label><input type="checkbox" id="tg-mine" checked /> User labels</label>
         <label><input type="checkbox" id="tg-acc" checked /> Accurate TIFs</label>
         <label><input type="checkbox" id="tg-filter" checked /> Filter mask</label>
       </span>
@@ -135,7 +135,8 @@
         <span id="crop-title"></span>
         <span class="modal-tools">
           <label><input type="checkbox" id="crop-autocontrast" /> Autocontrast</label>
-          <label><input type="checkbox" id="crop-gt" checked /> Existing GT</label>
+          <label><input type="checkbox" id="crop-gt" checked /> Original labels</label>
+          <label><input type="checkbox" id="crop-marks" checked /> User labels</label>
           <span class="drawmode">
             <label><input type="radio" name="drawmode" value="point" checked /> Point</label>
             <label><input type="radio" name="drawmode" value="line" /> Polyline</label>
@@ -167,6 +168,7 @@
         <span id="crop-workflow-msg" role="status"></span>
         <div id="crop-workflow-history" hidden></div>
       </div>
+      <div id="crop-labels-hint" class="crop-labels-hint" role="status" hidden>Turn on User labels to draw or edit.</div>
       <div id="crop-stage">
         <canvas id="crop-canvas" width="1024" height="1024"></canvas>
         <!-- screen-space vector overlay: NOT CSS-transformed, so marks keep a

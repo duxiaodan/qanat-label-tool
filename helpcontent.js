@@ -35,7 +35,7 @@ export const HELP_SECTIONS = [
       { t: 'ul', items: [
         '<b>Pan</b> with either mouse button (drag) · <b>zoom</b> with the wheel · <b>click a cell</b> to open it for labeling.',
         'On maps with detailed overview imagery, zooming automatically loads sharper views at <b>50, 25, 12.5 and 6.25 m/pixel</b>. Allow the imagery to load as you zoom. Open a cell for the full <b>2 m/pixel</b> crop and labeling tools; the overall map stops at a coarser level.',
-        '<b>Layer toggles</b> (top bar): the model\'s probability <b>Heatmap</b>, <b>Existing GT</b> (known shafts and channels), <b>All marks</b> (everyone\'s labels), <b>Accurate TIFs</b> (green = cells whose imagery was verified well-aligned), and <b>Filter mask</b> (see below).',
+        '<b>Layer toggles</b> (top bar): the model\'s probability <b>Heatmap</b>, <b>Original labels</b> (known shafts and channels), <b>User labels</b> (everyone\'s labels), <b>Accurate TIFs</b> (green = cells whose imagery was verified well-aligned), and <b>Filter mask</b> (see below).',
         '<b>Cell list</b> (left sidebar): all cells sorted by the model\'s shaft probability (p_pos), highest first. With completion controls, a green ✓ means finished and a blue shield check means approved. Otherwise, ✓ indicates saved marks. Hovering a row highlights the cell on the map.',
       ] },
       { t: 'h3', html: 'Filters' },
@@ -59,7 +59,7 @@ export const HELP_SECTIONS = [
         '<b>Point</b> (shaft): click to place a dot.',
         '<b>Polyline</b> (channel): click each vertex; <b>double-click or Enter</b> finishes the line; <b>Esc</b> cancels an unfinished line.',
       ] },
-      { t: 'p', html: 'Useful toggles: <b>Autocontrast</b> (stretch the imagery contrast — display only, never affects the data) and <b>Existing GT</b> (show/hide known ground truth).' },
+      { t: 'p', html: 'Useful toggles: <b>Autocontrast</b> (stretch the imagery contrast — display only, never affects the data) and <b>Original labels</b> (show/hide the original ground truth), and <b>User labels</b> (show/hide everyone\'s annotations, including your own). Each view has independent layer switches; crop switches keep their settings when you open another crop. Turn on User labels to draw or edit; hiding labels preserves saved and unsaved work.' },
       { t: 'p', html: 'Working with your own marks:' },
       { t: 'ul', items: [
         '<b>Select</b> one by clicking it, or <b>box-select</b> several with a left-drag.',
