@@ -413,6 +413,9 @@ async function reloadWorkflowCrop(confirmedJob=null) {
   return S.workflow.available;
 }
 function updateWorkflowUI() {
+  for (const id of ['crop-undo', 'crop-clear']) $(id).disabled = workflowLocked() || !cropUserLabelsVisible();
+  $('crop-labels-hint').hidden = cropUserLabelsVisible();
+  document.querySelectorAll('input[name="drawmode"]').forEach((radio) => { radio.disabled = !cropUserLabelsVisible(); });
   if(!S.workflow.enabled || !S.crop) return;
   const state=currentWorkflow(), perm=workflowPermissions(state,S.me,S.su);
   $('crop-state').textContent=workflowSummary(state);
@@ -423,7 +426,6 @@ function updateWorkflowUI() {
     button.disabled=busy||offline||!!S.workflow.pending||(action!=='finish'&&cropIsDirty());
   }
   $('crop-finish').textContent=cropIsDirty()?'Save & mark finished':'Mark finished';
-  for(const id of ['crop-undo','crop-clear']) $(id).disabled=workflowLocked();
   $('crop-save').disabled=busy||((offline||!!state.finished_by)&&!S.workflow.pending);
   $('crop-save').textContent=S.workflow.pending?'Retry save':'Save work';
   $('crop-state-history').disabled=busy;
@@ -2053,6 +2055,8 @@ async function requestCloseCrop() {
 // --------------------------------------------------------------------------- //
 // crop popup
 // --------------------------------------------------------------------------- //
+function cropUserLabelsVisible() { return $('crop-marks').checked; }
+
 async function openCrop(cid) {
   if(S.workflow.busy) return;
   if(S.workflow.pending) { S.workflow.error='Save result unknown. Retry save before leaving this crop.'; updateWorkflowUI(); return; }
@@ -2116,7 +2120,6 @@ async function openCrop(cid) {
       if (show) reviewSyncCropButtons();
     }
     $('crop-autocontrast').checked = false;
-    $('crop-gt').checked = true;
     document.querySelector('input[name="drawmode"][value="point"]').checked = true;
     restoreWorkflowDraft();
     $('crop-workflow-history').hidden=true;
@@ -2339,6 +2342,7 @@ function drawCropOverlay() {
     }
     ctx.restore();
   }
+  if (!cropUserLabelsVisible()) { ctx.restore(); return; }
   // others' marks (read-only, orange) — drawn under mine, never selectable
   if (S.crop.others && (S.crop.others.points.length || S.crop.others.lines.length)) {
     ctx.save();
@@ -2617,6 +2621,7 @@ function setupCropInteractions() {
   canvas.addEventListener('mousedown', (e) => {
     if (!S.crop || e.button !== 0) return;   // non-left bubbles to stage for panning
     e.stopPropagation();
+    if (!cropUserLabelsVisible()) return;
     const px = canvasEventToPx(e);
     const additive = e.shiftKey || e.ctrlKey || e.metaKey;
     // a plain press on an already-selected mark grabs it for a drag-move;
@@ -2751,7 +2756,7 @@ function setupCropInteractions() {
   // A linear scan over the crop's few hundred marks per pointermove is cheap;
   // bail first while any gesture is active (pan / press drag / polyline draw).
   stage.addEventListener('pointermove', (e) => {
-    if (!S.crop) { hideCropHoverTip(); return; }
+    if (!S.crop || !cropUserLabelsVisible()) { canvas.style.cursor = ''; hideCropHoverTip(); return; }
     if (panning || pressActive || cropDrag || S.crop.inProgress.length) { hideCropHoverTip(); return; }
     const [col, row] = canvasEventToPx(e);
     // grab affordance: `grab` exactly where a plain left press would start a
@@ -2775,16 +2780,27 @@ function setupCropInteractions() {
   stage.addEventListener('pointerleave', hideCropHoverTip);
 
   canvas.addEventListener('dblclick', (e) => {
-    if (!S.crop) return;
+    if (!S.crop || !cropUserLabelsVisible()) return;
     e.preventDefault();
     if (drawMode() === 'line') finishInProgressLine();
   });
   // the overlay's backing store is tied to the stage size / devicePixelRatio
   window.addEventListener('resize', () => { if (S.crop) drawCropOverlay(); });
   $('crop-autocontrast').addEventListener('change', redrawCrop);
-  $('crop-gt').addEventListener('change', redrawCrop);
+  $('crop-gt').addEventListener('change', drawCropOverlay);
+  $('crop-marks').addEventListener('change', () => {
+    cancelCropDrag();
+    pressActive = false;
+    selClear();
+    if (S.crop) S.crop.selectBox = null;
+    canvas.style.cursor = '';
+    hideCropHoverTip();
+    updateWorkflowUI();
+    updateHistoryButton();
+    drawCropOverlay();
+  });
   $('crop-undo').addEventListener('click', () => {
-    if (!S.crop || workflowLocked()) return;
+    if (!S.crop || workflowLocked() || !cropUserLabelsVisible()) return;
     if (S.crop.inProgress.length) { S.crop.inProgress.pop(); S.crop.dirty = true; }
     else if (S.crop.marks.points.length || S.crop.marks.lines.length) {
       // undo whichever was added last is ambiguous after reload; pop a point first, else a line
@@ -2799,7 +2815,7 @@ function setupCropInteractions() {
     redrawCrop();
   });
   $('crop-clear').addEventListener('click', () => {
-    if (!S.crop || workflowLocked()) return;
+    if (!S.crop || workflowLocked() || !cropUserLabelsVisible()) return;
     if (!confirm('Remove all your marks for this crop?')) return;
     S.crop.marks.points = []; S.crop.marks.lines = []; S.crop.inProgress = []; S.crop.selectBox = null; selClear();
     S.crop.pendingOwnMoves = new Map();   // every own row goes on save — no moves left to commit
@@ -2851,7 +2867,7 @@ function setupCropInteractions() {
   const navDlg = $('crop-nav-confirm');
   if (navDlg) navDlg.addEventListener('click', (e) => { if (e.target === navDlg) closeNavDialog('cancel'); });
   document.querySelectorAll('input[name="drawmode"]').forEach((r) => r.addEventListener('change', () => {
-    if (S.crop && drawMode() === 'point') finishInProgressLine();
+    if (S.crop && cropUserLabelsVisible() && drawMode() === 'point') finishInProgressLine();
   }));
   document.addEventListener('keydown', (e) => {
     if (!S.crop || $('crop-modal').hidden) return;
@@ -2890,11 +2906,11 @@ function setupCropInteractions() {
       e.preventDefault();
       navigateCrop(e.key.slice(5).toLowerCase());   // ArrowUp -> 'up', …
     }
-    else if (e.key === 'Enter') { if (drawMode() === 'line') finishInProgressLine(); }
+    else if (e.key === 'Enter') { if (cropUserLabelsVisible() && drawMode() === 'line') finishInProgressLine(); }
     else if (e.key === 'Delete' || e.key === 'Backspace') {
       if (selCount() > 0) { deleteSelected(); e.preventDefault(); }
     } else if (e.key === 'Escape') {
-      if (S.crop.inProgress.length) { S.crop.inProgress = []; redrawCrop(); }
+      if (cropUserLabelsVisible() && S.crop.inProgress.length) { S.crop.inProgress = []; redrawCrop(); }
       else if (selCount() > 0 || S.crop.selectBox) { selClear(); S.crop.selectBox = null; redrawCrop(); }
       // all three close routes (Close button, backdrop click, Esc) converge on
       // requestCloseCrop(): dirty crops get the 3-way unsaved-marks prompt,

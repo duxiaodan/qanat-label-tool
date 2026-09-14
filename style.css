@@ -305,6 +305,7 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
   padding: 2px 7px; font-size: 12px; line-height: 1.5;
 }
 .modal-hint { font-size: 11px; color: #889; margin-top: 6px; }
+.crop-labels-hint { color: #ff6b6b; font-size: 16px; font-weight: 600; line-height: 1.4; margin: 6px 0 10px; }
 
 /* ---------- adjacent-crop navigation ----------
    Small semi-transparent arrows overlaying the imagery at the four edges of
