@@ -325,3 +325,10 @@ export async function fetchCropHistory(cfg, board, project, cellId, auth) {
     before_id=rows.at(-1).id;
   }
 }
+
+export function fetchOriginalLabels(cfg, board, project, auth) {
+  return _rpc(cfg, 'rpc_original_labels', {token:auth.token,board,project});
+}
+export function fetchOriginalHistory(cfg, board, project, label_id, auth) {
+  return _rpc(cfg, 'rpc_original_label_history', {token:auth.token,board,project,label_id});
+}

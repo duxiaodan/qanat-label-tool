@@ -182,7 +182,7 @@ export function backfillInsertedIds(inserts, inserted) {
  * @returns {number|null}
  */
 export function singleSelectionDbId(sel, marks, others) {
-  if (!sel || !marks || !others) return null;
+  if (!sel || !marks || !others || sel.originals?.size) return null;
   const picks = [];
   for (const i of sel.points || []) picks.push(marks.points[i]);
   for (const i of sel.lines || []) picks.push(marks.lines[i]);
@@ -216,6 +216,7 @@ export function historyButtonState(s) {
   const off = (hint) => ({ enabled: false, dbId: null, hint });
   const generic = 'select exactly one saved mark';
   if (!s || !s.su || !s.sel || !s.marks || !s.others) return off(generic);
+  if (s.sel.originals?.size) return off('select exactly one label to view its history');
   const own = [];
   for (const i of s.sel.points || []) own.push(s.marks.points[i]);
   for (const i of s.sel.lines || []) own.push(s.marks.lines[i]);

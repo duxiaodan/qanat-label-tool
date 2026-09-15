@@ -593,3 +593,6 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
 #crop-workflow button:disabled, .modal-tools button:disabled { opacity:.45; cursor:default; }
 #crop-workflow #crop-approve { background:#2a6df0; }
 #crop-workflow #crop-finish { background:#237a42; font-weight:600; }
+
+#crop-edit-originals:checked { accent-color: #ff6b6b; }
+#crop-original-controls { display: inline-flex; align-items: center; gap: 8px; }

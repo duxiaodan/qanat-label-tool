@@ -136,6 +136,10 @@
         <span class="modal-tools">
           <label><input type="checkbox" id="crop-autocontrast" /> Autocontrast</label>
           <label><input type="checkbox" id="crop-gt" checked /> Original labels</label>
+          <span id="crop-original-controls" hidden>
+            <label><input type="checkbox" id="crop-edit-originals" /> Edit originals</label>
+            <label title="Show deleted original points on the image so you can select one and open History"><input type="checkbox" id="crop-show-deleted-originals" /> Show deleted originals</label>
+          </span>
           <label><input type="checkbox" id="crop-marks" checked /> User labels</label>
           <span class="drawmode">
             <label><input type="radio" name="drawmode" value="point" checked /> Point</label>
@@ -168,7 +172,7 @@
         <span id="crop-workflow-msg" role="status"></span>
         <div id="crop-workflow-history" hidden></div>
       </div>
-      <div id="crop-labels-hint" class="crop-labels-hint" role="status" hidden>Turn on User labels to draw or edit.</div>
+      <div id="crop-labels-hint" class="crop-labels-hint" role="status" hidden>Turn on User labels to draw or edit user labels.</div>
       <div id="crop-stage">
         <canvas id="crop-canvas" width="1024" height="1024"></canvas>
         <!-- screen-space vector overlay: NOT CSS-transformed, so marks keep a
@@ -188,7 +192,7 @@
         <button id="crop-nav-right" class="crop-nav crop-nav-right" hidden>&#9654;</button>
       </div>
       <div class="modal-hint">click = add a point / polyline vertex · double-click or Enter ends a polyline ·
-        click your own mark to select it · <b>left-drag = box-select multiple of your marks</b> · Delete/Backspace removes selected ·
+        click your own mark to select it · <b>left-drag = box-select multiple of your marks</b> · drag a selected label to move the selection · Delete/Backspace removes selected · Ctrl/Cmd+Z undoes the last edit ·
         right-drag (or middle-drag) to pan · wheel to zoom · <b>arrow keys (or the edge arrows) jump to the adjacent crop</b> · Esc cancels, then closes · click outside the box closes</div>
     </div>
 

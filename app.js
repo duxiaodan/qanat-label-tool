@@ -16,7 +16,7 @@ import { deriveKey, decryptBlob, encryptBlob, verifyPasscode, openSuEnvelope, de
 import {
   fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks, updateMark,
   createSnapshot, listSnapshots, restoreSnapshot,
-  fetchMarkHistory, restoreMarkVersion, fetchWorkflowStates, fetchCropView, cropCommand, fetchCropHistory,
+  fetchMarkHistory, restoreMarkVersion, fetchWorkflowStates, fetchCropView, cropCommand, fetchCropHistory, fetchOriginalLabels, fetchOriginalHistory,
 } from './sync.js';
 import {
   attribution, othersDeleteIds, pruneOthers, dropPoolMarksByDbId, cropDirtyState,
@@ -32,6 +32,7 @@ import {
   selectMarks, scopeSlug, scopeProblem, countOrphans, buildExportScope,
 } from './exportscope.js';
 import { HELP_SECTIONS, sectionOpenByDefault } from './helpcontent.js';
+import { indexOriginalLabels, effectiveOriginals } from './originals.js';
 import { SUPABASE } from './site_config.js';
 import { OverviewTiles, overviewMaxScale } from './overviewtiles.js';
 import { workflowPermissions, statusPasses, workflowSummary, workflowBadge } from './workflow.js';
@@ -84,6 +85,7 @@ const S = {
   lineMarks: [],        // {cropId, pPos, world:[[x,y],...], created, labeler, dbId?}
   workflow: { enabled:false, available:false, busy:false, states:new Map(), pending:null, error:'',
     finished:{mode:'all',people:new Set()}, approved:{mode:'all',people:new Set()} },
+  originals: { available: false, byCell: new Map(), points: [], edits: new Map() },
   done: new Set(),      // cell ids with >=1 saved mark (from anyone)
   unsynced: false,      // true when a save couldn't reach the backend
   // cell filter — ONE state object drives the sidebar list AND the map spotlight.
@@ -298,15 +300,16 @@ function stashWorkflowDraft() {
     const prior=storedWorkflowDraft(c.cell.id);
     if(prior && prior.revision!==c.revision) archiveWorkflowDraft(c.cell.id,prior);
     localStorage.setItem(workflowDraftKey(c.cell.id),JSON.stringify({cell_id:c.cell.id,world_bbox:c.cell.world_bbox,
-    revision:c.revision,marks:c.marks,inProgress:c.inProgress,
+    revision:c.revision,marks:c.marks,inProgress:c.inProgress,pendingOriginals:[...c.pendingOriginals],
     pendingOthersDeletes:[...c.pendingOthersDeletes],pendingOthersMoves:[...c.pendingOthersMoves],pendingOwnMoves:[...c.pendingOwnMoves]})); return true; }
   catch { S.workflow.error='Could not store the local draft. Keep this page open until saved.'; return false; }
 }
 function restoreWorkflowDraft() {
   if(!S.workflow.enabled || !S.crop || !S.workflow.available) return;
   const draft=storedWorkflowDraft(S.crop.cell.id); if(!draft)return;
-  if(draft.revision===S.crop.revision && !currentWorkflow().finished_by) {
+  if(draft.revision===S.crop.revision && !currentWorkflow().finished_by && (S.su || !draft.pendingOriginals?.length)) {
     S.crop.marks=draft.marks;S.crop.inProgress=draft.inProgress;S.crop.dirty=true;
+    S.crop.pendingOriginals=new Map(draft.pendingOriginals || []);
     S.crop.pendingOthersDeletes=new Set(draft.pendingOthersDeletes);
     S.crop.pendingOthersMoves=new Map(draft.pendingOthersMoves);S.crop.pendingOwnMoves=new Map(draft.pendingOwnMoves);
     loadCropMarksFor(S.crop.cell); S.crop.marks=draft.marks;
@@ -315,7 +318,9 @@ function restoreWorkflowDraft() {
     try {
       archiveWorkflowDraft(S.crop.cell.id,draft);
       localStorage.removeItem(workflowDraftKey(S.crop.cell.id));
-      S.workflow.error='This crop changed while you had unsaved edits. The old draft is kept locally and can be downloaded.';
+      S.workflow.error=!S.su && draft.pendingOriginals?.length
+        ? 'This draft contains superuser original-label edits. It is kept locally and can be downloaded.'
+        : 'This crop changed while you had unsaved edits. The old draft is kept locally and can be downloaded.';
     } catch {
       S.workflow.available=false;
       S.workflow.error='Could not archive the conflicting draft. Download it before editing.';
@@ -331,7 +336,7 @@ function downloadWorkflowDraft() {
   a.href=url;a.download=`qanat_local_draft_${S.crop.cell.id}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 function workflowLocked() {
-  return S.workflow.enabled && (!S.workflow.available || S.workflow.busy || !!S.workflow.pending || !!currentWorkflow().finished_by);
+  return S.workflow.busy || (S.workflow.enabled && (!S.workflow.available || !!S.workflow.pending || !!currentWorkflow().finished_by));
 }
 function acceptWorkflowState(state) {
   S.workflow.states.set(state.cell_id,state); S.workflow.available=true;
@@ -384,6 +389,8 @@ async function loadWorkflowCrop(cid,{confirmedJob=null}={}) {
     }
     const result=await fetchCropView(SUPABASE,S.board,S.project,cid,workflowAuth());
     const decoded=await decodeMarkRows(result.marks);
+    if (result.originals) await acceptOriginalEdits(cid,result.originals);
+    S.originals.available = !!result.originals_available;
     // A receipt describes the original command; the read above supplies the
     // current state. Retain recovery records until both have been confirmed.
     if(confirmed) {
@@ -403,17 +410,27 @@ async function loadWorkflowCrop(cid,{confirmedJob=null}={}) {
 // Refresh the open crop and its revision together. Matching drafts resume;
 // conflicting drafts are archived before further editing can replace them.
 async function reloadWorkflowCrop(confirmedJob=null) {
+  clearCropUndo();
   const crop=S.crop;
   if(!crop || !stashWorkflowDraft()) return false;
   if(!await loadWorkflowCrop(crop.cell.id,{confirmedJob}) || S.crop!==crop) return false;
   crop.dirty=false; crop.inProgress=[];
+  crop.pendingOriginals=new Map();
   crop.pendingOthersDeletes=new Set(); crop.pendingOthersMoves=new Map(); crop.pendingOwnMoves=new Map();
   loadCropMarksFor(crop.cell); selClear(); crop.selectBox=null; hideCropHoverTip();
   restoreWorkflowDraft(); redrawCrop(); updateWorkflowUI();
   return S.workflow.available;
 }
 function updateWorkflowUI() {
-  for (const id of ['crop-undo', 'crop-clear']) $(id).disabled = workflowLocked() || !cropUserLabelsVisible();
+  $('crop-clear').disabled = workflowLocked() || !cropUserLabelsVisible();
+  $('crop-undo').disabled = !canUndoCropEdit();
+  const undoEntry = cropUndoEntry();
+  $('crop-undo').title = undoEntry?.originals && !originalEditOn() ? 'Turn on Original labels and Edit originals to undo this edit.'
+    : undoEntry?.others && !suEditOn() ? 'Turn on Edit others to undo this edit.'
+    : undoEntry ? `Undo ${undoEntry.label} (Ctrl/Cmd+Z)` : 'No edits to undo. Save, refresh or leaving the crop clears undo history.';
+  $('crop-original-controls').hidden = !S.su || !S.originals.available;
+  $('crop-edit-originals').disabled = workflowLocked() || !$('crop-gt').checked;
+  $('crop-show-deleted-originals').disabled = S.workflow.busy || !$('crop-gt').checked;
   $('crop-labels-hint').hidden = cropUserLabelsVisible();
   document.querySelectorAll('input[name="drawmode"]').forEach((radio) => { radio.disabled = !cropUserLabelsVisible(); });
   if(!S.workflow.enabled || !S.crop) return;
@@ -439,7 +456,7 @@ async function sendWorkflowSave(job,retry=false) {
     S.unsynced=false; persist(); setSyncStatus('saved','ok'); return;
   }
   const result=await submitWorkflowJob(job);
-  job.apply(result);
+  await job.apply(result);
   localStorage.removeItem(workflowDraftKey(job.command.cell_id));
   S.workflow.pending=null; localStorage.removeItem(pendingWorkflowKey());
   if(S.crop?.cell.id===job.command.cell_id) S.crop.dirty=false;
@@ -448,7 +465,11 @@ async function sendWorkflowSave(job,retry=false) {
 }
 async function saveWork(finish=false) {
   if(!S.crop || S.workflow.busy) return false;
-  if(!S.workflow.enabled) { const ok=await commitCrop(); if(ok) setStatus('saved '+S.crop.cell.id); return ok; }
+  if(!S.workflow.enabled) {
+    S.workflow.busy=true; updateWorkflowUI();
+    try { const ok=await commitCrop(); if(ok) setStatus('saved '+S.crop.cell.id); return ok; }
+    finally { S.workflow.busy=false; updateWorkflowUI(); }
+  }
   if((!S.workflow.available || currentWorkflow().finished_by) && !S.workflow.pending) { updateWorkflowUI(); return false; }
   if(S.crop.inProgress.length===1) { S.workflow.error='Add another polyline vertex or cancel the unfinished line before saving.'; updateWorkflowUI(); return false; }
   const stored=storedWorkflowJob();
@@ -575,7 +596,7 @@ async function decodeMarkRows(rows) {
 }
 
 async function pullAllMarks() {
-  if (S.workflow.enabled) await pullWorkflow();
+  if (S.workflow.enabled) { await pullWorkflow(); await pullOriginalLabels(); }
   if (!backendOn()) { restore(); recomputeDone(); setSyncStatus('local-only', ''); return; }
   setSyncStatus('syncing…', '');
   // load the local cache first so any prior-session unsynced marks of mine survive
@@ -612,6 +633,7 @@ function cellPPos(cropId) {
 /** Re-pull the pool + redraw everything (Refresh button + post-save consistency). */
 async function refreshMarks() {
   if (S.workflow.busy) return;
+  clearCropUndo(); updateWorkflowUI();
   if(S.workflow.enabled) { S.workflow.busy=true; updateWorkflowUI(); }
   try {
     await pullAllMarks();
@@ -805,6 +827,7 @@ async function unlock() {
     S.cells = (S.manifest.cells || []).slice().sort((a, b) => b.p_pos - a.p_pos);
     S.cellRank = new Map();
     S.cells.forEach((c, i) => { S.cellById.set(c.id, c); S.cellRank.set(c.id, i); });
+    Object.assign(S.originals, await indexOriginalLabels(S.cells));
     buildCellCentreIndex(); // centre-keyed lookup for adjacent-crop navigation
     S.swathW = S.manifest.swath.width; S.swathH = S.manifest.swath.height;
     S.swathBounds = S.manifest.swath.world_bounds;
@@ -914,6 +937,12 @@ function setupSuperuserUI() {
 /** The pure enablement decision for #crop-history over the current crop state
  *  (see historyButtonState in suedit.js). */
 function histState() {
+  if (S.crop?.selected.originals.size) {
+    const point = S.crop.originals.points[[...S.crop.selected.originals][0]];
+    const enabled = originalInspectable() && selCount() === 1 && !!point;
+    return {enabled,dbId:null,originalId:enabled?point.id:null,
+      hint:enabled?'view this original label’s history':'select exactly one label to view its history'};
+  }
   return historyButtonState({
     su: S.su,
     editOthers: suEditOn(),
@@ -944,6 +973,7 @@ function applySuEditCue() {
     S.crop.selected.oLines.clear();
     redrawCrop();
   }
+  updateWorkflowUI();   // Undo may become available when Edit others is re-enabled.
   updateHistoryButton(); // enablement depends on the toggle, not just selection
 }
 
@@ -1141,95 +1171,100 @@ function setupSnapshotsDialog() {
 // loop terminates visually. Deliberately minimal: no diff rendering —
 // old_row/new_row geometry is ciphertext anyway.
 // --------------------------------------------------------------------------- //
-let _histMarkId = null;   // the mark whose trail the open panel shows
-let _histBusy = false;    // one restore at a time
+let _histTarget = null;
+let _histLoad = 0;
+let _histBusy = false;
 
 function histSetMsg(msg, isErr) {
   const el = $('hist-msg');
-  if (!el) return;
-  el.hidden = !msg;
-  el.textContent = msg || '';
+  el.hidden = !msg; el.textContent = msg || '';
   el.classList.toggle('hist-msg-err', !!isErr);
 }
 async function histOpen() {
   if (!S.su || !backendOn() || !S.crop) return;
-  const st = histState();
-  if (!st.enabled || st.dbId == null) return;
-  const id = st.dbId;
-  _histMarkId = id;
-  $('hist-title').textContent = `Mark history — row #${id}`;
-  histSetMsg('');
-  $('hist-panel').hidden = false;
+  const st = histState(); if (!st.enabled) return;
+  _histTarget = {kind:st.originalId?'original':'user',id:st.originalId||st.dbId,crop:S.crop};
+  $('hist-title').textContent = st.originalId ? 'Original label history' : 'User label history';
+  histSetMsg('');$('hist-panel').hidden=false;
   await histReload();
 }
-function histClose() {
-  $('hist-panel').hidden = true;
-  _histMarkId = null;
+function histClose() { $('hist-panel').hidden=true;_histTarget=null;_histLoad++; }
+function renderHistoryRows(entries) {
+  const list=$('hist-list');list.replaceChildren();
+  for (const entry of entries) {
+    const row=document.createElement('div');row.className='hist-row';
+    for (const [cls,text] of [['hist-op '+(entry.opClass||''),entry.op],['hist-when',entry.when||''],['hist-actor',entry.actor||'']]) {
+      const span=document.createElement('span');span.className=cls;span.textContent=text;row.appendChild(span);
+    }
+    const button=document.createElement('button');button.type='button';
+    button.textContent=entry.current?'Current':'Restore this state';
+    button.disabled=!entry.enabled;button.title=entry.hint||'';
+    if(entry.enabled)button.addEventListener('click',entry.restore);
+    row.appendChild(button);list.appendChild(row);
+  }
+  if(!entries.length)list.textContent='No recorded history for this label.';
+}
+async function originalHistoryEntries(target) {
+  const result=await fetchOriginalHistory(SUPABASE,S.board,S.project,target.id,suAuth());
+  const baseline=(S.originals.byCell.get(target.crop.cell.id)||[]).find(p=>p.id===target.id);
+  if(!baseline || !result.original)throw new Error('Original label history is unavailable.');
+  const pending=target.crop.pendingOriginals.get(target.id), rows=[];
+  if(pending)rows.push({op:'Unsaved '+(pending.action==='reset'?'restoration':pending.action==='delete'?'deletion':'move'),current:true,enabled:false});
+  const add=(op,when,actor,state,current)=>{
+    const enabled=!current&&!state.deleted&&originalEditOn()&&!workflowLocked()&&!_histBusy;
+    rows.push({op,when,actor,current,enabled,hint:state.deleted?'Select a version where the label existed.':current?'Current state':
+      !enabled?'Turn on Edit originals in an open crop to restore this state.':'Restore this version, then Save work.',
+      restore:()=>histRestoreOriginal(target,state)});
+  };
+  for(const [i,h] of result.history.entries()) {
+    const world=await decryptGeom(h.new_state.geom);
+    if(!world || world.length!==2 || !world.every(Number.isFinite))throw new Error('Could not decode original history.');
+    add(h.new_state.baseline?'Restored original':h.new_state.deleted?'Deleted':'Moved',fmtWhen(h.created_at),h.actor,
+      {...h.new_state,world},!pending&&i===0);
+  }
+  add('Original position','Imported','', {baseline:true,world:baseline.world},!pending&&!result.history.length);
+  return rows;
+}
+async function histRestoreOriginal(target,state) {
+  if(_histTarget!==target||S.crop!==target.crop||_histBusy||workflowLocked()||!originalEditOn())return;
+  const before=cropEditSnapshot();
+  S.crop.pendingOriginals.set(target.id,state.baseline?{action:'reset'}:{action:'move',px:worldToPixel(...state.world,S.crop.cell.world_bbox)});
+  loadOriginalCrop();selClear();
+  const idx=S.crop.originals.points.findIndex(p=>p.id===target.id);
+  if(idx>=0)S.crop.selected.originals.add(idx);
+  recordCropEdit('restore original label version',before,false,true,false);redrawCrop();
+  await histReload();
+  if(_histTarget===target)histSetMsg('Restoration ready. Close History and use Save work to save it.');
 }
 async function histReload() {
-  if (_histMarkId == null) return;
-  const list = $('hist-list');
-  list.textContent = 'loading…';
-  let rows;
-  try { rows = await fetchMarkHistory(SUPABASE, _histMarkId, suAuth()); }
-  catch (e) {
-    list.textContent = '';
-    histSetMsg('could not load history: ' + (e.rpcMessage || e.message), true);
-    return;
-  }
-  list.innerHTML = '';
-  if (!rows.length) {
-    const em = document.createElement('div');
-    em.className = 'hist-empty';
-    em.textContent = 'no history for this mark (it predates the audit trail)';
-    list.appendChild(em);
-    return;
-  }
-  // snapshot-restore DELETE+INSERT churn pairs collapse into one "↺ snapshot
-  // restore" entry; ordering stays newest-first (suedit.js collapseHistoryRows)
-  const entries = collapseHistoryRows(rows);
-  entries.forEach((en, i) => {
-    const row = document.createElement('div');
-    row.className = 'hist-row';
-    const cellEl = (cls, text) => {
-      const sp = document.createElement('span');
-      sp.className = cls;
-      sp.textContent = text;
-      row.appendChild(sp);
-    };
-    if (en.kind === 'restore') {
-      cellEl('hist-op hist-op-restore', '↺ snapshot restore');
-      cellEl('hist-when', fmtWhen(en.changed_at));
-      cellEl('hist-actor', en.actor || '');
+  const target=_histTarget, ticket=++_histLoad;
+  if(!target)return;
+  $('hist-list').textContent='Loading…';
+  try {
+    let entries;
+    if(target.kind==='original') {
+      entries=await originalHistoryEntries(target);
     } else {
-      const r = en.row;
-      const restoreLike = r.via === 'version_restore' || r.via === 'snapshot_restore';
-      cellEl('hist-op ' + (restoreLike ? 'hist-op-restore'
-        : 'hist-op-' + String(r.op || '').toLowerCase()), historyOpLabel(r));
-      cellEl('hist-when', fmtWhen(r.changed_at));
-      cellEl('hist-actor', r.actor || '');
+      const rows=await fetchMarkHistory(SUPABASE,target.id,suAuth());
+      entries=collapseHistoryRows(rows).map((en,i)=>{
+        const state=historyRestoreState(en,i===0), row=en.kind==='restore'?en:en.row;
+        const when=row.changed_at;
+        return {op:en.kind==='restore'?'↺ snapshot restore':historyOpLabel(row),
+          opClass:en.kind==='restore'||['version_restore','snapshot_restore'].includes(row.via)?'hist-op-restore':'hist-op-'+String(row.op||'').toLowerCase(),
+          when:fmtWhen(when),actor:row.actor,current:i===0,enabled:state.enabled,hint:state.hint,
+          restore:()=>histRestore(state.hid,when)};
+      });
     }
-    // STATE semantics: Restore returns the mark to this row's state. The
-    // decision (newest = current -> disabled; DELETE rows disabled; no-change
-    // snapshot restores disabled; everything else enabled, collapsed rows
-    // wired to the INSERT side) is one pure function — suedit.js.
-    const st = historyRestoreState(en, i === 0);
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.textContent = i === 0 ? 'Current' : 'Restore this state';
-    if (st.enabled) {
-      const when = en.kind === 'restore' ? en.changed_at : en.row.changed_at;
-      btn.addEventListener('click', () => histRestore(st.hid, when));
-    } else {
-      btn.disabled = true;
-      btn.title = st.hint;
-    }
-    row.appendChild(btn);
-    list.appendChild(row);
-  });
+    if(_histTarget!==target||ticket!==_histLoad||S.crop!==target.crop)return;
+    renderHistoryRows(entries);
+    if(target.kind==='original')histSetMsg('History for the selected original label. Restoring a state requires Save work.');
+  } catch(e) {
+    if(_histTarget!==target||ticket!==_histLoad)return;
+    $('hist-list').replaceChildren();histSetMsg('Could not load history: '+(e.rpcMessage||e.message),true);
+  }
 }
 async function histRestore(hid, changedAt) {
-  if (_histBusy || _histMarkId == null) return;
+  if (_histBusy || _histTarget?.kind !== 'user') return;
   _histBusy = true;
   histSetMsg('restoring…');
   try {
@@ -1775,13 +1810,8 @@ function buildSwathLayers() {
     rect.addEventListener('mouseleave', () => highlightCell(c.id, false));
     gCells.appendChild(rect);
 
-    // existing GT shaft points only (cell.gt_points are in world coords);
-    // GT polylines (cell.gt_lines) are deliberately NOT rendered — dots only.
-    for (const [gx, gy] of c.gt_points || []) {
-      const [sx, sy] = worldToSwathPx(gx, gy);
-      gGt.appendChild(svgEl('circle', { cx: sx, cy: sy, r: 1.2, class: 'gt-dot' }));
-    }
   }
+  rebuildOriginalLayer();
   rebuildMineLayer();
   rebuildFilterLayer();
   applyLayerToggles();
@@ -1944,7 +1974,7 @@ function updateCropNavButtons() {
 function cropIsDirty() {
   if (!S.crop) return false;
   return cropDirtyState({
-    dirty: S.crop.dirty,
+    dirty: S.crop.dirty || S.crop.pendingOriginals.size > 0,
     inProgressLen: S.crop.inProgress ? S.crop.inProgress.length : 0,
     pendingOthers: S.crop.pendingOthersDeletes ? S.crop.pendingOthersDeletes.size : 0,
     pendingMoves: S.crop.pendingOthersMoves ? S.crop.pendingOthersMoves.size : 0,
@@ -2055,6 +2085,69 @@ async function requestCloseCrop() {
 // --------------------------------------------------------------------------- //
 // crop popup
 // --------------------------------------------------------------------------- //
+function originalInspectable() {
+  return S.su && S.originals.available && S.workflow.enabled && $('crop-gt').checked;
+}
+function originalEditOn() { return originalInspectable() && $('crop-edit-originals').checked; }
+function cropLabelsInteractive() { return cropUserLabelsVisible() || originalInspectable(); }
+async function decodeOriginalEdits(rows) {
+  const edits = new Map();
+  for (const row of rows) {
+    const world = await decryptGeom(row.geom);
+    if (!Array.isArray(world) || world.length !== 2 || !world.every(Number.isFinite)) throw new Error('Could not decode original label correction.');
+    edits.set(row.label_id, {...row,world});
+  }
+  return edits;
+}
+async function pullOriginalLabels() {
+  try {
+    const result = await fetchOriginalLabels(SUPABASE,S.board,S.project,workflowAuth());
+    S.originals.edits = await decodeOriginalEdits(result.edits);
+    S.originals.available = result.available;
+    rebuildOriginalLayer();
+  } catch (error) {
+    S.originals.available = false;
+    // Older/local fixtures can have no SQL09 yet. Other failures lock edits.
+    if (error.status !== 404) {
+      S.workflow.available = false;
+      S.workflow.error = 'Original labels unavailable. Refresh before editing.';
+    }
+  }
+}
+async function acceptOriginalEdits(cid,rows) {
+  const decoded = await decodeOriginalEdits(rows);
+  for (const p of S.originals.byCell.get(cid) || []) S.originals.edits.delete(p.id);
+  for (const [id,row] of decoded) S.originals.edits.set(id,row);
+  rebuildOriginalLayer();
+}
+function loadOriginalCrop() {
+  const c = S.crop;
+  const edits = new Map(S.originals.edits);
+  for (const [id,edit] of c.pendingOriginals) {
+    if (edit.action === 'reset') edits.delete(id);
+    else edits.set(id, {...edits.get(id),deleted:edit.action==='delete',
+      ...(edit.px?{world:pixelToWorld(...edit.px,c.cell.world_bbox)}:{}),edited_by:S.me});
+  }
+  c.originals = {points: effectiveOriginals(S.originals.byCell.get(c.cell.id) || [],edits,S.su && $('crop-show-deleted-originals').checked)
+    .map(p => ({id:p.id,px:worldToPixel(...p.world,c.cell.world_bbox),editedBy:p.editedBy,deleted:p.deleted}))};
+}
+function rebuildOriginalLayer() {
+  const g = $('g-gt'); if (!g) return;
+  g.replaceChildren();
+  for (const p of effectiveOriginals(S.originals.points,S.originals.edits)) {
+    const [x,y] = worldToSwathPx(...p.world);
+    g.appendChild(svgEl('circle',{cx:x,cy:y,r:1.2,class:'gt-dot'}));
+  }
+}
+function hitTestOriginal([col,row]) {
+  if (!originalInspectable()) return null;
+  const tol = CROP_MARK_TOL_SCREEN_PX / Math.max(0.01,S.crop.view.scale);
+  const idx = S.crop.originals.points.findIndex(p => (p.px[0]-col)**2+(p.px[1]-row)**2 <= tol**2);
+  return idx < 0 ? null : {kind:'original',idx};
+}
+function cropHit(px) {
+  return (cropUserLabelsVisible() && (hitTestOwn(px) || (suEditOn() && hitTestOthers(px)))) || hitTestOriginal(px);
+}
 function cropUserLabelsVisible() { return $('crop-marks').checked; }
 
 async function openCrop(cid) {
@@ -2083,11 +2176,13 @@ async function openCrop(cid) {
       view: { x: 0, y: 0, scale: 1 },
       marks: { points: [], lines: [] },      // MY editable marks ({px|pts, ac} objects)
       others: { points: [], lines: [] },     // OTHERS' read-only marks (bare pixel coords)
+      originals: {points: []}, pendingOriginals: new Map(),
       inProgress: [],
       // indices of currently-selected marks. points/lines = OWN marks; oPoints/
       // oLines = OTHERS' marks (only ever populated while "Edit others" is on).
-      selected: { points: new Set(), lines: new Set(), oPoints: new Set(), oLines: new Set() },
+      selected: { points: new Set(), lines: new Set(), oPoints: new Set(), oLines: new Set(), originals: new Set() },
       selectBox: null,       // [c0, r0, c1, r1] in 1024² coords while rubber-band-dragging
+      undo: [],             // up to 100 local edits, reset at save/refresh/close
       dirty: false,          // unsaved mark edits (drives the unsaved-marks prompt on nav AND close)
       // superuser cross-labeler edits pending commit: row ids of OTHERS' marks
       // deleted in this crop but not yet saved. Committed by commitCrop via
@@ -2110,7 +2205,7 @@ async function openCrop(cid) {
       pendingOwnMoves: new Map(),
     };
     loadCropMarksFor(cell);
-    $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}   (${cell.gt_points.length} GT shafts)`;
+    $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}   (${cell.gt_points.length} original shafts)`;
     // GT-review verdict buttons: only in review mode AND for eligible cells
     // (in normal mode `show` is false and the span stays hidden, as shipped).
     const revBtns = $('gt-review-btns');
@@ -2133,6 +2228,7 @@ async function openCrop(cid) {
 
 // (re)derive the crop's mine/others pixel marks from the merged S.*Marks pool.
 function loadCropMarksFor(cell) {
+  loadOriginalCrop();
   const cid = cell.id;
   const mine = { points: [], lines: [] };
   const others = { points: [], lines: [] };
@@ -2174,6 +2270,7 @@ function loadCropMarksFor(cell) {
 // not currently being edited) without clobbering in-progress drawing/selection.
 function reloadCropMarks() {
   if (!S.crop) return;
+  clearCropUndo();
   loadCropMarksFor(S.crop.cell);
   selClear();
   S.crop.selectBox = null;
@@ -2195,17 +2292,19 @@ function closeCrop(save) {
 // and are only ever populated while the superuser "Edit others" toggle is on.
 const SEL_KIND = {
   point: (sel) => sel.points, line: (sel) => sel.lines,
+  original: (sel) => sel.originals,
   opoint: (sel) => sel.oPoints, oline: (sel) => sel.oLines,
 };
 function selClear() {
   if (!S.crop) return;
+  S.crop.selected.originals.clear();
   S.crop.selected.points.clear(); S.crop.selected.lines.clear();
   S.crop.selected.oPoints.clear(); S.crop.selected.oLines.clear();
 }
 function selCount() {
   if (!S.crop) return 0;
   const s = S.crop.selected;
-  return s.points.size + s.lines.size + s.oPoints.size + s.oLines.size;
+  return s.points.size + s.lines.size + s.oPoints.size + s.oLines.size + s.originals.size;
 }
 function selSet(kind, idx, additive) {
   if (!additive) selClear();
@@ -2215,6 +2314,7 @@ function boxNorm(b) { return [Math.min(b[0], b[2]), Math.min(b[1], b[3]), Math.m
 function pointInBox([c, r], b) { const [a0, a1, a2, a3] = boxNorm(b); return c >= a0 && c <= a2 && r >= a1 && r <= a3; }
 function selectFromBox(box, additive) {
   if (!additive) selClear();
+  if (cropUserLabelsVisible()) {
   S.crop.marks.points.forEach((p, i) => { if (pointInBox(p.px, box)) S.crop.selected.points.add(i); });
   S.crop.marks.lines.forEach((ln, i) => { if (ln.pts.some((v) => pointInBox(v, box))) S.crop.selected.lines.add(i); });
   // with "Edit others" on, the SAME box-select also takes others' marks
@@ -2222,10 +2322,70 @@ function selectFromBox(box, additive) {
     S.crop.others.points.forEach((p, i) => { if (pointInBox(p.px, box)) S.crop.selected.oPoints.add(i); });
     S.crop.others.lines.forEach((ln, i) => { if (ln.pts.some((v) => pointInBox(v, box))) S.crop.selected.oLines.add(i); });
   }
+  }
+  if (originalInspectable()) S.crop.originals.points.forEach((p,i) => { if (pointInBox(p.px,box)) S.crop.selected.originals.add(i); });
+}
+// Undo stores edit state, including pending persistence operations. Restoring
+// coordinates alone would leave moves/deletes queued for the next Save.
+function cropEditSnapshot() {
+  const c = S.crop;
+  return structuredClone({ originals:c.originals, pendingOriginals:c.pendingOriginals, marks: c.marks, others: c.others, inProgress: c.inProgress,
+    dirty: c.dirty, pendingOwnMoves: c.pendingOwnMoves,
+    pendingOthersMoves: c.pendingOthersMoves, pendingOthersDeletes: c.pendingOthersDeletes,
+    selected: c.selected, drawMode: drawMode(),
+  });
+}
+function recordCropEdit(label, before, others = false, originals = false, users = true) {
+  const undo = S.crop.undo;
+  undo.push({ label, before, others, originals, users });
+  if (undo.length > 100) undo.shift();
+}
+function clearCropUndo() { if (S.crop) S.crop.undo = []; }
+function cropUndoEntry() { return S.crop?.undo?.at(-1); }
+function canUndoCropEdit() {
+  const entry = cropUndoEntry();
+  return !!entry && !workflowLocked() && (!entry.users || cropUserLabelsVisible()) && (!entry.others || suEditOn()) && (!entry.originals || originalEditOn());
+}
+function undoCropEdit() {
+  if (!canUndoCropEdit()) return;
+  const { before } = S.crop.undo.pop();
+  const { drawMode: mode, ...edit } = structuredClone(before);
+  const originalIds = new Set([...edit.selected.originals].map(i=>edit.originals.points[i]?.id));
+  Object.assign(S.crop, edit);
+  // Visibility is a view preference, not part of undo. Rebuild deleted ghosts
+  // from restored edit intent under the current switch and remap selection.
+  loadOriginalCrop();
+  S.crop.selected.originals = new Set(S.crop.originals.points.flatMap((p,i)=>originalIds.has(p.id)?[i]:[]));
+  if (!originalInspectable()) S.crop.selected.originals.clear();
+  if (!suEditOn()) { S.crop.selected.oPoints.clear(); S.crop.selected.oLines.clear(); }
+  document.querySelector(`input[name="drawmode"][value="${mode}"]`).checked = true;
+  S.crop.selectBox = null;
+  hideCropHoverTip();
+  // Undo can reach the clean baseline. Remove its draft so reload cannot
+  // resurrect edits just undone; conflicting/archived recovery stays intact.
+  if (S.workflow.enabled && !cropIsDirty()) {
+    const draft = storedWorkflowDraft(S.crop.cell.id);
+    if (draft?.revision === S.crop.revision) localStorage.removeItem(workflowDraftKey(S.crop.cell.id));
+  }
+  redrawCrop();
 }
 function deleteSelected() {
-  if(workflowLocked()) return;
-  if (!S.crop || selCount() === 0) return;
+  if(workflowLocked() || !cropLabelsInteractive()) return;
+  if (!S.crop) return;
+  if (!originalEditOn()) S.crop.selected.originals.clear();
+  if (!suEditOn()) { S.crop.selected.oPoints.clear(); S.crop.selected.oLines.clear(); }
+  for (const i of S.crop.selected.originals) if (S.crop.originals.points[i]?.deleted) S.crop.selected.originals.delete(i);
+  if (selCount() === 0) { redrawCrop(); return; }
+  if (!cropUserLabelsVisible()) { S.crop.selected.points.clear(); S.crop.selected.lines.clear(); S.crop.selected.oPoints.clear(); S.crop.selected.oLines.clear(); }
+  const before = cropEditSnapshot();
+  const touchesOriginals = S.crop.selected.originals.size > 0;
+  const touchesUsers = selCount() > S.crop.selected.originals.size;
+  for (const i of S.crop.selected.originals) {
+    const p = S.crop.originals.points[i];
+    S.crop.pendingOriginals.set(p.id,{action:'delete',px:[...p.px]});
+  }
+  if (touchesOriginals) loadOriginalCrop();
+  const touchesOthers = S.crop.selected.oPoints.size > 0 || S.crop.selected.oLines.size > 0;
   const removedOwn = [];
   const pi = [...S.crop.selected.points].sort((a, b) => b - a);
   for (const i of pi) removedOwn.push(...S.crop.marks.points.splice(i, 1));
@@ -2249,6 +2409,7 @@ function deleteSelected() {
   // delete wins over a pending move of the same mark: the row is going away,
   // so the move intent is dropped with it.
   S.crop.pendingOthersMoves = dropMovesForIds(S.crop.pendingOthersMoves, removedIds);
+  recordCropEdit('delete labels', before, touchesOthers, touchesOriginals, touchesUsers);
   selClear();
   redrawCrop();
 }
@@ -2331,18 +2492,26 @@ function drawCropOverlay() {
   ctx.save();
   // clip to the imagery's on-screen rect, as when the marks lived on the image canvas
   ctx.beginPath(); ctx.rect(vx, vy, 1024 * scale, 1024 * scale); ctx.clip();
-  // existing GT (locked, read-only): shaft dots = red. GT polylines
+  // Original shaft dots = red; corrections are separate from the baseline. GT polylines
   // (cell.gt_lines) are deliberately NOT rendered — dots only.
   if ($('crop-gt').checked) {
     ctx.save();
     ctx.fillStyle = '#ff3b30';
-    for (const [gx, gy] of S.crop.cell.gt_points || []) {
-      const [c, r] = worldToPixel(gx, gy, S.crop.cell.world_bbox);
-      ctx.beginPath(); ctx.arc(SX(c), SY(r), 4, 0, 2 * Math.PI); ctx.fill();
-    }
+    S.crop.originals.points.forEach(({px:[c,r],deleted},idx) => {
+      if (deleted) {
+        ctx.save();ctx.strokeStyle='#ff6b6b';ctx.lineWidth=1.5;ctx.setLineDash([3,3]);
+        ctx.beginPath();ctx.arc(SX(c),SY(r),6,0,2*Math.PI);ctx.stroke();ctx.setLineDash([]);
+        ctx.beginPath();ctx.moveTo(SX(c)-3,SY(r)-3);ctx.lineTo(SX(c)+3,SY(r)+3);
+        ctx.moveTo(SX(c)-3,SY(r)+3);ctx.lineTo(SX(c)+3,SY(r)-3);ctx.stroke();ctx.restore();
+      } else { ctx.beginPath(); ctx.arc(SX(c), SY(r), 4, 0, 2 * Math.PI); ctx.fill(); }
+      if (S.crop.selected.originals.has(idx)) {
+        ctx.save();ctx.strokeStyle='#ff00ff';ctx.lineWidth=2.5;
+        ctx.beginPath();ctx.arc(SX(c),SY(r),7.5,0,2*Math.PI);ctx.stroke();ctx.restore();
+      }
+    });
     ctx.restore();
   }
-  if (!cropUserLabelsVisible()) { ctx.restore(); return; }
+  if (cropUserLabelsVisible()) {
   // others' marks (read-only, orange) — drawn under mine, never selectable
   if (S.crop.others && (S.crop.others.points.length || S.crop.others.lines.length)) {
     ctx.save();
@@ -2396,6 +2565,7 @@ function drawCropOverlay() {
     for (const [c, r] of S.crop.inProgress) { ctx.beginPath(); ctx.arc(SX(c), SY(r), 3, 0, 2 * Math.PI); ctx.fill(); }
   }
   ctx.restore();
+  }
   // rubber-band selection rectangle (stored in image px, drawn in screen px)
   if (S.crop.selectBox) {
     const [a0, a1, a2, a3] = boxNorm(S.crop.selectBox);
@@ -2474,9 +2644,10 @@ function findCropDragTarget([col, row]) {
   const su = suEditOn();
   // resolve the press exactly like a click first (own marks on top, then
   // others'): a press on an UNselected mark must stay a plain click.
-  const clickHit = hitTestOwn([col, row]) || (su ? hitTestOthers([col, row]) : null);
+  const clickHit = cropHit([col,row]);
   if (clickHit) {
     const { kind, idx } = clickHit;
+    if (kind === 'original' && sel.originals.has(idx) && originalEditOn() && !S.crop.originals.points[idx].deleted) return {group:'originals',kind:'point',selKind:'original',idx,mode:'point'};
     if (kind === 'point' && sel.points.has(idx)) {
       return { group: 'own', kind: 'point', selKind: 'point', idx, mode: 'point' };
     }
@@ -2495,6 +2666,7 @@ function findCropDragTarget([col, row]) {
   }
   // no click hit: the click hit-test only sees vertices, so a press on a
   // SELECTED polyline's SEGMENT lands here — that grabs the whole line.
+  if (!cropUserLabelsVisible()) return null;
   for (const idx of sel.lines) {
     const g = resolveLineGrab(S.crop.marks.lines[idx].pts, col, row, tol);
     if (g) return { group: 'own', kind: 'line', selKind: 'line', idx, mode: g.mode, vIdx: g.vIdx };
@@ -2510,8 +2682,33 @@ function findCropDragTarget([col, row]) {
 /** The live mark object a drag target refers to (own or others' list). */
 function dragTargetMark(t) {
   if (!S.crop || !t) return null;
-  const src = t.group === 'own' ? S.crop.marks : S.crop.others;
+  const src = t.group === 'originals' ? S.crop.originals : t.group === 'own' ? S.crop.marks : S.crop.others;
   return t.kind === 'point' ? src.points[t.idx] : src.lines[t.idx];
+}
+/** Capture editable selections once; live references prevent index drift on refresh. */
+function snapshotCropDragItems(anchor) {
+  const items = [];
+  for (const [group, kind, selection] of [
+    ['originals', 'point', 'originals'],
+    ['own', 'point', 'points'], ['own', 'line', 'lines'],
+    ['others', 'point', 'oPoints'], ['others', 'line', 'oLines'],
+  ]) {
+    if (group === 'originals' ? !originalEditOn() : !cropUserLabelsVisible()) continue;
+    if (group === 'others' && !suEditOn()) continue;
+    for (const idx of S.crop.selected[selection]) {
+      const target = { group, kind, idx };
+      const mark = dragTargetMark(target);
+      if (!mark || (group === 'originals' && mark.deleted)) continue;
+      items.push({ ...target, mark,
+        orig: kind === 'point' ? [...mark.px] : mark.pts.map(p => [...p]),
+        mode: kind === 'point' ? 'point' : 'whole',
+      });
+    }
+  }
+  // Single-line editing retains vertex grabs. Multiple labels move rigidly,
+  // even when the anchor is a vertex of one of the selected polylines.
+  if (items.length === 1) Object.assign(items[0], { mode: anchor.mode, vIdx: anchor.vIdx });
+  return items;
 }
 // ---- hover tooltip: who labeled an OTHER user's mark (crop popup only) ----
 // Display-only: others' marks stay exactly as non-interactive as before for
@@ -2535,7 +2732,9 @@ function showCropHoverTip(name, sx, sy) {
   tip.style.top = Math.max(pad, top) + 'px';
 }
 function finishInProgressLine() {
-  if(workflowLocked()) return;
+  if(workflowLocked() || !S.crop || !S.crop.inProgress.length) return;
+  const before = cropEditSnapshot();
+  before.drawMode = 'line'; // A mode-switch completion must undo back into drawing mode.
   // provenance: the line is stamped with the toggle state at COMPLETION time
   // (dblclick/Enter/mode-switch/commit flush), one `ac` flag per line.
   if (S.crop.inProgress.length >= 2) {
@@ -2543,6 +2742,7 @@ function finishInProgressLine() {
     S.crop.dirty = true;
   }
   S.crop.inProgress = [];
+  recordCropEdit('finish polyline', before);
   redrawCrop();
 }
 function setupCropInteractions() {
@@ -2553,12 +2753,14 @@ function setupCropInteractions() {
   let panning = false, lastX = 0, lastY = 0;
   // ---- press gesture on the canvas: left-click = add/select; left-drag = box-select ----
   let pressActive = false, pressX = 0, pressY = 0, pressPx = null, pressMoved = false, pressAdditive = false;
-  // ---- drag-move of an already-selected mark (see findCropDragTarget) ----
-  // {group, kind, selKind, idx, mode, vIdx?, startPx, startClientX/Y, moved,
-  //  orig} — `orig` is a deep copy of the pre-drag geometry, so every
-  // pointermove re-derives from it (no accumulation drift) and Esc-cancel is a
-  // plain restore. Multi-selection: ONLY the grabbed mark moves, by design.
+  // A drag captures its crop, anchor and editable selection. Every frame is
+  // computed from the original geometry with one shared, crop-bounded delta.
   let cropDrag = null;
+  function cropDragValid(d) {
+    return S.crop === d.crop && !workflowLocked()
+      && d.items.every(item => (item.group === 'originals' ? originalEditOn() : cropUserLabelsVisible() && (item.group === 'own' || suEditOn()))
+        && dragTargetMark(item) === item.mark);
+  }
 
   /** Revert an in-flight drag to the pre-drag geometry. True if one was active. */
   function cancelCropDrag() {
@@ -2566,48 +2768,57 @@ function setupCropInteractions() {
     const d = cropDrag;
     cropDrag = null;
     canvas.style.cursor = '';
-    if (S.crop) {
-      const m = dragTargetMark(d);
-      if (m) {
-        if (d.kind === 'point') m.px = [d.orig[0], d.orig[1]];
-        else m.pts = d.orig.map((p) => [p[0], p[1]]);
-      }
-      drawCropOverlay();
+    for (const item of d.items) {
+      if (item.kind === 'point') item.mark.px = [...item.orig];
+      else item.mark.pts = item.orig.map(p => [...p]);
     }
+    drawCropOverlay();
     return true;
   }
-  /** A finished (moved) drag: commit the new geometry into the crop state. */
-  function commitCropDrag(d) {
-    const m = dragTargetMark(d);
-    if (!m) return;
-    const same = d.kind === 'point'
-      ? (m.px[0] === d.orig[0] && m.px[1] === d.orig[1])
-      : (m.pts.length === d.orig.length
-         && m.pts.every((p, i) => p[0] === d.orig[i][0] && p[1] === d.orig[i][1]));
-    if (same) { redrawCrop(); return; }   // clamped back to the start — no change
-    const entry = d.kind === 'point'
-      ? { kind: 'point', px: [m.px[0], m.px[1]] }
-      : { kind: 'line', pts: m.pts.map((p) => [p[0], p[1]]) };
-    if (d.group === 'own') {
-      if (typeof m.dbId === 'number' && Number.isFinite(m.dbId)) {
-        // an already-SAVED own mark keeps its identity across a move: the
-        // dbId STAYS (so the reconcile-on-save leaves the row alone) and the
-        // move becomes a pending own-move, committed by "Save work" as an
-        // rpc_update_mark {geom} on the SAME row — id, created_at and the
-        // mark's history chain all survive. Last move of the mark wins.
-        S.crop.pendingOwnMoves = mergePendingMove(S.crop.pendingOwnMoves, m.dbId, entry);
+  /** Commit changed items through the existing per-mark pending maps. */
+  function commitCropDrag(drag) {
+    let changed = false;
+    for (const d of drag.items) {
+      const m = d.mark;
+      const same = d.kind === 'point'
+        ? (m.px[0] === d.orig[0] && m.px[1] === d.orig[1])
+        : (m.pts.length === d.orig.length
+           && m.pts.every((p, i) => p[0] === d.orig[i][0] && p[1] === d.orig[i][1]));
+      if (same) continue;   // clamped back to the start — no change
+      changed = true;
+      const entry = d.kind === 'point'
+        ? { kind: 'point', px: [m.px[0], m.px[1]] }
+        : { kind: 'line', pts: m.pts.map((p) => [p[0], p[1]]) };
+      if (d.group === 'originals') {
+        S.crop.pendingOriginals.set(m.id,{action:'move',px:[...m.px]});
+      } else if (d.group === 'own') {
+        if (typeof m.dbId === 'number' && Number.isFinite(m.dbId)) {
+          // an already-SAVED own mark keeps its identity across a move: the
+          // dbId STAYS (so the reconcile-on-save leaves the row alone) and the
+          // move becomes a pending own-move, committed by "Save work" as an
+          // rpc_update_mark {geom} on the SAME row — id, created_at and the
+          // mark's history chain all survive. Last move of the mark wins.
+          S.crop.pendingOwnMoves = mergePendingMove(S.crop.pendingOwnMoves, m.dbId, entry);
+        } else {
+          // a never-saved mark has no row to patch — its local coords already
+          // moved; the ordinary insert-on-save path picks them up.
+          S.crop.dirty = true;
+        }
       } else {
-        // a never-saved mark has no row to patch — its local coords already
-        // moved; the ordinary insert-on-save path picks them up.
-        S.crop.dirty = true;
+        // others' mark (superuser): a pending UPDATE, committed by "Save work"
+        // via rpc_update_mark. Last move of the same mark wins.
+        S.crop.pendingOthersMoves = mergePendingMove(S.crop.pendingOthersMoves, m.dbId, entry);
       }
-    } else {
-      // others' mark (superuser): a pending UPDATE, committed by "Save work"
-      // via rpc_update_mark. Last move of the same mark wins.
-      S.crop.pendingOthersMoves = mergePendingMove(S.crop.pendingOthersMoves, m.dbId, entry);
     }
+    if (changed) recordCropEdit('move labels', drag.before, drag.items.some(item => item.group === 'others'),
+      drag.items.some(item => item.group === 'originals'),drag.items.some(item => item.group !== 'originals'));
     redrawCrop();
   }
+  // Capture before the toggle's own handler redraws/stashes a draft. Losing
+  // cross-labeler permission cancels the entire gesture, including own items.
+  document.addEventListener('change', (e) => {
+    if (['tg-editothers','crop-edit-originals','crop-gt','crop-marks'].includes(e.target.id) && cropDrag && !cropDragValid(cropDrag)) cancelCropDrag();
+  }, true);
 
   stage.addEventListener('contextmenu', (e) => { if (S.crop) e.preventDefault(); });
   stage.addEventListener('mousedown', (e) => {
@@ -2621,7 +2832,7 @@ function setupCropInteractions() {
   canvas.addEventListener('mousedown', (e) => {
     if (!S.crop || e.button !== 0) return;   // non-left bubbles to stage for panning
     e.stopPropagation();
-    if (!cropUserLabelsVisible()) return;
+    if (!cropLabelsInteractive()) return;
     const px = canvasEventToPx(e);
     const additive = e.shiftKey || e.ctrlKey || e.metaKey;
     // a plain press on an already-selected mark grabs it for a drag-move;
@@ -2629,13 +2840,15 @@ function setupCropInteractions() {
     if (!additive && !workflowLocked()) {
       const t = findCropDragTarget(px);
       if (t) {
-        const m = dragTargetMark(t);
+        const items = snapshotCropDragItems(t);
         cropDrag = {
-          ...t,
+          ...t, crop: S.crop, items, before: cropEditSnapshot(),
+          // Clamp against ALL vertices once, preserving distances at the edge.
+          clampPoints: items.flatMap(item => item.kind === 'point' ? [item.orig]
+            : item.mode === 'vertex' ? [item.orig[item.vIdx]] : item.orig),
           startPx: px,
           startClientX: e.clientX, startClientY: e.clientY,
           moved: false,
-          orig: t.kind === 'point' ? [m.px[0], m.px[1]] : m.pts.map((p) => [p[0], p[1]]),
         };
         canvas.style.cursor = 'grabbing';
         hideCropHoverTip();
@@ -2649,6 +2862,7 @@ function setupCropInteractions() {
     hideCropHoverTip();   // a click/box-select press is starting
   });
   window.addEventListener('mousemove', (e) => {
+    if (cropDrag && !cropDragValid(cropDrag)) { cancelCropDrag(); return; }
     if (!S.crop) return;
     if (cropDrag) {
       if (!cropDrag.moved
@@ -2657,22 +2871,16 @@ function setupCropInteractions() {
       if (cropDrag.moved) {
         const cur = canvasEventToPx(e);
         const dc = cur[0] - cropDrag.startPx[0], dr = cur[1] - cropDrag.startPx[1];
-        const m = dragTargetMark(cropDrag);
-        if (!m) return;
-        if (cropDrag.kind === 'point') {
-          // the point follows the cursor (delta from the grab, no jump),
-          // clamped to the crop bounds
-          const [cdc, cdr] = clampDelta([cropDrag.orig], dc, dr);
-          m.px = [cropDrag.orig[0] + cdc, cropDrag.orig[1] + cdr];
-        } else if (cropDrag.mode === 'vertex') {
-          const ov = cropDrag.orig[cropDrag.vIdx];
-          const [cdc, cdr] = clampDelta([ov], dc, dr);
-          m.pts = cropDrag.orig.map((p, i) => (
-            i === cropDrag.vIdx ? [ov[0] + cdc, ov[1] + cdr] : [p[0], p[1]]));
-        } else {
-          // whole polyline, rigid; the clamp stops the drag at the crop edge
-          const [cdc, cdr] = clampDelta(cropDrag.orig, dc, dr);
-          m.pts = translatePoints(cropDrag.orig, cdc, cdr);
+        const [cdc, cdr] = clampDelta(cropDrag.clampPoints, dc, dr);
+        for (const item of cropDrag.items) {
+          if (item.kind === 'point') {
+            item.mark.px = [item.orig[0] + cdc, item.orig[1] + cdr];
+          } else if (item.mode === 'vertex') {
+            item.mark.pts = item.orig.map((p, i) => i === item.vIdx
+              ? [p[0] + cdc, p[1] + cdr] : [...p]);
+          } else {
+            item.mark.pts = translatePoints(item.orig, cdc, cdr);
+          }
         }
         drawCropOverlay();   // vectors only; imagery unchanged while dragging
       }
@@ -2694,6 +2902,7 @@ function setupCropInteractions() {
   });
   window.addEventListener('mouseup', () => {
     if (cropDrag) {
+      if (!cropDragValid(cropDrag)) { cancelCropDrag(); return; }
       const d = cropDrag;
       cropDrag = null;
       canvas.style.cursor = '';
@@ -2720,14 +2929,16 @@ function setupCropInteractions() {
         S.crop.selectBox = null;
         // own marks first (they draw on top), then — with "Edit others" on —
         // others' marks become clickable/selectable through the same gesture.
-        const hit = hitTestOwn(pressPx) || (suEditOn() ? hitTestOthers(pressPx) : null);
+        const hit = cropHit(pressPx);
         if (hit) { selSet(hit.kind, hit.idx, pressAdditive); redrawCrop(); return; }
         if (!pressAdditive) selClear();
-        if(workflowLocked()) { redrawCrop(); return; }
+        if(workflowLocked() || !cropUserLabelsVisible()) { redrawCrop(); return; }
+        const before = cropEditSnapshot();
         // new point: stamped with the toggle state at the moment it is added.
         if (drawMode() === 'point') S.crop.marks.points.push({ px: pressPx, ac: $('crop-autocontrast').checked });
         else S.crop.inProgress.push(pressPx);
         S.crop.dirty = true;
+        recordCropEdit(drawMode() === 'point' ? 'add point' : 'add polyline vertex', before);
         redrawCrop();
       }
     }
@@ -2756,12 +2967,19 @@ function setupCropInteractions() {
   // A linear scan over the crop's few hundred marks per pointermove is cheap;
   // bail first while any gesture is active (pan / press drag / polyline draw).
   stage.addEventListener('pointermove', (e) => {
-    if (!S.crop || !cropUserLabelsVisible()) { canvas.style.cursor = ''; hideCropHoverTip(); return; }
+    if (!S.crop || !cropLabelsInteractive()) { canvas.style.cursor = ''; hideCropHoverTip(); return; }
     if (panning || pressActive || cropDrag || S.crop.inProgress.length) { hideCropHoverTip(); return; }
     const [col, row] = canvasEventToPx(e);
     // grab affordance: `grab` exactly where a plain left press would start a
     // drag-move (selected own mark; selected other's mark with Edit others on)
     canvas.style.cursor = findCropDragTarget([col, row]) ? 'grab' : '';
+    const originalHit = hitTestOriginal([col,row]);
+    if (originalHit && !(cropUserLabelsVisible() && (hitTestOwn([col,row]) || hitTestOthers([col,row])))) {
+      const p = S.crop.originals.points[originalHit.idx], rect=stage.getBoundingClientRect();
+      showCropHoverTip(`${p.deleted?'Deleted original label':'Original label'}${p.editedBy?' · edited by '+p.editedBy:''}`,e.clientX-rect.left,e.clientY-rect.top);
+      return;
+    }
+    if (!cropUserLabelsVisible()) { hideCropHoverTip(); return; }
     const tol = CROP_MARK_TOL_SCREEN_PX / Math.max(0.01, S.crop.view.scale);
     const hit = nearestMark(
       S.crop.others.points.map((p) => p.px),
@@ -2787,7 +3005,11 @@ function setupCropInteractions() {
   // the overlay's backing store is tied to the stage size / devicePixelRatio
   window.addEventListener('resize', () => { if (S.crop) drawCropOverlay(); });
   $('crop-autocontrast').addEventListener('change', redrawCrop);
-  $('crop-gt').addEventListener('change', drawCropOverlay);
+  for (const id of ['crop-gt','crop-edit-originals','crop-show-deleted-originals']) $(id).addEventListener('change', () => {
+    cancelCropDrag();pressActive=false;
+    if(S.crop) { S.crop.selected.originals.clear();S.crop.selectBox=null;loadOriginalCrop(); }
+    redrawCrop();
+  });
   $('crop-marks').addEventListener('change', () => {
     cancelCropDrag();
     pressActive = false;
@@ -2799,27 +3021,22 @@ function setupCropInteractions() {
     updateHistoryButton();
     drawCropOverlay();
   });
-  $('crop-undo').addEventListener('click', () => {
-    if (!S.crop || workflowLocked() || !cropUserLabelsVisible()) return;
-    if (S.crop.inProgress.length) { S.crop.inProgress.pop(); S.crop.dirty = true; }
-    else if (S.crop.marks.points.length || S.crop.marks.lines.length) {
-      // undo whichever was added last is ambiguous after reload; pop a point first, else a line
-      const popped = S.crop.marks.points.length
-        ? S.crop.marks.points.pop() : S.crop.marks.lines.pop();
-      // the popped mark's row is deleted by the reconcile on save — a pending
-      // own-move of it goes with it.
-      S.crop.pendingOwnMoves = dropMovesForIds(S.crop.pendingOwnMoves, othersDeleteIds([popped]));
-      S.crop.dirty = true;
-    }
-    selClear();
-    redrawCrop();
-  });
+  function undoLastEdit() {
+    if (cancelCropDrag()) return;
+    pressActive = false;
+    undoCropEdit();
+  }
+  $('crop-undo').addEventListener('click', undoLastEdit);
+
   $('crop-clear').addEventListener('click', () => {
     if (!S.crop || workflowLocked() || !cropUserLabelsVisible()) return;
+    if (!(S.crop.marks.points.length || S.crop.marks.lines.length || S.crop.inProgress.length)) return;
     if (!confirm('Remove all your marks for this crop?')) return;
+    const before = cropEditSnapshot();
     S.crop.marks.points = []; S.crop.marks.lines = []; S.crop.inProgress = []; S.crop.selectBox = null; selClear();
     S.crop.pendingOwnMoves = new Map();   // every own row goes on save — no moves left to commit
     S.crop.dirty = true;
+    recordCropEdit('clear own labels', before);
     redrawCrop();
   });
   $('crop-save').addEventListener('click', () => saveWork());
@@ -2889,6 +3106,14 @@ function setupCropInteractions() {
       if (e.key === 'Escape') { e.preventDefault(); closeNavDialog('cancel'); }
       return;
     }
+    const target = e.target;
+    const editingText = target?.isContentEditable || target?.tagName === 'TEXTAREA'
+      || (target?.tagName === 'INPUT' && !['checkbox', 'radio', 'range', 'button'].includes(target.type));
+    const undoKey = (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'z';
+    if (undoKey) {
+      if (!editingText) { e.preventDefault(); undoLastEdit(); }
+      return;
+    }
     // a drag-move owns the keyboard while the mouse is down: Esc cancels the
     // DRAG (mark snaps back; selection, polyline, close are all untouched —
     // this deliberately slots before every other Esc duty); arrows / Delete /
@@ -2910,7 +3135,10 @@ function setupCropInteractions() {
     else if (e.key === 'Delete' || e.key === 'Backspace') {
       if (selCount() > 0) { deleteSelected(); e.preventDefault(); }
     } else if (e.key === 'Escape') {
-      if (cropUserLabelsVisible() && S.crop.inProgress.length) { S.crop.inProgress = []; redrawCrop(); }
+      if (cropUserLabelsVisible() && S.crop.inProgress.length) {
+        const before = cropEditSnapshot();
+        S.crop.inProgress = []; recordCropEdit('cancel polyline', before); redrawCrop();
+      }
       else if (selCount() > 0 || S.crop.selectBox) { selClear(); S.crop.selectBox = null; redrawCrop(); }
       // all three close routes (Close button, backdrop click, Esc) converge on
       // requestCloseCrop(): dirty crops get the 3-way unsaved-marks prompt,
@@ -2933,8 +3161,11 @@ function setupCropInteractions() {
 }
 async function commitCrop(finish = false) {
   if (!S.crop) return false;
+  clearCropUndo(); updateWorkflowUI();
   let saved = !backendOn();
   const cell = S.crop.cell;
+  const pendingOriginals = new Map(S.crop.pendingOriginals);
+  if (pendingOriginals.size && (!S.su || !S.workflow.enabled || !S.originals.available)) throw new Error('Original label editing is unavailable.');
   // flush any in-progress polyline (completing it now → stamp the current toggle)
   if (S.crop.inProgress.length >= 2) {
     S.crop.marks.lines.push({ pts: S.crop.inProgress.slice(), ac: $('crop-autocontrast').checked });
@@ -3039,14 +3270,19 @@ async function commitCrop(finish = false) {
           const world=moveWorld(mv); updates.push({id,patch:{geom:await encryptGeom(world)}});
           movedOthers.set(id,{world,editedBy:S.me});
         }
+        const original_edits = [];
+        for (const [label_id,edit] of pendingOriginals) original_edits.push({label_id,action:edit.action,
+          ...((edit.action==='move' || (edit.action==='delete' && edit.px)) ? {geom:await encryptGeom(pixelToWorld(...edit.px,cell.world_bbox))} : {})});
         const job = { id:crypto.randomUUID(), role:workflowRole(), command:{board:S.board,project:S.project,cell_id:cell.id,
           revision:S.crop.revision,action:finish?'finish':'save',
-          delete_ids:[...new Set([...toDelete,...pendingOthers])], inserts:inserts.map(x=>x.row),updates},
-          apply:result=>{
+          delete_ids:[...new Set([...toDelete,...pendingOthers])], inserts:inserts.map(x=>x.row),updates,original_edits},
+          apply:async result=>{
             backfillInsertedIds(inserts,result.inserted);
             if(S.crop?.cell===cell) S.crop.pendingOwnMoves=new Map();
             if(pendingOthers.size) applyOthersDeletes(cell,pendingOthers);
             if(movedOthers.size) applyOthersMoves(cell,movedOthers);
+            if(result.originals) await acceptOriginalEdits(cell.id,result.originals);
+            if(S.crop?.cell===cell) { S.crop.pendingOriginals=new Map();loadOriginalCrop(); }
             acceptWorkflowState(result.state);
           }};
         localStorage.setItem(pendingWorkflowKey(),JSON.stringify({id:job.id,role:job.role,command:job.command}));
