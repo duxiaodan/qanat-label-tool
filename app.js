@@ -12,6 +12,7 @@ import {
   pixelToWorld, worldToPixel, nearestMark, resolveLineGrab, clampDelta, translatePoints,
 } from './geo.js';
 import { buildShaftsFeatureCollection, buildLinesFeatureCollection } from './geojson.js';
+import { predictionSources, predictionCells, predictionMetadata, savedPrediction, predictionForMark } from './predictions.js';
 import { deriveKey, decryptBlob, encryptBlob, verifyPasscode, openSuEnvelope, deriveWriteToken } from './crypto.js';
 import {
   fetchAllMarks, fetchMyCellMarks, deleteMarksByIds, insertMarks, updateMark,
@@ -64,7 +65,8 @@ async function loadOverviewTile(file, signal) {
 const S = {
   key: null,            // CryptoKey (site files: manifest/swath/heatmap/crops)
   marksKey: null,       // CryptoKey for DB-row geometry (marks_salt; stable across rebuilds)
-  manifest: null,       // decrypted manifest object
+  manifest: null,       // immutable base scores and crop geometry
+  predictions: { sources: [], active: null, heatUrl: null, busy: false },
   cells: [],            // manifest.cells (p_pos desc)
   cellById: new Map(),
   cellRank: new Map(),  // cell id -> index into S.cells (p_pos desc) — O(1) range test
@@ -566,7 +568,7 @@ async function decodeMarkRows(rows) {
     const cropId = row.cell_id;
     const created = row.created_at || row.updated_at || '';
     // p_pos recorded at save time wins over the (possibly rebuilt) manifest's.
-    const pPos = row.p_pos != null ? row.p_pos : cellPPos(cropId);
+    const pPos = row.p_pos != null ? row.p_pos : null; // Unknown historical scores stay unknown.
     // provenance columns (plaintext in the DB; null on rows that predate them)
     const prov = {
       worldBbox: row.world_bbox ?? null,
@@ -623,11 +625,6 @@ async function pullAllMarks() {
   persist();
   if (S.unsynced) setSyncStatus('synced (local changes pending)', 'unsynced');
   else setSyncStatus('synced', 'ok');
-}
-
-function cellPPos(cropId) {
-  const c = S.cellById.get(cropId);
-  return c ? c.p_pos : 0;
 }
 
 /** Re-pull the pool + redraw everything (Refresh button + post-save consistency). */
@@ -752,6 +749,7 @@ function reviewDownload() {
     build_id: (S.manifest.build && S.manifest.build.build_id) || null,
     crs: S.manifest.crs || null,
     exported_at: new Date().toISOString(),
+    prediction_view: predictionMetadata(S.predictions.active),
     n_eligible: S.review.eligible.size,
     n_reviewed: verdicts.length,
     per_tif: perTif,
@@ -824,7 +822,9 @@ async function unlock() {
     S.manifest = JSON.parse(new TextDecoder().decode(manBytes));
     S.workflow.enabled = S.manifest.features?.crop_workflow === 1;
     document.querySelectorAll('[data-workflow]').forEach(e=>e.hidden=!S.workflow.enabled);
-    S.cells = (S.manifest.cells || []).slice().sort((a, b) => b.p_pos - a.p_pos);
+    S.predictions.sources = predictionSources(S.manifest);
+    S.predictions.active = S.predictions.sources[0];
+    S.cells = predictionCells(S.manifest.cells, S.predictions.active);
     S.cellRank = new Map();
     S.cells.forEach((c, i) => { S.cellById.set(c.id, c); S.cellRank.set(c.id, i); });
     Object.assign(S.originals, await indexOriginalLabels(S.cells));
@@ -843,6 +843,7 @@ async function unlock() {
     const heatUrl = await decryptToBlobUrl(S.manifest.swath.heatmap || 'heatmap.enc', 'image/png');
     $('swath-img').src = swathUrl;
     $('heat-img').src = heatUrl;
+    S.predictions.heatUrl = heatUrl;
   } catch (e) {
     $('gate-loading').hidden = true;
     $('gate-msg').textContent = 'decryption failed: ' + e.message;
@@ -852,6 +853,7 @@ async function unlock() {
   $('gate').hidden = true;
   $('app').hidden = false;
   sessionStorage.setItem('qanat-unlocked', '1');
+  setupPredictionSelector();
   // superuser-only UI (Edit-others toggle, Snapshots, History). Built HERE, not
   // in the static HTML, so for normal users none of it is in the DOM at all.
   if (S.su) setupSuperuserUI();
@@ -865,6 +867,59 @@ async function unlock() {
   fitSwath();
   updateDownloadEnabled();
   if (S.review.on) reviewRefreshUI(); // reveal counter/button + paint badges/tints
+}
+
+// Commit scores and their overlay together, only after the new image decodes.
+// Failed requests leave the entire previous prediction view intact.
+function setupPredictionSelector() {
+  const select = $('prediction-source');
+  select.replaceChildren();
+  for (const source of S.predictions.sources) {
+    const option = document.createElement('option'); option.value = source.id;
+    option.textContent = source.label; select.appendChild(option);
+  }
+  select.value = S.predictions.active.id;
+  $('prediction-control').hidden = S.predictions.sources.length < 2;
+  select.onchange = () => switchPrediction(select.value);
+}
+function updateCropTitle() {
+  if (!S.crop) return;
+  const cell = S.crop.cell;
+  const model = S.predictions.sources.length > 1 ? ` · ${S.predictions.active.label}` : '';
+  $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}${model}   (${cell.gt_points.length} original shafts)`;
+}
+async function switchPrediction(id) {
+  const select = $('prediction-source'), notice = $('prediction-status');
+  const previous = S.predictions.active;
+  if (id === previous.id) return;
+  if (S.predictions.busy || S.workflow.busy || S.workflow.pending || S.navBusy) {
+    select.value = previous.id; notice.textContent = 'Finish the current save or load first.'; return;
+  }
+  const source = S.predictions.sources.find(x => x.id === id);
+  if (!source) { select.value = previous.id; return; }
+  S.predictions.busy = true; select.disabled = true; notice.textContent = 'Loading model…';
+  let url;
+  try {
+    const cells = predictionCells(S.manifest.cells, source);
+    url = await decryptToBlobUrl(source.heatmap, 'image/png');
+    const image = new Image(); image.src = url; await image.decode();
+    if (image.naturalWidth !== S.swathW || image.naturalHeight !== S.swathH) throw new Error('Heatmap geometry mismatch');
+    const oldUrl = S.predictions.heatUrl;
+    $('heat-img').src = url;
+    S.predictions.active = source; S.predictions.heatUrl = url;
+    S.cells = cells; S.cellById = new Map(cells.map(c => [c.id, c]));
+    S.cellRank = new Map(cells.map((c, i) => [c.id, i]));
+    buildCellCentreIndex();
+    if (S.crop) { S.crop.cell = S.cellById.get(S.crop.cell.id); updateCropTitle(); }
+    initRankSlider(); // Scores are model-specific; keep labeler/workflow filters.
+    refreshFilterUI(); applyLayerToggles(); dlRefresh();
+    notice.textContent = `${source.label} · score range reset`;
+    if (oldUrl) URL.revokeObjectURL(oldUrl);
+  } catch (error) {
+    if (url && url !== S.predictions.heatUrl) URL.revokeObjectURL(url);
+    select.value = previous.id;
+    notice.textContent = `Model unchanged: ${error.message}`;
+  } finally { S.predictions.busy = false; select.disabled = false; }
 }
 
 // --------------------------------------------------------------------------- //
@@ -2151,7 +2206,7 @@ function cropHit(px) {
 function cropUserLabelsVisible() { return $('crop-marks').checked; }
 
 async function openCrop(cid) {
-  if(S.workflow.busy) return;
+  if(S.workflow.busy || S.predictions.busy) return;
   if(S.workflow.pending) { S.workflow.error='Save result unknown. Retry save before leaving this crop.'; updateWorkflowUI(); return; }
   S.workflow.busy=true; updateWorkflowUI();
   try {
@@ -2205,7 +2260,7 @@ async function openCrop(cid) {
       pendingOwnMoves: new Map(),
     };
     loadCropMarksFor(cell);
-    $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}   (${cell.gt_points.length} original shafts)`;
+    updateCropTitle();
     // GT-review verdict buttons: only in review mode AND for eligible cells
     // (in normal mode `show` is false and the span stays hidden, as shipped).
     const revBtns = $('gt-review-btns');
@@ -2238,12 +2293,12 @@ function loadCropMarksFor(cell) {
   // others' are display-only coords + the owner's name for the hover tooltip.
   for (const m of S.shaftMarks) if (m.cropId === cid) {
     const px = worldToPixel(m.world[0], m.world[1], cell.world_bbox);
-    if (m.labeler === S.me) mine.points.push({ px, ac: m.autocontrast ?? null, created: m.created || null, dbId: m.dbId ?? null });
+    if (m.labeler === S.me) mine.points.push({ px, prediction:savedPrediction(m), ac: m.autocontrast ?? null, created: m.created || null, dbId: m.dbId ?? null });
     else others.points.push({ px, labeler: m.labeler || '', dbId: m.dbId ?? null, editedBy: m.editedBy || null });
   }
   for (const m of S.lineMarks) if (m.cropId === cid) {
     const ln = m.world.map(([x, y]) => worldToPixel(x, y, cell.world_bbox));
-    if (m.labeler === S.me) mine.lines.push({ pts: ln, ac: m.autocontrast ?? null, created: m.created || null, dbId: m.dbId ?? null });
+    if (m.labeler === S.me) mine.lines.push({ pts: ln, prediction:savedPrediction(m), ac: m.autocontrast ?? null, created: m.created || null, dbId: m.dbId ?? null });
     else others.lines.push({ pts: ln, labeler: m.labeler || '', dbId: m.dbId ?? null, editedBy: m.editedBy || null });
   }
   // a moved-but-unsaved OWN mark keeps its dbId, so a mid-session refresh
@@ -3181,6 +3236,7 @@ async function commitCrop(finish = false) {
   const moveWorld = (mv) => (mv.kind === 'point'
     ? pixelToWorld(mv.px[0], mv.px[1], cell.world_bbox)
     : mv.pts.map(([c, r]) => pixelToWorld(c, r, cell.world_bbox)));
+  const priorMarks = new Map([...S.shaftMarks, ...S.lineMarks].filter(m => m.dbId != null).map(m => [m.dbId, m]));
   // drop ONLY MY old marks for this cell; never touch others' marks.
   S.shaftMarks = S.shaftMarks.filter((m) => !(m.cropId === cell.id && m.labeler === S.me));
   S.lineMarks = S.lineMarks.filter((m) => !(m.cropId === cell.id && m.labeler === S.me));
@@ -3211,12 +3267,16 @@ async function commitCrop(finish = false) {
   for (const p of S.crop.marks.points) {
     const [x, y] = pixelToWorld(p.px[0], p.px[1], cell.world_bbox);
     const m = { cropId: cell.id, pPos: cell.p_pos, world: [x, y], created: p.created || null, dbId: p.dbId ?? null, kind: KIND_SHAFT, labeler: S.me, ...prov, autocontrast: p.ac ?? null };
+    p.prediction = predictionForMark(p, cell, S.predictions.active, priorMarks.get(p.dbId));
+    Object.assign(m, p.prediction);
     srcOf.set(m, p);
     myShafts.push(m);
   }
   for (const ln of S.crop.marks.lines) {
     if (ln.pts.length < 2) continue;
     const m = { cropId: cell.id, pPos: cell.p_pos, world: ln.pts.map(([c, r]) => pixelToWorld(c, r, cell.world_bbox)), created: ln.created || null, dbId: ln.dbId ?? null, kind: KIND_CHANNEL, labeler: S.me, ...prov, autocontrast: ln.ac ?? null };
+    ln.prediction = predictionForMark(ln, cell, S.predictions.active, priorMarks.get(ln.dbId));
+    Object.assign(m, ln.prediction);
     srcOf.set(m, ln);
     myLines.push(m);
   }
@@ -3259,7 +3319,7 @@ async function commitCrop(finish = false) {
       const inserts = [];
       for (const m of mine) {
         if (m.dbId != null && existingIds.has(m.dbId)) continue; // untouched — leave its row alone
-        inserts.push({ mark: m, src: srcOf.get(m) || null, row: { kind: m.kind, geom: await encryptGeom(m.world), ...rowProv, autocontrast: m.autocontrast, created_at: m.created || undefined } });
+        inserts.push({ mark: m, src: srcOf.get(m) || null, row: { kind: m.kind, geom: await encryptGeom(m.world), ...rowProv, build_id:m.buildId, p_pos:m.pPos, autocontrast: m.autocontrast, created_at: m.created || undefined } });
       }
       // writes go through the token-gated RPCs; actor = the gate name.
       const auth = { token: S.writeToken, actor: S.me };
@@ -3614,6 +3674,10 @@ function dlDownload() {
   // per-feature `properties`, so conformant parsers are unaffected.
   built.shafts.export_scope = meta(ns);
   built.lines.export_scope = meta(nl);
+  for (const fc of [built.shafts, built.lines]) {
+    fc.prediction_view = predictionMetadata(S.predictions.active);
+    fc.prediction_sources = S.predictions.sources.map(predictionMetadata);
+  }
   triggerDownload(built.shafts, built.names.shafts);
   triggerDownload(built.lines, built.names.lines);
   setStatus(`downloaded ${ns + nl} marks (${ns} shafts + ${nl} channels)`);

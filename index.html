@@ -69,6 +69,10 @@
     <div id="main">
       <aside id="sidelist">
         <div class="side-head">
+          <label id="prediction-control" class="prediction-control" hidden>
+            Model <select id="prediction-source" aria-label="Heatmap model"></select>
+          </label>
+          <div id="prediction-status" class="prediction-status" role="status" aria-live="polite"></div>
           <div class="side-title">Cells (by p_pos &darr;)</div>
           <!-- Collapsible filter block. Collapsed (the default) it is one line:
                a live summary of what is filtered + the match count. Expanded it
