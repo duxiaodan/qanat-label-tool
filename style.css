@@ -596,3 +596,8 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
 
 #crop-edit-originals:checked { accent-color: #ff6b6b; }
 #crop-original-controls { display: inline-flex; align-items: center; gap: 8px; }
+
+.prediction-control { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12px; }
+.prediction-control select { flex: 1; min-width: 0; font: inherit; color: inherit; background: #20252d; border: 1px solid #657080; border-radius: 4px; padding: 5px; }
+.prediction-status { margin-bottom: 8px; font-size: 11px; line-height: 1.4; color: #bbc8d8; overflow-wrap: anywhere; }
+.prediction-status:empty { display: none; }
