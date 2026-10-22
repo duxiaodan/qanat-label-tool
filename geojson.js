@@ -1,14 +1,17 @@
 // geojson.js — build the downloadable FeatureCollections for the manual labels.
 //
-// EPSG:32638 (UTM zone 38N). Coordinates are rounded to 2 dp (~cm). Matches the
+// CRS follows the selected location; legacy callers default to EPSG:32638.
+// Coordinates are rounded to 2 dp (~cm). Matches the
 // envelopes pinned by scripts/jason_corona/label_tool_site/tests/test_geojson.mjs.
 //
 // Pure ES module: no DOM, no Node-only APIs.
 
-const CRS_BLOCK = {
-  type: 'name',
-  properties: { name: 'urn:ogc:def:crs:EPSG::32638' },
-};
+function crsBlock(marks,opts) {
+  const crs=opts?.crs || 'EPSG:32638';
+  if (!/^EPSG:326(37|38|39)$/.test(crs)) throw new Error('Unsupported coordinate system');
+  if ((marks||[]).some(m=>m.crs && m.crs!==crs)) throw new Error('Cannot combine different coordinate systems');
+  return {type:'name',properties:{name:'urn:ogc:def:crs:EPSG::'+crs.split(':')[1]}};
+}
 
 /** Round to 2 decimal places. */
 function round2(v) {
@@ -17,6 +20,7 @@ function round2(v) {
 
 function shaftProps(mark, labeler) {
   return {
+    ...(mark.displayPreprocessing ? {display_preprocessing:mark.displayPreprocessing} : {}),
     // per-mark owner wins (shared pool); fall back to the caller-supplied default.
     labeler: (mark && mark.labeler) || labeler,
     project: mark.project ?? null,
@@ -51,9 +55,10 @@ export function buildShaftsFeatureCollection(shaftMarks, opts) {
     },
   }));
   return {
+    ...(opts?.locationId ? {location_id:opts.locationId,board:opts.board} : {}),
     type: 'FeatureCollection',
     name: 'qanat_shafts_manual',
-    crs: CRS_BLOCK,
+    crs: crsBlock(shaftMarks,opts),
     features,
   };
 }
@@ -79,9 +84,10 @@ export function buildLinesFeatureCollection(lineMarks, opts) {
     });
   }
   return {
+    ...(opts?.locationId ? {location_id:opts.locationId,board:opts.board} : {}),
     type: 'FeatureCollection',
     name: 'qanat_channels_manual',
-    crs: CRS_BLOCK,
+    crs: crsBlock(lineMarks,opts),
     features,
   };
 }
