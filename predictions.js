@@ -4,7 +4,8 @@ export function predictionSources(manifest) {
   const cells = manifest.cells || [];
   const ids = new Set(cells.map(c => c.id));
   if (ids.size !== cells.length) throw new Error('Duplicate crop IDs');
-  const base = { id: 'default', label: 'Default model',
+  const base = { id: 'default', label: manifest.location_id && manifest.location_id !== 'erbil' ? 'Trial095 best · exclude nodata' : 'Default model',
+    ...(manifest.location_id && manifest.location_id !== 'erbil' ? {checkpoint_sha256:manifest.build?.checkpoint_sha256,preprocessing:manifest.inference_preprocessing} : {}),
     heatmap: manifest.swath.heatmap || 'heatmap.enc',
     build_id: manifest.build?.build_id ?? null,
     scores: Object.fromEntries(cells.map(c => [c.id, c.p_pos])) };

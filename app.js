@@ -38,12 +38,18 @@ import { SUPABASE } from './site_config.js';
 import { OverviewTiles, overviewMaxScale } from './overviewtiles.js';
 import { workflowPermissions, statusPasses, workflowSummary, workflowBadge } from './workflow.js';
 
+import {LOCATIONS, locationId, locationAsset, boardFor} from './locations.js';
+import {maskedContrast, unpackValidMask, decodeInlineValidMask, CONTRAST_VERSION} from './contrast.js';
+const LOCATION_ID = locationId(location.search);
+const LOCATION = LOCATIONS[LOCATION_ID];
+const shell = window.parent !== window ? window.parent.labelLocations : null;
+const asset = name => locationAsset(LOCATION_ID, name);
 let overviewTiles = null;
 
 async function loadOverviewTile(file, signal) {
   let url;
   try {
-    const response = await fetch('overview/' + file, { signal });
+    const response = await fetch(asset('overview/' + file), { signal });
     if (!response.ok) throw new Error('overview tile unavailable');
     const bytes = await decryptBlob(S.key, new Uint8Array(await response.arrayBuffer()));
     signal.throwIfAborted();
@@ -136,7 +142,7 @@ const S = {
   // `on` is decided once at boot from the URL; when false the feature is inert
   // and the page behaves exactly as before.
   review: {
-    on: new URLSearchParams(location.search).get('gtreview') === '1',
+    on: LOCATION.originals && new URLSearchParams(location.search).get('gtreview') === '1',
     eligible: new Set(),  // cell ids with >=1 GT point AND exactly one owning TIF
     verdicts: {},         // {cellId: {verdict:'accurate'|'drifted', decided_at}}
   },
@@ -254,19 +260,21 @@ function _b64ToBytes(b64) {
 }
 
 /** Encrypt a mark's world geometry -> base64 ciphertext for the `geom` column. */
-async function encryptGeom(world) {
-  const json = JSON.stringify({ world });
+async function encryptGeom(world, displayPreprocessing=CONTRAST_VERSION) {
+  const json = JSON.stringify({ world, location_id: LOCATION_ID, display_preprocessing: displayPreprocessing });
   const blob = await encryptBlob(S.marksKey, _utf8.encode(json));
   return _bytesToB64(blob);
 }
 /** Decrypt a `geom` base64 ciphertext -> the world-coords array (or null on failure). */
-async function decryptGeom(geomB64) {
+async function decryptRecord(geomB64) {
   try {
     const pt = await decryptBlob(S.marksKey, _b64ToBytes(geomB64));
     const o = JSON.parse(_dutf8.decode(pt));
-    return Array.isArray(o.world) ? o.world : null;
+    return Array.isArray(o.world) ? o : null;
   } catch (e) { return null; }
 }
+
+async function decryptGeom(value) { return (await decryptRecord(value))?.world ?? null; }
 
 /** kind tag in the DB: shafts are points, channels are polylines. */
 const KIND_SHAFT = 'shaft';
@@ -392,7 +400,7 @@ async function loadWorkflowCrop(cid,{confirmedJob=null}={}) {
     const result=await fetchCropView(SUPABASE,S.board,S.project,cid,workflowAuth());
     const decoded=await decodeMarkRows(result.marks);
     if (result.originals) await acceptOriginalEdits(cid,result.originals);
-    S.originals.available = !!result.originals_available;
+    S.originals.available = LOCATION.originals && !!result.originals_available;
     // A receipt describes the original command; the read above supplies the
     // current state. Retain recovery records until both have been confirmed.
     if(confirmed) {
@@ -562,7 +570,8 @@ async function decodeMarkRows(rows) {
   const shafts = [];
   const lines = [];
   for (const row of rows || []) {
-    const world = await decryptGeom(row.geom);
+    const record = await decryptRecord(row.geom);
+    const world = record?.world;
     if (!world) continue; // skip rows we can't decrypt (wrong key / corrupt)
     const owner = row.labeler || '';
     const cropId = row.cell_id;
@@ -577,6 +586,7 @@ async function decodeMarkRows(rows) {
       tifs: row.tifs ?? null,
       cropSha256: row.crop_sha256 ?? null,
       buildId: row.build_id ?? null,
+      displayPreprocessing: record.display_preprocessing ?? null,
       autocontrast: row.autocontrast ?? null,
       project: row.project ?? null,
       // who last cross-edited this mark (server-stamped, superuser edits only);
@@ -817,9 +827,20 @@ async function unlock() {
     } else {
       S.marksKey = S.key;
     }
+    await initializeLocation();
+  } catch (e) {
+    $('gate-loading').hidden = true;
+    $('gate-msg').textContent = 'decryption failed: ' + e.message;
+    return;
+  }
+  $('passcode').value = '';
+}
+
+async function initializeLocation() {
     // manifest
-    const manBytes = await decryptBlob(S.key, await fetchBytes('manifest.enc'));
+    const manBytes = await decryptBlob(S.key, await fetchBytes(asset('manifest.enc')));
     S.manifest = JSON.parse(new TextDecoder().decode(manBytes));
+    if (S.manifest.location_id !== LOCATION_ID || S.manifest.crs !== LOCATION.crs) throw new Error('Location manifest mismatch');
     S.workflow.enabled = S.manifest.features?.crop_workflow === 1;
     document.querySelectorAll('[data-workflow]').forEach(e=>e.hidden=!S.workflow.enabled);
     S.predictions.sources = predictionSources(S.manifest);
@@ -831,7 +852,7 @@ async function unlock() {
     buildCellCentreIndex(); // centre-keyed lookup for adjacent-crop navigation
     S.swathW = S.manifest.swath.width; S.swathH = S.manifest.swath.height;
     S.swathBounds = S.manifest.swath.world_bounds;
-    S.board = (S.swathBounds ? S.swathBounds.map((v) => Math.round(v)).join('_') : 'v1');
+    S.board = boardFor(S.manifest);
     // cache is per (board, project) — without the project the offline cache
     // would bleed one project's marks into another even with the DB filtered.
     S.storageKey = 'qanat-labels:' + S.board + ':' + S.project;
@@ -839,16 +860,12 @@ async function unlock() {
     await pullAllMarks();
     computeSessionSince(); // "this session" boundary — ONLY here, never on refresh
     // images
-    const swathUrl = await decryptToBlobUrl('swath.enc', 'image/jpeg');
-    const heatUrl = await decryptToBlobUrl(S.manifest.swath.heatmap || 'heatmap.enc', 'image/png');
+    const swathUrl = await decryptToBlobUrl(asset(S.manifest.swath.image || 'swath.enc'), 'image/jpeg');
+    const heatUrl = await decryptToBlobUrl(asset(S.manifest.swath.heatmap || 'heatmap.enc'), 'image/png');
     $('swath-img').src = swathUrl;
     $('heat-img').src = heatUrl;
     S.predictions.heatUrl = heatUrl;
-  } catch (e) {
-    $('gate-loading').hidden = true;
-    $('gate-msg').textContent = 'decryption failed: ' + e.message;
-    return;
-  }
+    await Promise.all([$('swath-img').decode(), $('heat-img').decode()]);
   // reveal app
   $('gate').hidden = true;
   $('app').hidden = false;
@@ -867,6 +884,13 @@ async function unlock() {
   fitSwath();
   updateDownloadEnabled();
   if (S.review.on) reviewRefreshUI(); // reveal counter/button + paint badges/tints
+  for (const id of ['tg-gt','crop-gt','tg-acc']) {
+    if (!LOCATION.originals) { $(id).checked=false; $(id).disabled=true; $(id).closest('label').title='Original labels and alignment reviews are unavailable for this location.'; }
+  }
+  applyLayerToggles();
+  shell?.authenticated(LOCATION_ID, Object.fromEntries(['key','marksKey','me','meDisplay','project','su','writeToken'].map(k=>[k,S[k]])));
+  shell?.ready(LOCATION_ID);
+
 }
 
 // Commit scores and their overlay together, only after the new image decodes.
@@ -879,14 +903,15 @@ function setupPredictionSelector() {
     option.textContent = source.label; select.appendChild(option);
   }
   select.value = S.predictions.active.id;
-  $('prediction-control').hidden = S.predictions.sources.length < 2;
+  $('prediction-control').hidden = false;
+  select.disabled = S.predictions.sources.length < 2;
   select.onchange = () => switchPrediction(select.value);
 }
 function updateCropTitle() {
   if (!S.crop) return;
   const cell = S.crop.cell;
   const model = S.predictions.sources.length > 1 ? ` · ${S.predictions.active.label}` : '';
-  $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}${model}   (${cell.gt_points.length} original shafts)`;
+  $('crop-title').textContent = `${cell.id}   p_pos=${fmtP(cell.p_pos)}${model}   (${LOCATION.originals ? cell.gt_points.length+' original shafts' : 'original labels unavailable'})`;
 }
 async function switchPrediction(id) {
   const select = $('prediction-source'), notice = $('prediction-status');
@@ -901,7 +926,7 @@ async function switchPrediction(id) {
   let url;
   try {
     const cells = predictionCells(S.manifest.cells, source);
-    url = await decryptToBlobUrl(source.heatmap, 'image/png');
+    url = await decryptToBlobUrl(asset(source.heatmap), 'image/png');
     const image = new Image(); image.src = url; await image.decode();
     if (image.naturalWidth !== S.swathW || image.naturalHeight !== S.swathH) throw new Error('Heatmap geometry mismatch');
     const oldUrl = S.predictions.heatUrl;
@@ -2155,6 +2180,7 @@ async function decodeOriginalEdits(rows) {
   return edits;
 }
 async function pullOriginalLabels() {
+  if (!LOCATION.originals) { S.originals.available=false; return; }
   try {
     const result = await fetchOriginalLabels(SUPABASE,S.board,S.project,workflowAuth());
     S.originals.edits = await decodeOriginalEdits(result.edits);
@@ -2216,18 +2242,30 @@ async function openCrop(cid) {
     setStatus(`loading crop ${cid}…`);
     let img;
     try {
-      const url = await decryptToBlobUrl('crops/' + cell.crop, 'image/jpeg');
-      img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
+      const url = await decryptToBlobUrl(asset('crops/' + cell.crop), cell.crop_mime || 'image/jpeg');
+      img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => { URL.revokeObjectURL(url); res(i); }; i.onerror = e => { URL.revokeObjectURL(url); rej(e); }; i.src = url; });
     } catch (e) { setStatus('crop load failed: ' + e.message); return; }
     setStatus('');
-    const canvas = $('crop-canvas');
-    canvas.width = 1024; canvas.height = 1024;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(img, 0, 0, 1024, 1024);
-    const raw = ctx.getImageData(0, 0, 1024, 1024);
+    const decoded = document.createElement('canvas');
+    decoded.width=1024; decoded.height=1024;
+    const decodedCtx=decoded.getContext('2d',{willReadFrequently:true});
+    decodedCtx.drawImage(img,0,0,1024,1024);
+    const raw=decodedCtx.getImageData(0,0,1024,1024);
 
+    let validMask;
+    try {
+      if (cell.valid_mask && typeof cell.valid_mask === 'object') {
+        validMask = await decodeInlineValidMask(cell.valid_mask);
+      } else if (cell.valid_mask === 'raw-zero' && cell.crop_mime === 'image/png') {
+        validMask = Uint8Array.from({length:1024*1024}, (_,i)=>raw.data[i*4]!==0 ? 1 : 0);
+      } else if (cell.valid_mask) {
+        validMask = unpackValidMask(await decryptBlob(S.key, await fetchBytes(asset('masks/'+cell.valid_mask))));
+      } else { throw new Error('Original nodata mask is unavailable'); }
+    } catch (e) { setStatus('crop mask load failed: '+e.message); return; }
+    const canvas=$('crop-canvas'); canvas.width=1024; canvas.height=1024;
+    const ctx=canvas.getContext('2d',{willReadFrequently:true});
     S.crop = {
-      cell, raw, ctx, img, revision:S.workflow.states.get(cid)?.revision ?? 0,
+      cell, raw, ctx, img, validMask, revision:S.workflow.states.get(cid)?.revision ?? 0,
       view: { x: 0, y: 0, scale: 1 },
       marks: { points: [], lines: [] },      // MY editable marks ({px|pts, ac} objects)
       others: { points: [], lines: [] },     // OTHERS' read-only marks (bare pixel coords)
@@ -2269,7 +2307,7 @@ async function openCrop(cid) {
       revBtns.hidden = !show;
       if (show) reviewSyncCropButtons();
     }
-    $('crop-autocontrast').checked = false;
+    restoreContrastPreference();
     document.querySelector('input[name="drawmode"][value="point"]').checked = true;
     restoreWorkflowDraft();
     $('crop-workflow-history').hidden=true;
@@ -2293,12 +2331,12 @@ function loadCropMarksFor(cell) {
   // others' are display-only coords + the owner's name for the hover tooltip.
   for (const m of S.shaftMarks) if (m.cropId === cid) {
     const px = worldToPixel(m.world[0], m.world[1], cell.world_bbox);
-    if (m.labeler === S.me) mine.points.push({ px, prediction:savedPrediction(m), ac: m.autocontrast ?? null, created: m.created || null, dbId: m.dbId ?? null });
+    if (m.labeler === S.me) mine.points.push({ px, prediction:savedPrediction(m), ac: m.autocontrast ?? null, dp: m.displayPreprocessing ?? null, created: m.created || null, dbId: m.dbId ?? null });
     else others.points.push({ px, labeler: m.labeler || '', dbId: m.dbId ?? null, editedBy: m.editedBy || null });
   }
   for (const m of S.lineMarks) if (m.cropId === cid) {
     const ln = m.world.map(([x, y]) => worldToPixel(x, y, cell.world_bbox));
-    if (m.labeler === S.me) mine.lines.push({ pts: ln, prediction:savedPrediction(m), ac: m.autocontrast ?? null, created: m.created || null, dbId: m.dbId ?? null });
+    if (m.labeler === S.me) mine.lines.push({ pts: ln, prediction:savedPrediction(m), ac: m.autocontrast ?? null, dp: m.displayPreprocessing ?? null, created: m.created || null, dbId: m.dbId ?? null });
     else others.lines.push({ pts: ln, labeler: m.labeler || '', dbId: m.dbId ?? null, editedBy: m.editedBy || null });
   }
   // a moved-but-unsaved OWN mark keeps its dbId, so a mid-session refresh
@@ -2482,25 +2520,21 @@ function applyCropTransform() {
   drawCropOverlay();
 }
 function autocontrast(src) {
-  // 1%-cutoff per-channel histogram stretch on the (greyscale) crop.
-  const d = src.data;
-  const n = d.length / 4;
-  const hist = new Uint32Array(256);
-  for (let i = 0; i < d.length; i += 4) hist[d[i]]++;
-  const cut = Math.max(1, Math.floor(n * 0.01));
-  let lo = 0, hi = 255, acc = 0;
-  for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc > cut) { lo = v; break; } }
-  acc = 0;
-  for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc > cut) { hi = v; break; } }
-  if (hi <= lo) { hi = 255; lo = 0; }
-  const lut = new Uint8Array(256);
-  for (let v = 0; v < 256; v++) lut[v] = Math.max(0, Math.min(255, Math.round(((v - lo) / (hi - lo)) * 255)));
-  const out = new ImageData(1024, 1024);
-  for (let i = 0; i < d.length; i += 4) {
-    const g = lut[d[i]];
-    out.data[i] = g; out.data[i + 1] = lut[d[i + 1]]; out.data[i + 2] = lut[d[i + 2]]; out.data[i + 3] = 255;
-  }
-  return out;
+  return S.crop.enhanced ||= new ImageData(maskedContrast(src.data, S.crop.validMask),1024,1024);
+}
+// Display preference is shared across locations; per-mark draw-time provenance
+// remains on each mark. Read on every crop so retained frames use the latest choice.
+const CONTRAST_PREFERENCE_KEY = 'qanat-ui:autocontrast:v1';
+function restoreContrastPreference() {
+  try {
+    const saved = localStorage.getItem(CONTRAST_PREFERENCE_KEY);
+    if (saved !== null) $('crop-autocontrast').checked = saved === 'on';
+  } catch { /* Keep the current in-memory toggle if browser storage is unavailable. */ }
+}
+function rememberContrastPreference() {
+  try { localStorage.setItem(CONTRAST_PREFERENCE_KEY, $('crop-autocontrast').checked ? 'on' : 'off'); }
+  catch { /* The current crop and subsequent crops in this frame still work. */ }
+  redrawCrop();
 }
 // ---- crop rendering -------------------------------------------------------
 // The imagery lives on #crop-canvas (1024², CSS-`scale()`d, `image-rendering:
@@ -2793,7 +2827,7 @@ function finishInProgressLine() {
   // provenance: the line is stamped with the toggle state at COMPLETION time
   // (dblclick/Enter/mode-switch/commit flush), one `ac` flag per line.
   if (S.crop.inProgress.length >= 2) {
-    S.crop.marks.lines.push({ pts: S.crop.inProgress.slice(), ac: $('crop-autocontrast').checked });
+    S.crop.marks.lines.push({ pts: S.crop.inProgress.slice(), ac: $('crop-autocontrast').checked, dp: CONTRAST_VERSION });
     S.crop.dirty = true;
   }
   S.crop.inProgress = [];
@@ -2990,7 +3024,7 @@ function setupCropInteractions() {
         if(workflowLocked() || !cropUserLabelsVisible()) { redrawCrop(); return; }
         const before = cropEditSnapshot();
         // new point: stamped with the toggle state at the moment it is added.
-        if (drawMode() === 'point') S.crop.marks.points.push({ px: pressPx, ac: $('crop-autocontrast').checked });
+        if (drawMode() === 'point') S.crop.marks.points.push({ px: pressPx, ac: $('crop-autocontrast').checked, dp: CONTRAST_VERSION });
         else S.crop.inProgress.push(pressPx);
         S.crop.dirty = true;
         recordCropEdit(drawMode() === 'point' ? 'add point' : 'add polyline vertex', before);
@@ -3059,7 +3093,7 @@ function setupCropInteractions() {
   });
   // the overlay's backing store is tied to the stage size / devicePixelRatio
   window.addEventListener('resize', () => { if (S.crop) drawCropOverlay(); });
-  $('crop-autocontrast').addEventListener('change', redrawCrop);
+  $('crop-autocontrast').addEventListener('change', rememberContrastPreference);
   for (const id of ['crop-gt','crop-edit-originals','crop-show-deleted-originals']) $(id).addEventListener('change', () => {
     cancelCropDrag();pressActive=false;
     if(S.crop) { S.crop.selected.originals.clear();S.crop.selectBox=null;loadOriginalCrop(); }
@@ -3223,7 +3257,7 @@ async function commitCrop(finish = false) {
   if (pendingOriginals.size && (!S.su || !S.workflow.enabled || !S.originals.available)) throw new Error('Original label editing is unavailable.');
   // flush any in-progress polyline (completing it now → stamp the current toggle)
   if (S.crop.inProgress.length >= 2) {
-    S.crop.marks.lines.push({ pts: S.crop.inProgress.slice(), ac: $('crop-autocontrast').checked });
+    S.crop.marks.lines.push({ pts: S.crop.inProgress.slice(), ac: $('crop-autocontrast').checked, dp: CONTRAST_VERSION });
   }
   S.crop.inProgress = [];
   // Snapshot the pending superuser others-deletes, others-moves AND own-moves
@@ -3266,7 +3300,7 @@ async function commitCrop(finish = false) {
   const srcOf = new Map();
   for (const p of S.crop.marks.points) {
     const [x, y] = pixelToWorld(p.px[0], p.px[1], cell.world_bbox);
-    const m = { cropId: cell.id, pPos: cell.p_pos, world: [x, y], created: p.created || null, dbId: p.dbId ?? null, kind: KIND_SHAFT, labeler: S.me, ...prov, autocontrast: p.ac ?? null };
+    const m = { cropId: cell.id, pPos: cell.p_pos, world: [x, y], created: p.created || null, dbId: p.dbId ?? null, kind: KIND_SHAFT, labeler: S.me, ...prov, displayPreprocessing: p.dp ?? null, autocontrast: p.ac ?? null };
     p.prediction = predictionForMark(p, cell, S.predictions.active, priorMarks.get(p.dbId));
     Object.assign(m, p.prediction);
     srcOf.set(m, p);
@@ -3274,7 +3308,7 @@ async function commitCrop(finish = false) {
   }
   for (const ln of S.crop.marks.lines) {
     if (ln.pts.length < 2) continue;
-    const m = { cropId: cell.id, pPos: cell.p_pos, world: ln.pts.map(([c, r]) => pixelToWorld(c, r, cell.world_bbox)), created: ln.created || null, dbId: ln.dbId ?? null, kind: KIND_CHANNEL, labeler: S.me, ...prov, autocontrast: ln.ac ?? null };
+    const m = { cropId: cell.id, pPos: cell.p_pos, world: ln.pts.map(([c, r]) => pixelToWorld(c, r, cell.world_bbox)), created: ln.created || null, dbId: ln.dbId ?? null, kind: KIND_CHANNEL, labeler: S.me, ...prov, displayPreprocessing: ln.dp ?? null, autocontrast: ln.ac ?? null };
     ln.prediction = predictionForMark(ln, cell, S.predictions.active, priorMarks.get(ln.dbId));
     Object.assign(m, ln.prediction);
     srcOf.set(m, ln);
@@ -3319,7 +3353,7 @@ async function commitCrop(finish = false) {
       const inserts = [];
       for (const m of mine) {
         if (m.dbId != null && existingIds.has(m.dbId)) continue; // untouched — leave its row alone
-        inserts.push({ mark: m, src: srcOf.get(m) || null, row: { kind: m.kind, geom: await encryptGeom(m.world), ...rowProv, build_id:m.buildId, p_pos:m.pPos, autocontrast: m.autocontrast, created_at: m.created || undefined } });
+        inserts.push({ mark: m, src: srcOf.get(m) || null, row: { kind: m.kind, geom: await encryptGeom(m.world,m.displayPreprocessing), ...rowProv, build_id:m.buildId, p_pos:m.pPos, autocontrast: m.autocontrast, created_at: m.created || undefined } });
       }
       // writes go through the token-gated RPCs; actor = the gate name.
       const auth = { token: S.writeToken, actor: S.me };
@@ -3548,8 +3582,8 @@ function dlScope() {
 function dlBuild() {
   const scope = dlScope();
   const labeler = $('labeler').value.trim();
-  const shafts = buildShaftsFeatureCollection(selectMarks(S.shaftMarks, scope), { labeler });
-  const lines = buildLinesFeatureCollection(selectMarks(S.lineMarks, scope), { labeler });
+  const shafts = buildShaftsFeatureCollection(selectMarks(S.shaftMarks, scope), { labeler, crs:S.manifest.crs, locationId:LOCATION_ID, board:S.board });
+  const lines = buildLinesFeatureCollection(selectMarks(S.lineMarks, scope), { labeler, crs:S.manifest.crs, locationId:LOCATION_ID, board:S.board });
   const slug = scopeSlug(scope);
   const d = ymd(new Date());
   const proj = sanitize(S.project || 'project');
@@ -3557,8 +3591,8 @@ function dlBuild() {
   return {
     shafts, lines, scope,
     names: {
-      shafts: `qanat_shafts_${proj}_${tag}_${d}.geojson`,
-      lines: `qanat_channels_${proj}_${tag}_${d}.geojson`,
+      shafts: `qanat_shafts_${LOCATION_ID}_${proj}_${tag}_${d}.geojson`,
+      lines: `qanat_channels_${LOCATION_ID}_${proj}_${tag}_${d}.geojson`,
     },
   };
 }
@@ -3906,3 +3940,24 @@ function boot() {
   $('gate-name').value ? $('passcode').focus() : $('gate-name').focus();
 }
 boot();
+
+// Each frame owns one immutable board. In-flight requests remain with that board.
+window.labelLocationSession = {
+  hasUnsaved: () => cropIsDirty() || !!S.workflow.pending || S.workflow.busy || S.unsynced,
+  async canLeave() {
+    if (S.navBusy || S.workflow.busy || S.workflow.pending || S.predictions.busy) {
+      setStatus('Finish or retry the current operation before changing location.'); return false;
+    }
+    const modal=[...document.querySelectorAll('.modal')].find(el=>!el.hidden && !['crop-modal','help-modal'].includes(el.id));
+    if (modal) { setStatus('Close the open dialog before changing location.'); return false; }
+    if (S.crop && !$('crop-modal').hidden) { await requestCloseCrop(); if (!$('crop-modal').hidden) return false; }
+    helpClose(); return true;
+  },
+};
+const inherited = shell?.getSession();
+if (inherited) {
+  Object.assign(S,inherited);
+  $('me-name').textContent=S.meDisplay; $('me-project').textContent=S.project; $('labeler').value=S.meDisplay;
+  $('gate-loading').hidden=false;
+  initializeLocation().catch(e=>{ $('gate-msg').textContent=e.message; shell?.failed(LOCATION_ID,e.message); });
+}
