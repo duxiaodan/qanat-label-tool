@@ -21,6 +21,24 @@ export function rankInRange(rank, lo, hi) {
   return rank >= lo && rank <= hi;
 }
 
+/** Inclusive exact score bounds on a descending cell array. An empty interval
+ * has lo > hi; no nearest-score crop is added to an otherwise empty result. */
+export function ranksForScores(cells, lower, upper) {
+  if (!Number.isFinite(lower) || !Number.isFinite(upper) || lower < 0 || upper > 1 || lower > upper) {
+    throw new RangeError('Enter score bounds between 0 and 1, with minimum ≤ maximum.');
+  }
+  const first = predicate => {
+    let left = 0, right = cells.length;
+    while (left < right) {
+      const mid = Math.floor((left + right) / 2);
+      if (predicate(cells[mid].p_pos)) left = mid + 1;
+      else right = mid;
+    }
+    return left;
+  };
+  return {lo: first(p => p > upper), hi: first(p => p >= lower) - 1};
+}
+
 /**
  * The "labeled by…" half of the predicate.
  * @param {string} cid            cell id
@@ -52,6 +70,7 @@ export function filterIsActive(opts, maxRank) {
   const o = opts || {};
   if (o.unlabeledOnly) return true;
   if (o.checked && o.checked.size > 0) return true;
+  if (o.scoreRange && (o.scoreRange.lower > 0 || o.scoreRange.upper < 1)) return true;
   return o.lo > 0 || o.hi < maxRank;
 }
 
@@ -100,7 +119,11 @@ export function filterSummary(opts, ctx) {
   const total = ctx.total || 0;
   const maxRank = total ? total - 1 : 0;
   const parts = [];
-  if (o.lo > 0 || o.hi < maxRank) {
+  if (o.scoreRange && (o.scoreRange.lower > 0 || o.scoreRange.upper < 1 || o.lo > 0 || o.hi < maxRank)) {
+    const scores = [o.scoreRange.lower, o.scoreRange.upper]
+      .map(p => (Math.round(p * 1000) / 1000).toFixed(3));
+    parts.push(`p_pos ${scores.join('–')}`);
+  } else if (o.lo > 0 || o.hi < maxRank) {
     const hiPct = fmtPercent(rankPercent(o.hi, total));
     parts.push(o.lo > 0
       ? `top ${fmtPercent(rankPercent(o.lo, total))}–${hiPct}%`

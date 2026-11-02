@@ -11,16 +11,14 @@
   <div id="gate" class="gate">
     <div class="gate-box">
       <h1>Qanat label tool</h1>
-      <p>Add missing ground-truth shaft points &amp; channel polylines onto the
-         Jason CORONA swath crops.</p>
+      <p>Add ground-truth shaft points &amp; channel polylines to your project's map.</p>
       <label for="gate-name">Your name (required — labels are attributed to you)</label>
       <input type="text" id="gate-name" list="name-suggestions" autocomplete="off"
              placeholder="e.g. Jane Doe" />
       <datalist id="name-suggestions"></datalist>
       <label for="gate-project">Project (required — labels are kept separate per project)</label>
-      <!-- options are populated from the PROJECTS const in app.js; selection is
-           deliberately NOT remembered across logins so nobody labels into a
-           stale project by accident -->
+      <!-- The project is chosen in the parent page before opening its map.
+           Standalone viewers offer only projects that own this map. -->
       <select id="gate-project">
         <option value="" disabled selected>— select a project —</option>
       </select>
@@ -96,9 +94,22 @@
                        aria-label="lowest p_pos kept" />
               </div>
               <div class="rank-readout">
-                <span id="rank-lo-out">&mdash;</span>
-                <span id="rank-hi-out">&mdash;</span>
+                <label id="rank-lo-out" class="rank-bound">
+                  <span>Max p_pos</span>
+                  <input id="rank-lo-value" type="number" min="0" max="1" step="any"
+                         inputmode="decimal" aria-label="Maximum p_pos" aria-describedby="rank-error"
+                         title="Enter exact maximum p_pos (0–1). Enter to apply, Esc to cancel." />
+                  <span id="rank-lo-percent">&mdash;</span>
+                </label>
+                <label id="rank-hi-out" class="rank-bound">
+                  <span>Min p_pos</span>
+                  <input id="rank-hi-value" type="number" min="0" max="1" step="any"
+                         inputmode="decimal" aria-label="Minimum p_pos" aria-describedby="rank-error"
+                         title="Enter exact minimum p_pos (0–1). Enter to apply, Esc to cancel." />
+                  <span id="rank-hi-percent">&mdash;</span>
+                </label>
               </div>
+              <div id="rank-error" class="rank-error" role="alert" hidden></div>
             </div>
             <div class="filter-sec">
               <div class="filter-sec-title">labeled by</div>
