@@ -168,6 +168,19 @@ body.su-edit-on #crop-modal .modal-box { box-shadow: 0 0 0 2px #f6a623; }
   display: flex; justify-content: space-between; gap: 8px; margin-top: 4px;
   font-size: 10px; color: #99a3b3; font-variant-numeric: tabular-nums;
 }
+.rank-bound { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 3px; }
+.rank-bound:last-child { text-align: right; }
+.rank-bound input {
+  box-sizing: border-box; width: 100%; min-width: 0; padding: 3px 4px;
+  border: 1px solid #3a4352; border-radius: 3px; background: #10141c;
+  color: #dde4ed; font: inherit; cursor: text; appearance: textfield;
+  -moz-appearance: textfield;
+}
+.rank-bound input::-webkit-inner-spin-button,
+.rank-bound input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+.rank-bound input:focus { outline: 1px solid #679cff; border-color: #679cff; }
+.rank-bound input[aria-invalid=true] { border-color: #ff8d8d; }
+.rank-error { margin-top: 5px; color: #ffabab; font-size: 11px; line-height: 1.35; }
 
 /* "labeled by…" checkbox list (union; "(unlabeled)" is mutually exclusive) */
 .filter-labelers { display: flex; flex-direction: column; gap: 2px; max-height: 148px; overflow-y: auto; }

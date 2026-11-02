@@ -27,7 +27,7 @@ import {
 } from './suedit.js';
 import {
   cellPasses, filterIsActive, pruneSelection, labelerOrder,
-  rankPercent, fmtPercent, filterSummary, rectSubpath, spotlightPaths,
+  rankPercent, fmtPercent, filterSummary, rectSubpath, spotlightPaths, ranksForScores,
 } from './cellfilter.js';
 import {
   selectMarks, scopeSlug, scopeProblem, countOrphans, buildExportScope,
@@ -39,10 +39,12 @@ import { OverviewTiles, overviewMaxScale } from './overviewtiles.js';
 import { workflowPermissions, statusPasses, workflowSummary, workflowBadge } from './workflow.js';
 
 import {LOCATIONS, locationId, locationAsset, boardFor} from './locations.js';
+import {PROJECTS, projectAllowsMap} from './projects.js';
 import {maskedContrast, unpackValidMask, decodeInlineValidMask, CONTRAST_VERSION} from './contrast.js';
 const LOCATION_ID = locationId(location.search);
 const LOCATION = LOCATIONS[LOCATION_ID];
 const shell = window.parent !== window ? window.parent.labelLocations : null;
+const FRAME_PROJECT = new URLSearchParams(location.search).get('project');
 const asset = name => locationAsset(LOCATION_ID, name);
 let overviewTiles = null;
 
@@ -103,6 +105,7 @@ const S = {
   filter: {
     lo: 0,                 // first (highest-p_pos) rank kept, inclusive
     hi: 0,                 // last (lowest-p_pos) rank kept, inclusive; = cells-1 on unlock
+    scoreRange: null,      // exact typed {lower, upper}; slider drags return to rank selection
     checked: new Set(),    // normalized labeler names; EMPTY = condition inactive
     unlabeled: false,      // "(unlabeled)" — mutually exclusive with `checked`
     open: false,           // Filters section expanded? (collapsed by default)
@@ -779,7 +782,14 @@ async function unlock() {
   if (!nameRaw.trim()) { $('gate-msg').textContent = 'enter your name before labeling'; return; }
   const project = $('gate-project').value;
   if (!project || !PROJECTS.includes(project)) { $('gate-msg').textContent = 'select a project before labeling'; return; }
+  if (!projectAllowsMap(project, LOCATION_ID)) { $('gate-msg').textContent = 'This map is unavailable in the selected project.'; return; }
   if (!pw) { $('gate-msg').textContent = 'enter a passcode'; return; }
+  if (shell && !shell.beginLogin(LOCATION_ID, project)) return;
+  try { await unlockProject(pw, nameRaw, project); }
+  finally { shell?.endLogin(); }
+}
+
+async function unlockProject(pw, nameRaw, project) {
   let cj;
   try { cj = await fetchJson('crypto.json'); }
   catch (e) { $('gate-msg').textContent = 'cannot load crypto.json — is the site served correctly?'; return; }
@@ -837,6 +847,9 @@ async function unlock() {
 }
 
 async function initializeLocation() {
+    if (!projectAllowsMap(S.project, LOCATION_ID) || (shell && shell.projectFor(LOCATION_ID, FRAME_PROJECT) !== S.project)) {
+      throw new Error('Map is unavailable in the selected project');
+    }
     // manifest
     const manBytes = await decryptBlob(S.key, await fetchBytes(asset('manifest.enc')));
     S.manifest = JSON.parse(new TextDecoder().decode(manBytes));
@@ -889,7 +902,7 @@ async function initializeLocation() {
   }
   applyLayerToggles();
   shell?.authenticated(LOCATION_ID, Object.fromEntries(['key','marksKey','me','meDisplay','project','su','writeToken'].map(k=>[k,S[k]])));
-  shell?.ready(LOCATION_ID);
+  shell?.ready(LOCATION_ID, FRAME_PROJECT);
 
 }
 
@@ -1399,7 +1412,7 @@ function computeLabelerCells() {
 /** The live predicate arguments (one object, so list + map can never diverge). */
 function filterOpts() {
   return {
-    lo: S.filter.lo, hi: S.filter.hi,
+    lo: S.filter.lo, hi: S.filter.hi, scoreRange: S.filter.scoreRange,
     checked: S.filter.checked, unlabeledOnly: S.filter.unlabeled,
     labelerCells: S.labelerCells,
   };
@@ -1427,12 +1440,20 @@ function countMatches() {
 // usual z-index juggling gets wrong. Keyboard still works: the chosen handle is
 // focused on pointerdown, and each input's own `input` event is handled below.
 const RANK_THUMB_PX = 14; // keep in sync with the thumb width in style.css
+const scoreInputEdits = new Set();
+
+function scoreBounds() {
+  return S.filter.scoreRange || {
+    upper: S.cells[S.filter.lo]?.p_pos ?? 1,
+    lower: S.cells[S.filter.hi]?.p_pos ?? 0,
+  };
+}
 
 function initRankSlider() {
   const lo = $('rank-lo'), hi = $('rank-hi');
   if (!lo || !hi) return;
   const max = maxRank();
-  S.filter.lo = 0; S.filter.hi = max;
+  S.filter.lo = 0; S.filter.hi = max; S.filter.scoreRange = null;
   for (const el of [lo, hi]) { el.min = '0'; el.max = String(max); el.step = '1'; }
   lo.value = '0'; hi.value = String(max);
   syncRankUI();
@@ -1440,6 +1461,7 @@ function initRankSlider() {
 /** Clamp so lo <= hi (a handle pushed past the other stops, never swaps). */
 function setRankRange(lo, hi) {
   const max = maxRank();
+  S.filter.scoreRange = null;
   S.filter.lo = Math.max(0, Math.min(max, Math.round(lo)));
   S.filter.hi = Math.max(0, Math.min(max, Math.round(hi)));
   if (S.filter.lo > S.filter.hi) S.filter.lo = S.filter.hi;
@@ -1451,22 +1473,56 @@ function setRankRange(lo, hi) {
 /** Repaint the selected-range bar + the two value/percentile readouts. */
 function syncRankUI() {
   const max = maxRank() || 1;
+  const clampRank = rank => Math.max(0, Math.min(maxRank(), rank));
+  $('rank-lo').value = String(clampRank(S.filter.lo));
+  $('rank-hi').value = String(clampRank(S.filter.hi));
+  const empty = S.filter.lo > S.filter.hi;
   const fill = $('rank-fill');
   if (fill) {
-    fill.style.left = (S.filter.lo / max) * 100 + '%';
-    fill.style.right = (1 - S.filter.hi / max) * 100 + '%';
+    fill.hidden = empty;
+    fill.style.left = (clampRank(S.filter.lo) / max) * 100 + '%';
+    fill.style.right = (1 - clampRank(S.filter.hi) / max) * 100 + '%';
   }
   const total = S.cells.length;
-  const put = (id, rank) => {
-    const el = $(id);
-    if (!el) return;
-    const c = S.cells[rank];
-    el.textContent = c
-      ? `${fmtP(c.p_pos)}  ·  top ${fmtPercent(rankPercent(rank, total))}%`
-      : '—';
+  const bounds = scoreBounds();
+  for (const [prefix, rank, value] of [['rank-lo', S.filter.lo, bounds.upper], ['rank-hi', S.filter.hi, bounds.lower]]) {
+    const input = $(prefix + '-value');
+    input.value = fmtP(value);
+    input.disabled = !total;
+    input.removeAttribute('aria-invalid');
+    $(prefix + '-percent').textContent = !total ? '—' : empty ? 'no matches' : `top ${fmtPercent(rankPercent(rank, total))}%`;
+  }
+  scoreInputEdits.clear();
+  $('rank-error').hidden = true;
+}
+
+function applyScoreInputs() {
+  if (!scoreInputEdits.size) return;
+  const upper = $('rank-lo-value'), lower = $('rank-hi-value');
+  const bounds = scoreBounds();
+  // Untouched readouts are rounded for display; preserve their exact bounds.
+  const values = {
+    upper: scoreInputEdits.has(upper.id) ? upper.valueAsNumber : bounds.upper,
+    lower: scoreInputEdits.has(lower.id) ? lower.valueAsNumber : bounds.lower,
   };
-  put('rank-lo-out', S.filter.lo);
-  put('rank-hi-out', S.filter.hi);
+  let message = '';
+  for (const [el, value] of [[upper, values.upper], [lower, values.lower]]) {
+    const invalid = !Number.isFinite(value) || value < 0 || value > 1;
+    if (invalid) { el.setAttribute('aria-invalid', 'true'); message = 'Enter a p_pos between 0 and 1.'; }
+    else el.removeAttribute('aria-invalid');
+  }
+  if (!message && values.lower > values.upper) {
+    upper.setAttribute('aria-invalid', 'true'); lower.setAttribute('aria-invalid', 'true');
+    message = 'Minimum p_pos must be less than or equal to maximum p_pos.';
+  }
+  if (message) {
+    $('rank-error').textContent = message; $('rank-error').hidden = false;
+    return;
+  }
+  Object.assign(S.filter, ranksForScores(S.cells, values.lower, values.upper));
+  S.filter.scoreRange = values;
+  syncRankUI();
+  scheduleFilterRender();
 }
 /** Track x (client px) -> rank, matching the native thumb's half-width insets. */
 function rankFromClientX(clientX) {
@@ -1481,15 +1537,17 @@ function setupRankSlider() {
   let dragging = null; // 'lo' | 'hi' while a pointer drag is in flight
   const applyAt = (clientX) => {
     const r = rankFromClientX(clientX);
-    if (dragging === 'lo') setRankRange(Math.min(r, S.filter.hi), S.filter.hi);
-    else setRankRange(S.filter.lo, Math.max(r, S.filter.lo));
+    const lo = Number($('rank-lo').value), hi = Number($('rank-hi').value);
+    if (dragging === 'lo') setRankRange(Math.min(r, hi), hi);
+    else setRankRange(lo, Math.max(r, lo));
     scheduleFilterRender();
   };
   wrap.addEventListener('pointerdown', (e) => {
     const r = rankFromClientX(e.clientX);
     // nearest handle wins; ties go to the one that can still move that way
-    const dLo = Math.abs(r - S.filter.lo), dHi = Math.abs(r - S.filter.hi);
-    dragging = (dLo < dHi || (dLo === dHi && r < S.filter.lo)) ? 'lo' : 'hi';
+    const lo = Number($('rank-lo').value), hi = Number($('rank-hi').value);
+    const dLo = Math.abs(r - lo), dHi = Math.abs(r - hi);
+    dragging = (dLo < dHi || (dLo === dHi && r < lo)) ? 'lo' : 'hi';
     const el = $(dragging === 'lo' ? 'rank-lo' : 'rank-hi');
     if (el) el.focus();
     wrap.setPointerCapture(e.pointerId);
@@ -1505,6 +1563,20 @@ function setupRankSlider() {
     $(id).addEventListener('input', () => {
       setRankRange(Number($('rank-lo').value), Number($('rank-hi').value));
       scheduleFilterRender();
+    });
+  }
+  let cancelling = false;
+  for (const id of ['rank-lo-value', 'rank-hi-value']) {
+    const input = $(id);
+    input.addEventListener('input', () => scoreInputEdits.add(id));
+    input.addEventListener('focus', () => input.select());
+    input.addEventListener('change', () => { if (!cancelling) applyScoreInputs(); });
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); applyScoreInputs(); }
+      if (e.key === 'Escape') {
+        e.preventDefault(); e.stopPropagation();
+        cancelling = true; syncRankUI(); input.blur(); cancelling = false;
+      }
     });
   }
 }
@@ -1670,7 +1742,7 @@ function rebuildFilterLayer() {
   }
   const { veil, clip } = spotlightPaths(S.swathW, S.swathH, holes);
   g.appendChild(svgEl('path', { d: veil, 'fill-rule': 'evenodd', class: 'filter-dim' }));
-  applyFilterClip(clip);
+  applyFilterClip(clip, true);
 }
 /** Point #heat-img and #g-acc at the spotlight clipPath, or release them.
  *
@@ -1686,13 +1758,17 @@ function rebuildFilterLayer() {
  *  a complete escape hatch (see applyLayerToggles): hiding the veil without
  *  releasing the clips would leave a half-on state with the heatmap still
  *  punched out and nothing on screen explaining why. */
-let _filterClipD = ''; // last built clip geometry; '' means "no spotlight"
-function applyFilterClip(clipD) {
-  if (clipD !== undefined) _filterClipD = clipD || '';
+let _filterClipD = '';
+let _filterClipActive = false; // an active empty clip hides all colour for zero matches
+function applyFilterClip(clipD, active) {
+  if (clipD !== undefined) {
+    _filterClipD = clipD || '';
+    _filterClipActive = active ?? !!clipD;
+  }
   const path = document.getElementById('filter-clip-path');
   if (path) path.setAttribute('d', _filterClipD);
   const tg = $('tg-filter');
-  const ref = (_filterClipD && (!tg || tg.checked)) ? 'url(#filter-clip)' : '';
+  const ref = (_filterClipActive && (!tg || tg.checked)) ? 'url(#filter-clip)' : '';
   const heat = document.getElementById('heat-img');
   if (heat) heat.style.clipPath = ref;
   const gAcc = document.getElementById('g-acc');
@@ -1795,13 +1871,6 @@ function worldToSwathPx(x, y) {
 // TIFs whose existing GT was reviewed as ACCURATE (gt_review 2026-07-02, 25/25
 // unanimous verdicts) — drives the toggleable light-green swath mask. Update
 // this list as more GT-review verdicts come in.
-// Labeling projects. Marks are fully separated per project: the gate requires
-// picking one (never remembered across logins — a stale preselection is how
-// labels end up in the wrong project), every DB row is stamped with it, and
-// pull/save/reconcile are all scoped to it. Select-only: users cannot add
-// projects; to add one, extend this list (alphabetical) and redeploy.
-const PROJECTS = ['EPAS_2026_Q2', 'Test'];
-
 const ACCURATE_TIFS = new Set([
   '1039-2088DA038_b_R_utm38n.tif',
   '1039-2088DA037_b_L_utm38n.tif',
@@ -3902,13 +3971,17 @@ function boot() {
   // prefill the gate with the most-recently-remembered name (per-device convenience).
   const names = loadNames();
   if (names.length) $('gate-name').value = names[names.length - 1];
-  // project dropdown: alphabetical, select-only, NEVER preselected (a fresh,
-  // deliberate choice every login is the anti-mixing guarantee).
+  // The parent binds the project before opening a map. Standalone gates
+  // require an explicit choice among this map's projects.
   const projSel = $('gate-project');
-  for (const p of PROJECTS.slice().sort()) {
+  for (const p of PROJECTS.filter(p => projectAllowsMap(p, LOCATION_ID))) {
     const o = document.createElement('option');
     o.value = p; o.textContent = p;
     projSel.appendChild(o);
+  }
+  if (shell) {
+    projSel.value = shell.projectFor(LOCATION_ID, FRAME_PROJECT);
+    projSel.disabled = true;
   }
   $('unlock').addEventListener('click', unlock);
   $('passcode').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
@@ -3941,23 +4014,23 @@ function boot() {
 }
 boot();
 
-// Each frame owns one immutable board. In-flight requests remain with that board.
+// Each frame owns one immutable project + board. Requests and drafts stay in that scope.
 window.labelLocationSession = {
   hasUnsaved: () => cropIsDirty() || !!S.workflow.pending || S.workflow.busy || S.unsynced,
   async canLeave() {
     if (S.navBusy || S.workflow.busy || S.workflow.pending || S.predictions.busy) {
-      setStatus('Finish or retry the current operation before changing location.'); return false;
+      setStatus('Finish or retry the current operation before switching projects or maps.'); return false;
     }
     const modal=[...document.querySelectorAll('.modal')].find(el=>!el.hidden && !['crop-modal','help-modal'].includes(el.id));
-    if (modal) { setStatus('Close the open dialog before changing location.'); return false; }
+    if (modal) { setStatus('Close the open dialog before switching projects or maps.'); return false; }
     if (S.crop && !$('crop-modal').hidden) { await requestCloseCrop(); if (!$('crop-modal').hidden) return false; }
     helpClose(); return true;
   },
 };
-const inherited = shell?.getSession();
+const inherited = shell?.getSession(LOCATION_ID, FRAME_PROJECT);
 if (inherited) {
   Object.assign(S,inherited);
   $('me-name').textContent=S.meDisplay; $('me-project').textContent=S.project; $('labeler').value=S.meDisplay;
   $('gate-loading').hidden=false;
-  initializeLocation().catch(e=>{ $('gate-msg').textContent=e.message; shell?.failed(LOCATION_ID,e.message); });
+  initializeLocation().catch(e=>{ $('gate-msg').textContent=e.message; shell?.failed(LOCATION_ID,FRAME_PROJECT,e.message); });
 }

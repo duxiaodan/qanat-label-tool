@@ -1,3 +1,31 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Qanat label tool · TEST</title><style>
-:root{color-scheme:dark}*{box-sizing:border-box}html,body{margin:0;height:100%;font:14px system-ui;background:#101217;color:#eee}header{height:48px;display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid #394454}select{font:inherit;min-width:140px;padding:5px}#location-status{color:#bfccdc;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}header>label,header>strong{flex-shrink:0}#location-host{position:relative;height:calc(100vh - 48px)}.location-panel{border:0;position:absolute;inset:0;width:100%;height:100%;background:#101217}.location-panel.loading{visibility:hidden;pointer-events:none}strong{color:#ffcd75}
-</style></head><body><header><label for="location-select">Location</label><select id="location-select" aria-label="Location"></select><strong>TEST</strong><span id="location-status" role="status"></span></header><main id="location-host"></main><script type="module" src="location-shell.js"></script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Qanat label tool</title>
+  <style>
+    :root{color-scheme:dark}*{box-sizing:border-box}[hidden]{display:none!important}
+    html,body{margin:0;height:100%;font:14px system-ui;background:#101217;color:#eee}
+    header{min-height:48px;display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:6px 16px;border-bottom:1px solid #394454}
+    select{font:inherit;min-width:120px;max-width:100%;padding:5px}
+    #location-status{color:#bfccdc;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    header>label{flex-shrink:0}body{display:flex;flex-direction:column}
+    #location-host{position:relative;flex:1;min-height:0}
+    #project-prompt{margin:64px 24px;text-align:center;color:#bfccdc}
+    .location-panel{border:0;position:absolute;inset:0;width:100%;height:100%;background:#101217}
+    .location-panel.loading{visibility:hidden;pointer-events:none}
+  </style>
+</head>
+<body>
+  <header>
+    <label for="project-select">Project</label>
+    <select id="project-select" aria-label="Project"><option value="" disabled selected>— select a project —</option></select>
+    <label for="location-select">Map</label>
+    <select id="location-select" aria-label="Map" disabled><option value="">— select a project first —</option></select>
+    <span id="location-status" role="status">Choose a project to open its map.</span>
+  </header>
+  <main id="location-host"><p id="project-prompt">Choose a project above, then sign in to label its map.</p></main>
+  <script type="module" src="location-shell.js"></script>
+</body>
+</html>
