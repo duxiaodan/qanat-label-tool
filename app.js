@@ -37,6 +37,8 @@ import { indexOriginalLabels, effectiveOriginals } from './originals.js';
 import { SUPABASE } from './site_config.js';
 import { OverviewTiles, overviewMaxScale } from './overviewtiles.js';
 import { workflowPermissions, statusPasses, workflowSummary, workflowBadge } from './workflow.js';
+import { createLabelStorage, RecoveryStorageError } from './storage.js';
+const labelStorage = createLabelStorage();
 
 import {LOCATIONS, locationId, locationAsset, boardFor} from './locations.js';
 import {PROJECTS, projectAllowsMap} from './projects.js';
@@ -94,7 +96,7 @@ const S = {
   // per-session marks (each mark carries `labeler` owner + optional `dbId`)
   shaftMarks: [],       // {cropId, pPos, world:[x,y], created, labeler, dbId?}
   lineMarks: [],        // {cropId, pPos, world:[[x,y],...], created, labeler, dbId?}
-  workflow: { enabled:false, available:false, busy:false, states:new Map(), pending:null, error:'',
+  workflow: { enabled:false, available:false, busy:false, states:new Map(), pending:null, error:'', draftError:'',
     finished:{mode:'all',people:new Set()}, approved:{mode:'all',people:new Set()} },
   originals: { available: false, byCell: new Map(), points: [], edits: new Map() },
   done: new Set(),      // cell ids with >=1 saved mark (from anyone)
@@ -215,19 +217,23 @@ function ymd(d) {
 // --------------------------------------------------------------------------- //
 // persistence
 // --------------------------------------------------------------------------- //
-function persist() {
-  try {
-    localStorage.setItem(S.storageKey, JSON.stringify({
-      shaftMarks: S.shaftMarks, lineMarks: S.lineMarks, done: [...S.done],
-      unsynced: S.unsynced,
-    }));
-  } catch (e) { /* quota / disabled — non-fatal */ }
+async function persist() {
+  // Workflow drafts and pending commands protect edits. Cache only confirmed
+  // server pools; cache availability must never change a cloud save's outcome.
+  if (backendOn() && S.workflow.enabled && S.unsynced) return false;
+  const pool = {
+    shaftMarks: S.shaftMarks, lineMarks: S.lineMarks, done: [...S.done], unsynced: S.unsynced,
+  };
+  if(await labelStorage.savePool(S.storageKey,pool)) return true;
+  if(!backendOn()) {
+    try { labelStorage.writeRecovery(S.storageKey,pool); return true; } catch {}
+  }
+  return false;
 }
-function restore() {
+async function restore() {
   try {
-    const raw = localStorage.getItem(S.storageKey);
-    if (!raw) return;
-    const o = JSON.parse(raw);
+    const o = await labelStorage.loadPool(S.storageKey);
+    if (!o) return;
     S.shaftMarks = Array.isArray(o.shaftMarks) ? o.shaftMarks : [];
     S.lineMarks = Array.isArray(o.lineMarks) ? o.lineMarks : [];
     // localStorage is per-device → any cached mark without an owner is mine.
@@ -295,28 +301,34 @@ function workflowAuth() { return {token:S.writeToken,actor:S.me}; }
 function currentWorkflow() { return S.workflow.states.get(S.crop?.cell.id) || {}; }
 function workflowRole() { return S.su?'superuser':'normal'; }
 function pendingWorkflowKey() { return `qanat-workflow-pending:${S.board}:${S.project}:${S.me}`; }
-function storedWorkflowJob() { try { return JSON.parse(localStorage.getItem(pendingWorkflowKey()) || 'null'); } catch { return null; } }
+function storedWorkflowJob() { return labelStorage.readRecovery(pendingWorkflowKey()); }
 function workflowDraftKey(cid) { return `qanat-workflow-draft:${S.board}:${S.project}:${S.me}:${cid}`; }
-function storedWorkflowDraft(cid) { try { return JSON.parse(localStorage.getItem(workflowDraftKey(cid)) || 'null'); } catch { return null; } }
+function storedWorkflowDraft(cid) { return labelStorage.readRecovery(workflowDraftKey(cid)); }
 function archivedWorkflowDrafts(cid) {
-  try { return JSON.parse(localStorage.getItem(workflowDraftKey(cid)+':archive') || '[]'); } catch { return []; }
+  return labelStorage.readRecovery(workflowDraftKey(cid)+':archive', []);
 }
 function archiveWorkflowDraft(cid,draft) {
   const archives=archivedWorkflowDrafts(cid), raw=JSON.stringify(draft);
   if(!archives.some(d=>JSON.stringify(d)===raw)) {
-    archives.push(draft); localStorage.setItem(workflowDraftKey(cid)+':archive',JSON.stringify(archives));
+    archives.push(draft); labelStorage.writeRecovery(workflowDraftKey(cid)+':archive',archives);
   }
 }
+function currentWorkflowDraft() {
+  const c=S.crop;
+  return {board:S.board,project:S.project,labeler:S.me,location_id:LOCATION_ID,
+    cell_id:c.cell.id,world_bbox:c.cell.world_bbox,revision:c.revision,marks:c.marks,
+    inProgress:c.inProgress,pendingOriginals:[...c.pendingOriginals],
+    pendingOthersDeletes:[...c.pendingOthersDeletes],pendingOthersMoves:[...c.pendingOthersMoves],pendingOwnMoves:[...c.pendingOwnMoves]};
+}
 function stashWorkflowDraft() {
-  if(!S.workflow.enabled || !S.crop || !cropIsDirty()) return true;
+  if(!S.workflow.enabled || !S.crop || !cropIsDirty()) { S.workflow.draftError=''; return true; }
   const c=S.crop;
   try {
     const prior=storedWorkflowDraft(c.cell.id);
     if(prior && prior.revision!==c.revision) archiveWorkflowDraft(c.cell.id,prior);
-    localStorage.setItem(workflowDraftKey(c.cell.id),JSON.stringify({cell_id:c.cell.id,world_bbox:c.cell.world_bbox,
-    revision:c.revision,marks:c.marks,inProgress:c.inProgress,pendingOriginals:[...c.pendingOriginals],
-    pendingOthersDeletes:[...c.pendingOthersDeletes],pendingOthersMoves:[...c.pendingOthersMoves],pendingOwnMoves:[...c.pendingOwnMoves]})); return true; }
-  catch { S.workflow.error='Could not store the local draft. Keep this page open until saved.'; return false; }
+    labelStorage.writeRecovery(workflowDraftKey(c.cell.id),currentWorkflowDraft());
+    S.workflow.draftError=''; return true; }
+  catch { S.workflow.draftError='Could not back up the latest draft. Latest edits are only in this page. Keep it open and download the current draft.'; return false; }
 }
 function restoreWorkflowDraft() {
   if(!S.workflow.enabled || !S.crop || !S.workflow.available) return;
@@ -331,7 +343,7 @@ function restoreWorkflowDraft() {
   } else {
     try {
       archiveWorkflowDraft(S.crop.cell.id,draft);
-      localStorage.removeItem(workflowDraftKey(S.crop.cell.id));
+      labelStorage.removeRecovery(workflowDraftKey(S.crop.cell.id));
       S.workflow.error=!S.su && draft.pendingOriginals?.length
         ? 'This draft contains superuser original-label edits. It is kept locally and can be downloaded.'
         : 'This crop changed while you had unsaved edits. The old draft is kept locally and can be downloaded.';
@@ -343,9 +355,10 @@ function restoreWorkflowDraft() {
 }
 function downloadWorkflowDraft() {
   if(!S.crop)return;
-  const current=storedWorkflowDraft(S.crop.cell.id), archived=archivedWorkflowDrafts(S.crop.cell.id);
-  if(!current && !archived.length)return;
+  const current=currentWorkflowDraft(), archived=archivedWorkflowDrafts(S.crop.cell.id);
   const draft=archived.length?{current,archived}:current;
+  const pending=storedWorkflowJob();
+  if(pending?.command.cell_id===S.crop.cell.id) draft.pending_save=pending;
   const a=document.createElement('a');const url=URL.createObjectURL(new Blob([JSON.stringify(draft,null,2)],{type:'application/json'}));
   a.href=url;a.download=`qanat_local_draft_${S.crop.cell.id}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
@@ -380,7 +393,7 @@ async function submitWorkflowJob(job) {
   try { return await cropCommand(SUPABASE,job.command,job.id,workflowAuth()); }
   catch(error) {
     if(workflowRequestRejected(error)) {
-      localStorage.removeItem(pendingWorkflowKey()); S.workflow.pending=null;
+      labelStorage.removeRecovery(pendingWorkflowKey()); S.workflow.pending=null;
     }
     throw error;
   }
@@ -408,16 +421,17 @@ async function loadWorkflowCrop(cid,{confirmedJob=null}={}) {
     // A receipt describes the original command; the read above supplies the
     // current state. Retain recovery records until both have been confirmed.
     if(confirmed) {
-      localStorage.removeItem(pendingWorkflowKey()); localStorage.removeItem(workflowDraftKey(cid)); S.workflow.pending=null;
+      await labelStorage.confirmCrop(S.storageKey,S.me,cid);
+      labelStorage.removeRecovery(pendingWorkflowKey()); labelStorage.removeRecovery(workflowDraftKey(cid)); S.workflow.pending=null;
     }
     S.shaftMarks=[...S.shaftMarks.filter(m=>m.cropId!==cid),...decoded.shafts];
     S.lineMarks=[...S.lineMarks.filter(m=>m.cropId!==cid),...decoded.lines];
     S.workflow.states.set(cid,result.state); S.workflow.available=true; S.workflow.error='';
     if(S.crop?.cell.id===cid) S.crop.revision=result.state.revision;
-    recomputeDone(); persist(); refreshFilterUI(); refreshDoneMarks(); rebuildMineLayer(); applyLayerToggles();
+    recomputeDone(); await persist(); refreshFilterUI(); refreshDoneMarks(); rebuildMineLayer(); applyLayerToggles();
     return true;
   } catch(e) {
-    S.workflow.available=false; S.workflow.error='Could not confirm crop state. Local changes kept. '+(e.rpcMessage||e.message);
+    S.workflow.available=false; S.workflow.error='Could not confirm crop state. Keep this page open and retry. '+(e.rpcMessage||e.message);
     return false;
   }
 }
@@ -450,7 +464,8 @@ function updateWorkflowUI() {
   if(!S.workflow.enabled || !S.crop) return;
   const state=currentWorkflow(), perm=workflowPermissions(state,S.me,S.su);
   $('crop-state').textContent=workflowSummary(state);
-  $('crop-workflow-msg').textContent=S.workflow.error || (state.finished_by ? 'Read-only. Reopen this crop before changing its marks.' : '');
+  $('crop-workflow-msg').textContent=[S.workflow.error,S.workflow.draftError,
+    state.finished_by ? 'Read-only. Reopen this crop before changing its marks.' : ''].filter(Boolean).join(' ');
   const busy=S.workflow.busy, offline=!S.workflow.available;
   for(const [action,allowed] of Object.entries({finish:perm.finish,unfinish:perm.reopen,approve:perm.approve,unapprove:perm.unapprove})) {
     const button=$('crop-'+action); button.hidden=!allowed;
@@ -460,21 +475,23 @@ function updateWorkflowUI() {
   $('crop-save').disabled=busy||((offline||!!state.finished_by)&&!S.workflow.pending);
   $('crop-save').textContent=S.workflow.pending?'Retry save':'Save work';
   $('crop-state-history').disabled=busy;
-  $('crop-draft-download').hidden=!storedWorkflowDraft(S.crop.cell.id)&&!archivedWorkflowDrafts(S.crop.cell.id).length;
+  $('crop-draft-download').hidden=!cropIsDirty()&&!S.workflow.pending&&!S.workflow.draftError&&
+    !storedWorkflowDraft(S.crop.cell.id)&&!archivedWorkflowDrafts(S.crop.cell.id).length;
 }
 async function sendWorkflowSave(job,retry=false) {
   if(retry) {
     if(S.crop?.cell.id!==job.command.cell_id) throw new Error('Reload and open the crop with the pending save to recover it.');
     await submitWorkflowJob(job);
     if(!await reloadWorkflowCrop(job)) throw new Error(S.workflow.error || 'Could not confirm crop state');
-    S.unsynced=false; persist(); setSyncStatus('saved','ok'); return;
+    S.unsynced=false; await persist(); setSyncStatus('saved','ok'); return;
   }
   const result=await submitWorkflowJob(job);
   await job.apply(result);
-  localStorage.removeItem(workflowDraftKey(job.command.cell_id));
-  S.workflow.pending=null; localStorage.removeItem(pendingWorkflowKey());
+  await labelStorage.confirmCrop(S.storageKey,S.me,job.command.cell_id);
+  labelStorage.removeRecovery(workflowDraftKey(job.command.cell_id));
+  S.workflow.pending=null; labelStorage.removeRecovery(pendingWorkflowKey());
   if(S.crop?.cell.id===job.command.cell_id) S.crop.dirty=false;
-  S.unsynced=false; S.workflow.error=''; persist();
+  S.unsynced=false; S.workflow.error=''; S.workflow.draftError=''; await persist();
   setSyncStatus(job.command.action==='finish'?'saved and finished':'saved','ok');
 }
 async function askFinishConfirmation() {
@@ -517,7 +534,8 @@ async function saveWork(finish=false) {
     return await commitCrop(finish);
   } catch(e) {
     if(workflowRequestRejected(e)) { await pullWorkflow(); refreshFilterUI(); refreshDoneMarks(); }
-    S.workflow.error='Save not confirmed; local changes kept. '+(e.rpcMessage||e.message);
+    S.workflow.error='Save not confirmed. Keep this page open and retry saving. '+(e.rpcMessage||e.message);
+    setSyncStatus('save not confirmed — retry required','unsynced');
     return false;
   } finally {
     S.workflow.busy=false; updateWorkflowUI();
@@ -629,17 +647,17 @@ async function decodeMarkRows(rows) {
 
 async function pullAllMarks() {
   if (S.workflow.enabled) { await pullWorkflow(); await pullOriginalLabels(); }
-  if (!backendOn()) { restore(); recomputeDone(); setSyncStatus('local-only', ''); return; }
+  if (!backendOn()) { await restore(); recomputeDone(); setSyncStatus('local-only', ''); return; }
   setSyncStatus('syncing…', '');
   // load the local cache first so any prior-session unsynced marks of mine survive
   // the merge below (they have no dbId; synced ones picked up dbIds on save).
-  if (!S.shaftMarks.length && !S.lineMarks.length) restore();
+  if (!S.shaftMarks.length && !S.lineMarks.length) await restore();
   let rows;
   try {
     rows = await fetchAllMarks(SUPABASE, S.board, S.project);
   } catch (e) {
     // can't reach backend — fall back to whatever we have locally.
-    restore();
+    await restore();
     recomputeDone();
     S.unsynced = true;
     setSyncStatus('offline — using local cache', 'unsynced');
@@ -652,7 +670,7 @@ async function pullAllMarks() {
   S.shaftMarks = shafts;
   S.lineMarks = lines;
   recomputeDone();
-  persist();
+  await persist();
   if (S.unsynced) setSyncStatus('synced (local changes pending)', 'unsynced');
   else setSyncStatus('synced', 'ok');
 }
@@ -899,7 +917,7 @@ async function initializeLocation() {
   // reveal app
   $('gate').hidden = true;
   $('app').hidden = false;
-  sessionStorage.setItem('qanat-unlocked', '1');
+  try { sessionStorage.setItem('qanat-unlocked', '1'); } catch { /* Optional session hint. */ }
   setupPredictionSelector();
   // superuser-only UI (Edit-others toggle, Snapshots, History). Built HERE, not
   // in the static HTML, so for normal users none of it is in the DOM at all.
@@ -2208,7 +2226,7 @@ async function navigateCrop(dir) {
         if (!await saveWork()) return;                     // MUST finish before openCrop replaces S.crop
         setStatus('saved ' + savedId);
       }
-      if(choice==='discard' && S.workflow.enabled) localStorage.removeItem(workflowDraftKey(S.crop.cell.id));
+      if(choice==='discard' && S.workflow.enabled) labelStorage.removeRecovery(workflowDraftKey(S.crop.cell.id));
       // 'discard': openCrop below rebuilds the marks from the pool, so the
       // uncommitted edits simply never leave S.crop.
     }
@@ -2239,7 +2257,7 @@ async function requestCloseCrop() {
       if (!await saveWork()) return;                      // fully awaited BEFORE the close, like navigateCrop
       setStatus('saved ' + savedId);
     }
-    if(choice==='discard' && S.workflow.enabled) localStorage.removeItem(workflowDraftKey(S.crop.cell.id));
+    if(choice==='discard' && S.workflow.enabled) labelStorage.removeRecovery(workflowDraftKey(S.crop.cell.id));
     // 'discard': closeCrop nulls S.crop, so the uncommitted edits never reach
     // the pool — the next openCrop rebuilds marks from the saved pool.
     closeCrop(false);
@@ -2544,7 +2562,7 @@ function undoCropEdit() {
   // resurrect edits just undone; conflicting/archived recovery stays intact.
   if (S.workflow.enabled && !cropIsDirty()) {
     const draft = storedWorkflowDraft(S.crop.cell.id);
-    if (draft?.revision === S.crop.revision) localStorage.removeItem(workflowDraftKey(S.crop.cell.id));
+    if (draft?.revision === S.crop.revision) labelStorage.removeRecovery(workflowDraftKey(S.crop.cell.id));
   }
   redrawCrop();
 }
@@ -3477,7 +3495,8 @@ async function commitCrop(finish = false) {
             if(S.crop?.cell===cell) { S.crop.pendingOriginals=new Map();loadOriginalCrop(); }
             acceptWorkflowState(result.state);
           }};
-        localStorage.setItem(pendingWorkflowKey(),JSON.stringify({id:job.id,role:job.role,command:job.command}));
+        try { labelStorage.writeRecovery(pendingWorkflowKey(),{id:job.id,role:job.role,command:job.command}); }
+        catch(error) { if(error instanceof RecoveryStorageError) error.uploadNotAttempted=true; throw error; }
         S.workflow.pending=job;
         await sendWorkflowSave(job);
       } else {
@@ -3555,12 +3574,14 @@ async function commitCrop(finish = false) {
       // server's rejection reason (e.g. "invalid write token") — a rejected
       // write must read clearly, not silently look like a network blip.
       if(S.workflow.enabled) {
-        S.workflow.error=e.rpcMessage || e.message;
-        await pullWorkflow();
+        S.workflow.error=e.uploadNotAttempted
+          ? 'Not uploaded: a recovery record could not be stored. Keep this page open and download the current draft.'
+          : 'Save not confirmed. Keep this page open and retry saving. '+(e.rpcMessage || e.message);
+        if(!e.uploadNotAttempted) await pullWorkflow();
       }
       S.unsynced = true;
       const why = e && e.rpcMessage ? ` (${e.rpcMessage})` : '';
-      setSyncStatus(`unsynced — kept locally${why}`, 'unsynced');
+      setSyncStatus(e.uploadNotAttempted ? 'not uploaded — download draft' : `save not confirmed — retry required${why}`, 'unsynced');
     }
   } else {
     // localStorage-only mode: no server to confirm — apply deletes/moves locally.
@@ -3576,7 +3597,11 @@ async function commitCrop(finish = false) {
       S.crop.pendingOwnMoves = dropMovesForIds(S.crop.pendingOwnMoves, pendingOwn.keys());
     }
   }
-  persist();
+  const persisted=await persist();
+  if(!backendOn() && !persisted) {
+    saved=false; S.unsynced=true;
+    setSyncStatus('not saved — keep this page open','unsynced');
+  }
   // everything the user drew is now in the pool (and, when configured, the DB) —
   // guard on the cell because closeCrop(true) can null/replace S.crop meanwhile.
   if (S.crop && S.crop.cell === cell) S.crop.dirty = !saved;
