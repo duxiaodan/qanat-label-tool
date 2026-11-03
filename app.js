@@ -47,6 +47,7 @@ const shell = window.parent !== window ? window.parent.labelLocations : null;
 const FRAME_PROJECT = new URLSearchParams(location.search).get('project');
 const asset = name => locationAsset(LOCATION_ID, name);
 let overviewTiles = null;
+let finishReminderSuppressed = false; // standalone viewer; the shell shares its own page-session choice
 
 async function loadOverviewTile(file, signal) {
   let url;
@@ -476,6 +477,23 @@ async function sendWorkflowSave(job,retry=false) {
   S.unsynced=false; S.workflow.error=''; persist();
   setSyncStatus(job.command.action==='finish'?'saved and finished':'saved','ok');
 }
+async function askFinishConfirmation() {
+  if (shell ? !shell.shouldConfirmFinish() : finishReminderSuppressed) return true;
+  const dialog = $('crop-finish-confirm');
+  $('crop-finish-unsaved').hidden = !cropIsDirty();
+  const skip = $('crop-finish-skip');
+  skip.checked = false;
+  dialog.returnValue = '';
+  const confirmed = await new Promise(resolve => {
+    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'finish'), {once: true});
+    dialog.showModal();
+  });
+  if (confirmed && skip.checked) {
+    if (shell) shell.suppressFinishReminder();
+    else finishReminderSuppressed = true;
+  }
+  return confirmed;
+}
 async function saveWork(finish=false) {
   if(!S.crop || S.workflow.busy) return false;
   if(!S.workflow.enabled) {
@@ -490,22 +508,21 @@ async function saveWork(finish=false) {
     S.workflow.error=`A previous save for ${stored.command.cell_id} needs confirmation. Reopen that crop to retry it.`;
     updateWorkflowUI(); return false;
   }
-  if(finish && !S.workflow.pending && !confirm(
-    'Mark this crop as finished?\n\n' +
-    'Only confirm after checking the entire crop: all qanats are labeled, or no qanats are present.\n\n' +
-    (cropIsDirty() ? 'Your unsaved labels will be saved. ' : '') +
-    'The crop will be marked finished for everyone and become read-only. It must be reopened before further edits.\n\n' +
-    'Choose Cancel to keep editing. Save work saves labels without marking the crop finished.'
-  )) return false;
+  let finishCancelled = false;
+  // Lock navigation and project switching while the asynchronous confirmation is open.
   S.workflow.busy=true; S.workflow.error=''; updateWorkflowUI();
   try {
+    if(finish && !S.workflow.pending && !await askFinishConfirmation()) { finishCancelled=true; return false; }
     if(S.workflow.pending) { await sendWorkflowSave(S.workflow.pending,true); redrawCrop(); return true; }
     return await commitCrop(finish);
   } catch(e) {
     if(workflowRequestRejected(e)) { await pullWorkflow(); refreshFilterUI(); refreshDoneMarks(); }
     S.workflow.error='Save not confirmed; local changes kept. '+(e.rpcMessage||e.message);
     return false;
-  } finally { S.workflow.busy=false; updateWorkflowUI(); }
+  } finally {
+    S.workflow.busy=false; updateWorkflowUI();
+    if (finishCancelled) $('crop-finish').focus();
+  }
 }
 async function workflowAction(action) {
   if(!S.crop || S.workflow.busy || !S.workflow.available) return;
@@ -3198,6 +3215,17 @@ function setupCropInteractions() {
     redrawCrop();
   });
   $('crop-save').addEventListener('click', () => saveWork());
+  $('crop-finish-cancel').addEventListener('click', () => $('crop-finish-confirm').close('cancel'));
+  $('crop-finish-go').addEventListener('click', () => $('crop-finish-confirm').close('finish'));
+  $('crop-finish-confirm').addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.key !== 'Tab') return;
+    // Keep Tab inside the dialog even when the viewer lives in an iframe.
+    e.preventDefault();
+    const controls = [$('crop-finish-skip'), $('crop-finish-cancel'), $('crop-finish-go')];
+    const i = controls.indexOf(document.activeElement);
+    controls[(i + (e.shiftKey ? -1 : 1) + controls.length) % controls.length].focus();
+  });
   for(const action of ['finish','unfinish','approve','unapprove']) $('crop-'+action).addEventListener('click',()=>workflowAction(action));
   $('crop-state-history').addEventListener('click',showWorkflowHistory);
   $('crop-state-refresh').addEventListener('click',refreshMarks);
@@ -3246,6 +3274,7 @@ function setupCropInteractions() {
   }));
   document.addEventListener('keydown', (e) => {
     if (!S.crop || $('crop-modal').hidden) return;
+    if ($('crop-finish-confirm').open) return;
     // the download / snapshots / help dialogs stack above everything: while
     // one is open it owns the keyboard (Esc closes IT), so the crop's
     // Esc/arrow duties stand down.
