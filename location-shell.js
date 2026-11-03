@@ -9,6 +9,8 @@ const prompt = document.querySelector('#project-prompt');
 const sessions = new Map();
 // Identity is shared in memory. Each viewer owns an immutable project and map.
 let project = null, auth = null, current = null, busy = false;
+// Page lifetime only, shared across project viewers; a reload resets the choice.
+let finishReminderSuppressed = false;
 const scopeKey = (name, id) => `${name}:${id}`;
 
 for (const name of PROJECTS) projectSelector.add(new Option(name, name));
@@ -38,6 +40,8 @@ function showContext() {
 }
 
 window.labelLocations = {
+  shouldConfirmFinish() { return !finishReminderSuppressed; },
+  suppressFinishReminder() { finishReminderSuppressed = true; },
   projectFor(id, name) { requireScope(name, id); return name; },
   getSession(id, name) {
     requireScope(name, id);

@@ -251,6 +251,26 @@
     </div>
   </div>
 
+  <dialog id="crop-finish-confirm" class="finish-confirm"
+          aria-labelledby="crop-finish-title" aria-describedby="crop-finish-description">
+    <h2 id="crop-finish-title">Mark this crop as finished?</h2>
+    <div id="crop-finish-description">
+      <p>Only confirm after checking the entire crop: all qanats are labeled, or no qanats are present.</p>
+      <p id="crop-finish-unsaved" hidden>Your unsaved labels will be saved.</p>
+      <p>The crop will be marked finished for everyone and become read-only. It must be reopened before further edits.</p>
+      <p>Choose Cancel to keep editing. Save work saves labels without marking the crop finished.</p>
+    </div>
+    <label class="finish-confirm-option">
+      <input id="crop-finish-skip" type="checkbox" aria-describedby="crop-finish-session-note" />
+      <span>Don’t remind me again this session</span>
+    </label>
+    <p id="crop-finish-session-note" class="finish-confirm-note">Resets when you refresh or close this page.</p>
+    <div class="finish-confirm-actions">
+      <button id="crop-finish-cancel" type="button" autofocus>Cancel</button>
+      <button id="crop-finish-go" type="button">Mark finished</button>
+    </div>
+  </dialog>
+
   <!-- download dialog: three INDEPENDENT axes (crops / marks by / created) that
        AND into one mark-level predicate (exportscope.js). The defaults —
        all × everyone × any time — reproduce the pre-dialog one-shot download. -->
