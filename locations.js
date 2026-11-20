@@ -1,4 +1,4 @@
-import {ASSET_BASE_URL} from './asset_config.js';
+import {ASSET_BASE_URL, LOCAL_ASSETS, LOCAL_ASSET_PATTERN} from './asset_config.js';
 export const LOCATIONS = Object.freeze({
   erbil: {name:'Erbil',crs:'EPSG:32638',originals:true},
   aleppo: {name:'Aleppo',crs:'EPSG:32637',originals:false},
@@ -11,6 +11,8 @@ export function locationId(search) {
 }
 export function locationAsset(id,name) {
   if(!Object.hasOwn(LOCATIONS,id) || typeof name!=='string' || name.startsWith('/') || name.includes('..') || /[:\\]/.test(name)) throw new Error('Invalid location asset');
+  const local = Object.hasOwn(LOCAL_ASSETS,name) ? LOCAL_ASSETS[name] : (LOCAL_ASSET_PATTERN && LOCAL_ASSET_PATTERN.test(name) ? name : null);
+  if(local) return `locations/${id}/${local}`;
   const relative = `locations/${id}/${name}`;
   return ASSET_BASE_URL ? new URL(relative, ASSET_BASE_URL).href : relative;
 }
